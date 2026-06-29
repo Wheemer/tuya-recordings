@@ -73,14 +73,19 @@ Other platforms need a compatible helper binary built from
 ### Tuya Developer API Services
 
 In the Tuya Developer Platform, open the cloud project used by LocalTuya and
-authorize these API services:
+make sure these API services are authorized:
 
 | Tuya service name | Why Tuya Recordings needs it |
 | --- | --- |
 | `IoT Core` | Base cloud project and device access. |
-| `Authorization Token Management` | Access-token creation for Tuya OpenAPI calls. |
 | `Smart Home Basic Service` | Lists the devices linked to the Smart Life / Tuya account. |
 | `IoT Video Live Stream` | Provides WebRTC IPC configuration and the video resource pack used by Tuya's camera signaling path. |
+
+`Authorization Token Management` must also be present on the project, but Tuya
+usually adds it automatically with normal cloud projects. It is not a camera
+feature or paid video feature. It only covers Tuya's normal token endpoint,
+`GET /v1.0/token?grant_type=1`, which every signed Tuya OpenAPI request needs
+before the integration can call the device or camera APIs.
 
 `Video Cloud Storage` is not required for normal Tuya Recordings use. This
 integration caches SD-card recordings from the camera playback path; it does not
