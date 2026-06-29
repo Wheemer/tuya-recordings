@@ -75,6 +75,8 @@ ____________________________________________________________
 
 ## Installation via HACS
 
+[![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Wheemer&repository=tuya-recordings&category=integration)
+
 1. **Open HACS in Home Assistant**
 
    HACS is the easiest way to install and update custom integrations.
