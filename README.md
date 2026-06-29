@@ -12,7 +12,7 @@
 ---
 
 <p align="center">
-  <img src="custom_components/tuya_recordings/brand/logo.png" alt="Tuya Recordings logo" width="180">
+  <img src="custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings logo" width="520">
 </p>
 
 ## Overview
