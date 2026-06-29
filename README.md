@@ -1,19 +1,17 @@
+<div align="center">
+
 # Tuya Recordings
 
-![GitHub Release](https://img.shields.io/github/v/release/Wheemer/tuya-recordings?include_prereleases&style=plastic)
-![GitHub issues](https://img.shields.io/github/issues/Wheemer/tuya-recordings.svg?style=plastic)
-![GitHub Stars](https://img.shields.io/github/stars/Wheemer/tuya-recordings.svg?style=plastic)
-![GitHub Last Commit](https://img.shields.io/github/last-commit/Wheemer/tuya-recordings.svg?style=plastic)
-![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg?style=plastic)
-![Home Assistant](https://img.shields.io/badge/Home%20Assistant-Custom%20Integration-41BDF5.svg?style=plastic)
-![Tuya](https://img.shields.io/badge/Tuya-Smart%20Life-orange.svg?style=plastic)
-![Status](https://img.shields.io/badge/status-public%20beta-yellow.svg?style=plastic)
+### SD-card recording browser and cache for Tuya / Smart Life cameras in Home Assistant
 
----
-
-<p align="center">
   <img src="custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings logo" width="520">
-</p>
+
+[![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
+[![Home Assistant Custom Integration](https://img.shields.io/badge/HOME%20ASSISTANT-CUSTOM%20INTEGRATION-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://www.home-assistant.io/)
+[![Latest release](https://img.shields.io/github/v/release/Wheemer/tuya-recordings?include_prereleases&style=for-the-badge&logo=github&logoColor=white&label=RELEASE&labelColor=555555&color=22C55E)](https://github.com/Wheemer/tuya-recordings/releases)
+[![Downloads](https://img.shields.io/github/downloads/Wheemer/tuya-recordings/total?style=for-the-badge&logo=github&logoColor=white&label=DOWNLOADS&labelColor=555555&color=8A2BE2)](https://github.com/Wheemer/tuya-recordings/releases)
+
+</div>
 
 ## Overview
 
@@ -58,7 +56,8 @@ in the Tuya or Smart Life app.
   Smart Life account.
 - `localtuya` configured with Tuya Cloud credentials saved in its config entry.
 - A Tuya Developer project linked to the same account.
-- Tuya Developer APIs needed for IPC/WebRTC camera access.
+- Tuya Developer API services needed for Tuya account/device lookup and
+  IPC/WebRTC camera access.
 - `ffmpeg` available on the Home Assistant system.
 - Tuya / Smart Life cameras with SD cards and local recordings.
 
@@ -70,6 +69,39 @@ Developer values again.
 Bundled playback helpers are included for Linux `amd64`, `arm64`, and `armv7`.
 Other platforms need a compatible helper binary built from
 `tools/pion_offer_probe`.
+
+### Tuya Developer API Services
+
+In the Tuya Developer Platform, open the cloud project used by LocalTuya and
+authorize these API services:
+
+| Tuya service name | Why Tuya Recordings needs it |
+| --- | --- |
+| `IoT Core` | Base cloud project and device access. |
+| `Authorization Token Management` | Access-token creation for Tuya OpenAPI calls. |
+| `Smart Home Basic Service` | Lists the devices linked to the Smart Life / Tuya account. |
+| `IoT Video Live Stream` | Provides WebRTC IPC configuration and the video resource pack used by Tuya's camera signaling path. |
+
+`Video Cloud Storage` is not required for normal Tuya Recordings use. This
+integration caches SD-card recordings from the camera playback path; it does not
+play Tuya's paid cloud-storage recordings.
+
+Depending on the Tuya project age and region, Tuya may also show already
+authorized default services such as `Device Status Notification`, `Data
+Dashboard Service`, `Industry Basic Service`, or `[Deprecate]Smart Home Scene
+Linkage`. Those are common on Tuya / LocalTuya projects, but they are not the
+camera recording playback path.
+
+The important endpoint coverage is:
+
+- `GET /v1.0/token?grant_type=1`
+- `GET /v1.0/users/{uid}/devices`
+- `GET /v1.0/users/{uid}/devices/{device_id}/webrtc-configs`
+- `POST /v2.0/open-iot-hub/access/config`
+
+If setup or playback reports `permission deny`, `No permissions`, or a Tuya API
+permission error, recheck this service list first and make sure the project is
+linked to the same Smart Life / Tuya app account and the correct data center.
 
 ____________________________________________________________
 
