@@ -73,8 +73,15 @@ Other platforms need a compatible helper binary built from
 ### Tuya Developer API Service
 
 Tuya Recordings uses the same Tuya Developer project and cloud credentials that
-you already configured for LocalTuya. LocalTuya projects normally already have
-the basic Tuya services needed for tokens and device lookup.
+you already configured for LocalTuya. If LocalTuya is already configured with
+cloud credentials and can find your devices, the normal LocalTuya cloud setup is
+already done.
+
+LocalTuya's cloud setup normally covers the basic project services it needs,
+including `Industry Basic Service`, `Smart Home Basic Service`, and `Device
+Status Notification`. Do not add those again just for Tuya Recordings unless you
+are setting up LocalTuya from scratch or repairing a broken Tuya Developer
+project.
 
 For SD-card recording playback, check that this extra camera service is
 authorized:
@@ -95,8 +102,6 @@ camera recording playback path.
 
 The important endpoint coverage is:
 
-- `GET /v1.0/token?grant_type=1`
-- `GET /v1.0/users/{uid}/devices`
 - `GET /v1.0/users/{uid}/devices/{device_id}/webrtc-configs`
 - `POST /v2.0/open-iot-hub/access/config`
 
@@ -104,7 +109,8 @@ If setup or playback reports `permission deny`, `No permissions`, or a Tuya API
 permission error, first confirm that `IoT Video Live Stream` is subscribed and
 authorized on the same Tuya project LocalTuya is using. Then make sure the
 project is linked to the same Smart Life / Tuya app account and the correct data
-center.
+center. If the `open-iot-hub` endpoint is denied, also confirm the project's
+normal LocalTuya/Tuya cloud services and IoT Core subscription are still active.
 
 ____________________________________________________________
 
