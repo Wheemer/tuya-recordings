@@ -1,0 +1,13 @@
+{
+  "domain": "tuya_recordings",
+  "name": "Tuya Recordings",
+  "codeowners": ["@Wheemer"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http", "media_source", "panel_custom", "tuya", "localtuya"],
+  "integration_type": "hub",
+  "documentation": "https://github.com/Wheemer/tuya-recordings",
+  "issue_tracker": "https://github.com/Wheemer/tuya-recordings/issues",
+  "iot_class": "cloud_polling",
+  "requirements": ["paho-mqtt>=2.0.0", "requests>=2.31.0"],
+  "version": "0.3.0"
+}

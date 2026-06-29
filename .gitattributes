@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+*.png binary
+custom_components/tuya_recordings/pion_offer binary
+custom_components/tuya_recordings/pion_offer_linux_* binary

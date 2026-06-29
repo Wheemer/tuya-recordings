@@ -1,0 +1,53 @@
+refresh_recordings:
+  name: Refresh recordings
+  description: Refresh the cached Tuya SD-card recording index.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID. Leave empty to refresh all Tuya Recordings entries.
+      required: false
+      selector:
+        text:
+
+clear_cache:
+  name: Clear cache
+  description: Clear the cached Tuya SD-card recording index.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID. Leave empty to clear all Tuya Recordings entries.
+      required: false
+      selector:
+        text:
+
+sync_media:
+  name: Sync media
+  description: Download all discovered Tuya SD-card recordings when Media Sync is enabled.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID. Leave empty to sync all Tuya Recordings entries with Media Sync enabled.
+      required: false
+      selector:
+        text:
+
+populate_thumbnails:
+  name: Populate thumbnails
+  description: Create missing Tuya SD-card recording thumbnails from cached videos.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID. Leave empty to populate thumbnails for all Tuya Recordings entries.
+      required: false
+      selector:
+        text:
+    limit:
+      name: Limit
+      description: Maximum number of missing thumbnails to attempt. Thumbnails are generated only from cached videos.
+      required: false
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 50
+          mode: box
