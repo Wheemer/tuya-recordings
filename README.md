@@ -258,33 +258,9 @@ https://github.com/Wheemer/tuya-recordings/issues
   subscription management, and account management remain in the Tuya / Smart
   Life app.
 
-### LocalTuya repair direction
+### LocalTuya notes
 
-Tuya Recordings creates repair issues when prerequisites are missing or when
-official Tuya camera entities are not represented in LocalTuya.
-
-Future repair helpers should be guarded and explicit: start from the official
-Tuya camera list, show the suggested LocalTuya camera config, back up the
-LocalTuya config entry, then apply changes only when the integration can safely
-determine the camera device ID, local key, protocol version, and LAN IP.
-
-The integration should not silently patch another integration with guessed
-camera IPs.
-
-### Development
-
-Run validation from the repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\validate.ps1
-```
-
-Build bundled helper binaries when needed:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\build_helpers.ps1
-```
-
-The bundled Linux helpers are built from `tools/pion_offer_probe` and the
-patched Pion ICE source in `tools/pion_ice_patch`. See
-`THIRD_PARTY_NOTICES.md` for license details.
+Tuya Recordings can create repair issues when prerequisites are missing or when
+official Tuya camera entities are not represented in LocalTuya. These issues are
+there to help explain why faster local recording-sync hints may not be available
+for every camera.
