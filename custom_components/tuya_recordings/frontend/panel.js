@@ -401,35 +401,33 @@ class TuyaRecordingsPanel extends HTMLElement {
     if (!stats) return "";
     const sync = stats.sync || {};
     const ready = Number(stats.ready_clips) || 0;
-    const indexed = Number(stats.indexed_clips) || 0;
     const pending = Math.max(0, Number(stats.pending_clips) || 0);
-    const videos = Number(stats.cached_videos) || 0;
-    const thumbs = Number(stats.cached_thumbnails) || 0;
+    const onlineCameras = Number(stats.online_cameras) || 0;
+    const totalCameras = Number(stats.total_cameras) || 0;
     const storage = Number(stats.total_bytes) || 0;
-    const videoBytes = Number(stats.video_bytes) || 0;
-    const thumbBytes = Number(stats.thumbnail_bytes) || 0;
-    const state = this.formatSyncState(sync);
+    const latest = stats.latest_clip || null;
+    const syncState = this.friendlySyncState(sync, pending);
     return `
       <div class="stats-grid">
         <div class="stat-card">
-          <div class="stat-label">Cache Ready</div>
-          <div class="stat-value">${this.escape(this.formatNumber(ready))}/${this.escape(this.formatNumber(indexed))}</div>
-          <div class="stat-sub">${this.escape(this.formatNumber(pending))} pending</div>
+          <div class="stat-label">Ready To Watch</div>
+          <div class="stat-value">${this.escape(this.formatNumber(ready))}</div>
+          <div class="stat-sub">${this.escape(this.readyDetail(pending))}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Cached Files</div>
-          <div class="stat-value">${this.escape(this.formatNumber(videos))}</div>
-          <div class="stat-sub">${this.escape(this.formatNumber(thumbs))} thumbnails</div>
+          <div class="stat-label">Newest Recording</div>
+          <div class="stat-value">${this.escape(this.latestRecordingValue(latest))}</div>
+          <div class="stat-sub">${this.escape(this.latestRecordingDetail(latest))}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Cameras Online</div>
+          <div class="stat-value">${this.escape(this.cameraCountValue(onlineCameras, totalCameras))}</div>
+          <div class="stat-sub">${this.escape(this.cameraCountDetail(onlineCameras, totalCameras))}</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">Storage Used</div>
           <div class="stat-value">${this.escape(this.formatBytes(storage))}</div>
-          <div class="stat-sub">${this.escape(this.formatBytes(videoBytes))} video • ${this.escape(this.formatBytes(thumbBytes))} thumbs</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Sync Status</div>
-          <div class="stat-value">${this.escape(state)}</div>
-          <div class="stat-sub">${this.escape(this.formatSyncDetail(sync))}</div>
+          <div class="stat-sub">${this.escape(syncState)}</div>
         </div>
       </div>
     `;
@@ -674,24 +672,42 @@ class TuyaRecordingsPanel extends HTMLElement {
     return `${value.toFixed(digits)} ${unit}`;
   }
 
-  formatSyncState(sync) {
-    const state = String(sync?.state || sync?.status || "idle").replaceAll("_", " ");
-    return state.charAt(0).toUpperCase() + state.slice(1);
+  readyDetail(pending) {
+    if (pending > 0) return `${this.formatNumber(pending)} still syncing`;
+    return "All caught up";
   }
 
-  formatSyncDetail(sync) {
-    if (!sync || Object.keys(sync).length === 0) return "No sync activity yet";
-    const downloaded = Number(sync.downloaded) || 0;
-    const skipped = Number(sync.skipped) || 0;
-    const failed = Number(sync.failed) || 0;
-    const total = Number(sync.total) || 0;
-    const parts = [];
-    if (total) parts.push(`${this.formatNumber(total)} checked`);
-    if (downloaded) parts.push(`${this.formatNumber(downloaded)} new`);
-    if (skipped) parts.push(`${this.formatNumber(skipped)} skipped`);
-    if (failed) parts.push(`${this.formatNumber(failed)} failed`);
-    if (sync.current) parts.push(`now ${sync.current}`);
-    return parts.length ? parts.join(" • ") : "Waiting for next sync";
+  latestRecordingValue(latest) {
+    if (!latest?.start) return "None yet";
+    return this.formatTime(latest.start);
+  }
+
+  latestRecordingDetail(latest) {
+    if (!latest?.start) return "No cached recordings ready";
+    const duration = this.formatDuration(latest.duration);
+    return `${latest.camera_name || "Camera"} • ${duration}`;
+  }
+
+  cameraCountValue(online, total) {
+    if (!total) return "0";
+    return `${this.formatNumber(online)}/${this.formatNumber(total)}`;
+  }
+
+  cameraCountDetail(online, total) {
+    if (!total) return "No cameras found";
+    if (online === total) return "All cameras online";
+    if (!online) return "All cameras offline";
+    return `${this.formatNumber(total - online)} offline`;
+  }
+
+  friendlySyncState(sync, pending) {
+    const state = String(sync?.state || sync?.status || "idle").toLowerCase();
+    const failed = Number(sync?.failed) || 0;
+    if (failed > 0) return `${this.formatNumber(failed)} clip${failed === 1 ? "" : "s"} need another try`;
+    if (state === "running") return "Syncing new videos";
+    if (state === "stalled") return "Sync needs attention";
+    if (pending > 0) return "Catching up in background";
+    return "Recordings are ready";
   }
 
   escape(value) {

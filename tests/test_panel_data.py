@@ -66,6 +66,16 @@ def test_build_panel_data_marks_cached_files(tmp_path):
     assert data["stats"]["pending_clips"] == 0
     assert data["stats"]["cached_videos"] == 1
     assert data["stats"]["cached_thumbnails"] == 1
+    assert data["stats"]["visible_clips"] == 1
+    assert data["stats"]["online_cameras"] == 1
+    assert data["stats"]["total_cameras"] == 1
+    assert data["stats"]["latest_clip"] == {
+        "dev_id": "camera 1",
+        "camera_name": "Front",
+        "start": 100,
+        "end": 130,
+        "duration": 30,
+    }
 
 
 def test_build_panel_data_hides_junk_mp4(tmp_path):
@@ -96,6 +106,8 @@ def test_build_panel_data_hides_junk_mp4(tmp_path):
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 0
     assert data["stats"]["pending_clips"] == 1
+    assert data["stats"]["visible_clips"] == 0
+    assert data["stats"]["latest_clip"] is None
 
 
 def test_build_panel_data_hides_uncached_files(tmp_path):
@@ -123,6 +135,8 @@ def test_build_panel_data_hides_uncached_files(tmp_path):
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 0
     assert data["stats"]["pending_clips"] == 1
+    assert data["stats"]["visible_clips"] == 0
+    assert data["stats"]["latest_clip"] is None
 
 
 def test_build_panel_data_hides_cached_video_without_thumbnail(tmp_path):
@@ -155,6 +169,8 @@ def test_build_panel_data_hides_cached_video_without_thumbnail(tmp_path):
     assert data["stats"]["pending_clips"] == 1
     assert data["stats"]["cached_videos"] == 1
     assert data["stats"]["cached_thumbnails"] == 0
+    assert data["stats"]["visible_clips"] == 0
+    assert data["stats"]["latest_clip"] is None
 
 
 def test_build_panel_data_lazy_mode_shows_uncached_files(tmp_path):
@@ -188,3 +204,5 @@ def test_build_panel_data_lazy_mode_shows_uncached_files(tmp_path):
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 0
     assert data["stats"]["pending_clips"] == 1
+    assert data["stats"]["visible_clips"] == 1
+    assert data["stats"]["latest_clip"]["camera_name"] == "Front"

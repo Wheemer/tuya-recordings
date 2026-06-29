@@ -23,6 +23,9 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         dev_id = str(camera.get("devId") or "")
         if not dev_id:
             continue
+        stats["total_cameras"] += 1
+        if camera.get("online"):
+            stats["online_cameras"] += 1
         clips = []
         dates: set[str] = set()
         camera_stats = {
@@ -65,6 +68,8 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
             if cache_only and not ready:
                 continue
             dates.add(clip_date)
+            stats["visible_clips"] += 1
+            _update_latest_clip(stats, dev_id, str(camera.get("name") or dev_id), start, end)
             clips.append(
                 {
                     "dev_id": dev_id,
@@ -111,6 +116,10 @@ def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
         "cached_thumbnails": 0,
         "ready_clips": 0,
         "pending_clips": 0,
+        "visible_clips": 0,
+        "total_cameras": 0,
+        "online_cameras": 0,
+        "latest_clip": None,
         "video_files": 0,
         "thumbnail_files": 0,
         "video_bytes": 0,
@@ -120,6 +129,19 @@ def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
         "sync": {},
         "camera_stats": [],
         "cache_only": bool(getattr(client, "media_sync_enabled", False)),
+    }
+
+
+def _update_latest_clip(stats: dict[str, Any], dev_id: str, camera_name: str, start: int, end: int) -> None:
+    latest = stats.get("latest_clip")
+    if isinstance(latest, dict) and int(latest.get("start") or 0) >= start:
+        return
+    stats["latest_clip"] = {
+        "dev_id": dev_id,
+        "camera_name": camera_name,
+        "start": start,
+        "end": end,
+        "duration": max(0, end - start),
     }
 
 
