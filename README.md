@@ -70,22 +70,18 @@ Bundled playback helpers are included for Linux `amd64`, `arm64`, and `armv7`.
 Other platforms need a compatible helper binary built from
 `tools/pion_offer_probe`.
 
-### Tuya Developer API Services
+### Tuya Developer API Service
 
-In the Tuya Developer Platform, open the cloud project used by LocalTuya and
-make sure these API services are authorized:
+Tuya Recordings uses the same Tuya Developer project and cloud credentials that
+you already configured for LocalTuya. LocalTuya projects normally already have
+the basic Tuya services needed for tokens and device lookup.
+
+For SD-card recording playback, check that this extra camera service is
+authorized:
 
 | Tuya service name | Why Tuya Recordings needs it |
 | --- | --- |
-| `IoT Core` | Base cloud project and device access. |
-| `Smart Home Basic Service` | Lists the devices linked to the Smart Life / Tuya account. |
-| `IoT Video Live Stream` | Provides WebRTC IPC configuration and the video resource pack used by Tuya's camera signaling path. |
-
-`Authorization Token Management` must also be present on the project, but Tuya
-usually adds it automatically with normal cloud projects. It is not a camera
-feature or paid video feature. It only covers Tuya's normal token endpoint,
-`GET /v1.0/token?grant_type=1`, which every signed Tuya OpenAPI request needs
-before the integration can call the device or camera APIs.
+| `IoT Video Live Stream` | Provides the WebRTC IPC configuration and video resource pack used by Tuya's camera playback signaling path. |
 
 `Video Cloud Storage` is not required for normal Tuya Recordings use. This
 integration caches SD-card recordings from the camera playback path; it does not
@@ -105,8 +101,10 @@ The important endpoint coverage is:
 - `POST /v2.0/open-iot-hub/access/config`
 
 If setup or playback reports `permission deny`, `No permissions`, or a Tuya API
-permission error, recheck this service list first and make sure the project is
-linked to the same Smart Life / Tuya app account and the correct data center.
+permission error, first confirm that `IoT Video Live Stream` is subscribed and
+authorized on the same Tuya project LocalTuya is using. Then make sure the
+project is linked to the same Smart Life / Tuya app account and the correct data
+center.
 
 ____________________________________________________________
 
