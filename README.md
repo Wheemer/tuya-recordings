@@ -72,23 +72,24 @@ Other platforms need a compatible helper binary built from
 
 ### Tuya Developer API Service
 
-Tuya Recordings uses the same Tuya Developer project and cloud credentials that
-you already configured for LocalTuya. If LocalTuya is already configured with
-cloud credentials and can find your devices, the normal LocalTuya cloud setup is
-already done.
+If LocalTuya already works and can find your devices, Tuya Recordings should
+only need one extra Tuya Cloud API service:
 
-LocalTuya's cloud setup normally covers the basic project services it needs,
-including `Industry Basic Service`, `Smart Home Basic Service`, and `Device
-Status Notification`. Do not add those again just for Tuya Recordings unless you
-are setting up LocalTuya from scratch or repairing a broken Tuya Developer
-project.
-
-For SD-card recording playback, check that this extra camera service is
-authorized:
-
-| Tuya service name | Why Tuya Recordings needs it |
+| Add this Tuya service | Why Tuya Recordings needs it |
 | --- | --- |
 | `IoT Video Live Stream` | Provides the WebRTC IPC configuration and video resource pack used by Tuya's camera playback signaling path. |
+
+That is the main Tuya Developer service to add/check for this integration.
+
+If you are setting up LocalTuya from scratch, follow LocalTuya's own Tuya Cloud
+setup first. LocalTuya commonly needs these baseline services before Tuya
+Recordings is involved:
+
+| LocalTuya baseline service | Why LocalTuya needs it |
+| --- | --- |
+| `Industry Basic Service` | Basic Tuya device/project access used by LocalTuya. |
+| `Smart Home Basic Service` | Lists the devices linked to the Smart Life / Tuya account. |
+| `Device Status Notification` | Tuya device status/event support used by LocalTuya setups. |
 
 `Video Cloud Storage` is not required for normal Tuya Recordings use. This
 integration caches SD-card recordings from the camera playback path; it does not
