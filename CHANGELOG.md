@@ -1,5 +1,28 @@
 # Changelog
 
+## Tuya Recordings v0.3.0-beta.2
+
+Backup-focused beta update for installs that mainly want SD-card visibility
+while Frigate or another NVR handles primary detection.
+
+### Highlights
+
+- Adds Thumbnail Sync mode. This keeps SD-card clips visible only after a
+  thumbnail is ready, without requiring the full video cache to stay enabled.
+- Preserves existing thumbnails when switching away from full media pre-cache.
+- Adds a `tuya_recordings.clear_video_cache` service that deletes cached MP4
+  video files while keeping the recording index and thumbnails.
+- Keeps Media Browser and the Tuya Recordings panel aligned with the backup
+  mode: thumbnail-backed clips stay browsable, video playback remains
+  on-demand.
+- Improves the storage cleanup path so cached videos can be removed by Home
+  Assistant Core from the same private media folder the integration uses.
+
+### Validation
+
+- Full validation passed through `tools/validate.ps1`.
+- Test suite passed: 106 tests.
+
 ## Tuya Recordings v0.3.0-beta.1
 
 First public beta of Tuya Recordings for Home Assistant.

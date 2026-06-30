@@ -20,6 +20,17 @@ clear_cache:
       selector:
         text:
 
+clear_video_cache:
+  name: Clear video cache
+  description: Delete cached Tuya MP4/video files while keeping the recording index and thumbnails.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry ID. Leave empty to clear cached videos for all Tuya Recordings entries.
+      required: false
+      selector:
+        text:
+
 sync_media:
   name: Sync media
   description: Download all discovered Tuya SD-card recordings when Media Sync is enabled.

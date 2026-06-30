@@ -39,6 +39,7 @@ CONF_ENTRY_ID = "entry_id"
 CONF_LIMIT = "limit"
 SERVICE_REFRESH = "refresh_recordings"
 SERVICE_CLEAR_CACHE = "clear_cache"
+SERVICE_CLEAR_VIDEO_CACHE = "clear_video_cache"
 SERVICE_SYNC_MEDIA = "sync_media"
 SERVICE_POPULATE_THUMBNAILS = "populate_thumbnails"
 DATA_CAMERA_WORK_TASK = "camera_work_task"
@@ -226,6 +227,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not _configured_entries(hass):
         hass.services.async_remove(DOMAIN, SERVICE_REFRESH)
         hass.services.async_remove(DOMAIN, SERVICE_CLEAR_CACHE)
+        hass.services.async_remove(DOMAIN, SERVICE_CLEAR_VIDEO_CACHE)
         hass.services.async_remove(DOMAIN, SERVICE_SYNC_MEDIA)
         hass.services.async_remove(DOMAIN, SERVICE_POPULATE_THUMBNAILS)
         frontend.async_remove_panel(hass, FRONTEND_URL_PATH, warn_if_unknown=False)
@@ -251,6 +253,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
         entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
         for entry_data in entries:
             await hass.async_add_executor_job(entry_data["client"].clear_cache)
+            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
+
+    async def clear_video_cache(call) -> None:
+        entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
+        for entry_data in entries:
+            result = await hass.async_add_executor_job(entry_data["client"].clear_video_cache)
+            _LOGGER.info(
+                "Deleted %s cached Tuya recording video(s) and %s temp file(s) from %s",
+                result["deleted_videos"],
+                result["deleted_temp_files"],
+                result["path"],
+            )
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
 
     async def sync_media(call) -> None:
@@ -281,6 +295,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(DOMAIN, SERVICE_REFRESH, refresh_recordings, schema=schema)
     hass.services.async_register(DOMAIN, SERVICE_CLEAR_CACHE, clear_cache, schema=schema)
+    hass.services.async_register(DOMAIN, SERVICE_CLEAR_VIDEO_CACHE, clear_video_cache, schema=schema)
     hass.services.async_register(DOMAIN, SERVICE_SYNC_MEDIA, sync_media, schema=schema)
     hass.services.async_register(DOMAIN, SERVICE_POPULATE_THUMBNAILS, populate_thumbnails, schema=thumbnail_schema)
 

@@ -248,6 +248,40 @@ class TuyaRecordingsClient:
         finally:
             self._refresh_lock.release()
 
+    def clear_video_cache(self) -> dict[str, Any]:
+        """Delete cached video files while preserving the index and thumbnails."""
+        video_folder = Path(self.media_storage_path) / "videos"
+        result = {
+            "path": str(video_folder),
+            "deleted_videos": 0,
+            "deleted_temp_files": 0,
+            "deleted_bytes": 0,
+        }
+        if not video_folder.exists() or not video_folder.is_dir():
+            return result
+
+        patterns = ("*.mp4", "*.tmp.mp4", "*.h264.pipe", "*.sample.h264")
+        candidates: set[Path] = set()
+        for pattern in patterns:
+            for path in video_folder.glob(pattern):
+                if path.is_file():
+                    candidates.add(path)
+
+        for path in candidates:
+            is_video = path.suffix == ".mp4" and not path.name.endswith(".tmp.mp4")
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError as exc:
+                LOGGER.warning("Failed to delete cached Tuya recording file %s: %s", path, exc)
+                continue
+            result["deleted_bytes"] += size
+            if is_video:
+                result["deleted_videos"] += 1
+            else:
+                result["deleted_temp_files"] += 1
+        return result
+
     def diagnostics(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         return {

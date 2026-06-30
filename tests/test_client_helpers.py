@@ -374,6 +374,36 @@ def test_clear_cache_removes_memory_and_disk_cache(tmp_path):
     assert not cache_path.exists()
 
 
+def test_clear_video_cache_preserves_thumbnails_and_index(tmp_path):
+    media_path = tmp_path / "media"
+    videos = media_path / "videos"
+    thumbs = media_path / "thumbs"
+    videos.mkdir(parents=True)
+    thumbs.mkdir(parents=True)
+    video = videos / "camera_1_2.mp4"
+    temp_video = videos / "camera_1_2.tmp.mp4"
+    pipe = videos / "camera_1_2.mp4.h264.pipe"
+    thumb = thumbs / "camera_1_2.jpg"
+    video.write_bytes(b"video")
+    temp_video.write_bytes(b"temp")
+    pipe.write_bytes(b"pipe")
+    thumb.write_bytes(b"thumb")
+    cache_path = tmp_path / "recordings.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    client = TuyaRecordingsClient({}, cache_path=cache_path, media_storage_path=media_path)
+
+    result = client.clear_video_cache()
+
+    assert result["deleted_videos"] == 1
+    assert result["deleted_temp_files"] == 2
+    assert result["deleted_bytes"] == len(b"video") + len(b"temp") + len(b"pipe")
+    assert not video.exists()
+    assert not temp_video.exists()
+    assert not pipe.exists()
+    assert thumb.exists()
+    assert cache_path.exists()
+
+
 def test_stale_cache_preserves_cached_cameras():
     client = TuyaRecordingsClient({})
     client._camera_index_cache = {"cameras": [{"name": "Camera"}]}
