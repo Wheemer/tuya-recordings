@@ -19,10 +19,12 @@ from .const import (
     CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_REGION,
+    CONF_THUMBNAIL_SYNC_ENABLED,
     CONF_USER_ID,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_SYNC_ENABLED,
     DEFAULT_MEDIA_STORAGE_PATH,
+    DEFAULT_THUMBNAIL_SYNC_ENABLED,
     DEFAULT_REGION,
     LOGGER,
 )
@@ -36,6 +38,7 @@ from .lib import (
     clip_key as _clip_key,
     cleanup_cached_media,
     create_webrtc_offer as _lib_create_webrtc_offer,
+    extract_h264_thumbnail as _extract_h264_thumbnail,
     extract_mp4_thumbnail as _extract_mp4_thumbnail,
     finalize_mp4_for_browser as _finalize_mp4_for_browser,
     filter_webrtc_candidates as _filter_webrtc_candidates,
@@ -74,6 +77,8 @@ MEDIA_SYNC_MAX_CAMERA_WORKERS = 2
 MEDIA_SYNC_CAMERA_PASS_TIMEOUT = 10 * 60
 THUMBNAIL_AUTOFILL_LIMIT = 10
 THUMBNAIL_AUTOFILL_COOLDOWN = 45
+THUMBNAIL_SAMPLE_SECONDS = 2
+THUMBNAIL_SAMPLE_TIMEOUT = 8
 INDEX_SOURCE = "tuya_ipc_recordings"
 
 
@@ -117,6 +122,7 @@ class TuyaRecordingsClient:
     def update_options(self, entry_data: dict[str, Any]) -> None:
         self.lookback_days = int(entry_data.get(CONF_LOOKBACK_DAYS, DEFAULT_LOOKBACK_DAYS) or 0)
         self.media_sync_enabled = bool(entry_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
+        self.thumbnail_sync_enabled = bool(entry_data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED))
         self.media_sync_hours = int(entry_data.get(CONF_MEDIA_SYNC_HOURS, 0) or 0)
         self.media_view_recordings_order = entry_data.get(CONF_MEDIA_VIEW_RECORDINGS_ORDER, "Descending")
         configured_media_path = entry_data.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH)
@@ -834,6 +840,8 @@ class TuyaRecordingsClient:
                 try:
                     if self.ensure_thumbnail(dev_id, start, end):
                         created_from_cache += 1
+                    elif self.thumbnail_sync_enabled and self.create_thumbnail_sample(dev_id, start, end):
+                        created += 1
                     else:
                         skipped += 1
                 except Exception as exc:
@@ -892,6 +900,8 @@ class TuyaRecordingsClient:
                 try:
                     if self.ensure_thumbnail(dev_id, start, end):
                         created_from_cache += 1
+                    elif self.thumbnail_sync_enabled and self.create_thumbnail_sample(dev_id, start, end):
+                        created += 1
                     else:
                         skipped += 1
                 except Exception as exc:
@@ -907,6 +917,47 @@ class TuyaRecordingsClient:
             }
         finally:
             self._thumbnail_autofill_lock.release()
+
+    def create_thumbnail_sample(self, dev_id: str, start: int, end: int) -> Path | None:
+        """Create a thumbnail by briefly sampling the SD-card playback stream."""
+        thumbnail_path = self.thumbnail_path(dev_id, start, end)
+        if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
+            return thumbnail_path
+        sample_end = min(int(end), int(start) + THUMBNAIL_SAMPLE_SECONDS)
+        if sample_end <= int(start):
+            return None
+        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_path = thumbnail_path.with_suffix(".sample.h264")
+        sample_path.unlink(missing_ok=True)
+        try:
+            config, mqtt_auth = self._ipc_bootstrap(dev_id)
+            try:
+                self._ipc_download_clip_h264(
+                    dev_id,
+                    config,
+                    mqtt_auth,
+                    int(start),
+                    sample_end,
+                    sample_path,
+                    playback_timeout=THUMBNAIL_SAMPLE_TIMEOUT,
+                    verify_clip=False,
+                )
+            except Exception:
+                sample_path.unlink(missing_ok=True)
+                self._ipc_download_clip_h264(
+                    dev_id,
+                    config,
+                    mqtt_auth,
+                    int(start),
+                    int(end),
+                    sample_path,
+                    playback_timeout=THUMBNAIL_SAMPLE_TIMEOUT,
+                    verify_clip=True,
+                )
+            _extract_h264_thumbnail(sample_path, thumbnail_path)
+            return thumbnail_path
+        finally:
+            sample_path.unlink(missing_ok=True)
 
     def _ipc_recordings_for_day(
         self,

@@ -37,12 +37,13 @@ in the Tuya or Smart Life app.
 - Custom Tuya Recordings panel with camera/date browsing, thumbnails, cache
   statistics, storage usage, and sync status.
 - Optional background pre-cache mode for instant playback of cached clips.
+- Optional thumbnail sync mode for backup browsing without keeping full videos.
 - Tapo-style on-demand playback when pre-cache is disabled.
-- Generated thumbnails from cached MP4 recordings.
+- Generated thumbnails from cached MP4 recordings or short thumbnail samples.
 - Private storage path under `/media`, avoiding public `/config/www` files.
 - Home Assistant services for refresh, media sync, thumbnail population, and
   cache clearing.
-- Status sensors and a pre-cache switch.
+- Status sensors plus pre-cache and thumbnail sync switches.
 - Repair issues when official Tuya or LocalTuya prerequisites are missing.
 - Event-assisted sync hints from matching Tuya/LocalTuya entities, with normal
   polling as the fallback.
@@ -177,6 +178,8 @@ During setup, choose:
   `/media/tuya_recordings`.
 - **Recording order**: Newest-first or oldest-first browsing.
 - **Pre-cache recordings**: Download recordings in the background.
+- **Preload thumbnails**: Create thumbnail previews in the background without
+  keeping full video files.
 - **Sync window in hours**: Use `0` to sync every discovered SD-card recording.
 
 Do not use `/config/www`. Cached recordings should not be public web files.
@@ -187,6 +190,13 @@ Do not use `/config/www`. Cached recordings should not be public web files.
 
 Recordings are listed and downloaded only when selected. This is closest to the
 Tapo-style model.
+
+**Thumbnail backup mode**
+
+Leave **Pre-cache recordings** off and turn **Preload thumbnails** on. Tuya
+Recordings keeps the SD-card index and thumbnail previews, while full video
+clips are downloaded only when opened. This is the best mode when Frigate is the
+primary recorder and Tuya Recordings is only a backup SD-card browser.
 
 **Pre-cache mode**
 
@@ -218,10 +228,13 @@ Normal flow:
 
 1. Discover Tuya IPC cameras from the Tuya account.
 2. Query SD-card recording days and clips.
-3. Download a clip through Tuya IPC playback.
-4. Save the MP4 under the private storage path.
-5. Generate a thumbnail from the cached MP4.
-6. Serve cached media through the custom panel and Home Assistant Media Browser.
+3. Download a clip through Tuya IPC playback when needed.
+4. Save the MP4 under the private storage path when full pre-cache or playback
+   is requested.
+5. Generate thumbnails from cached MP4 files or from short temporary H264
+   samples.
+6. Serve cached or on-demand media through the custom panel and Home Assistant
+   Media Browser.
 
 ### Automatic Sync Hints
 

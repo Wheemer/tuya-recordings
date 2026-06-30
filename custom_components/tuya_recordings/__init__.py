@@ -302,7 +302,7 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
             "interval",
             thumbnails=True,
             thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
-            require_media_sync=True,
+            require_media_sync=False,
         )
 
     async def _run_media_interval(now) -> None:
@@ -315,7 +315,7 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
             "startup",
             thumbnails=True,
             thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
-            require_media_sync=True,
+            require_media_sync=False,
         )
 
     async def _run_media_startup(now) -> None:
@@ -324,8 +324,11 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
     entry.async_on_unload(async_track_time_interval(hass, _run_thumbnail_interval, THUMBNAIL_SYNC_INTERVAL))
     entry.async_on_unload(async_track_time_interval(hass, _run_media_interval, MEDIA_SYNC_INTERVAL))
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if isinstance(entry_data, dict) and entry_data.get("client") and entry_data["client"].media_sync_enabled:
+    if isinstance(entry_data, dict) and entry_data.get("client") and (
+        entry_data["client"].media_sync_enabled or entry_data["client"].thumbnail_sync_enabled
+    ):
         entry.async_on_unload(async_call_later(hass, THUMBNAIL_SYNC_STARTUP_DELAY, _run_thumbnail_startup))
+    if isinstance(entry_data, dict) and entry_data.get("client") and entry_data["client"].media_sync_enabled:
         entry.async_on_unload(async_call_later(hass, MEDIA_SYNC_STARTUP_DELAY, _run_media_startup))
 
 
@@ -350,7 +353,7 @@ def _async_setup_recording_triggers(hass: HomeAssistant, entry: ConfigEntry) -> 
         if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
             return
         client: TuyaRecordingsClient = entry_data["client"]
-        if not client.media_sync_enabled:
+        if not client.media_sync_enabled and not client.thumbnail_sync_enabled:
             return
 
         now = hass.loop.time()
@@ -371,6 +374,7 @@ def _async_setup_recording_triggers(hass: HomeAssistant, entry: ConfigEntry) -> 
                 media=True,
                 thumbnails=True,
                 thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
+                require_media_sync=False,
             )
 
         entry_data[DATA_RECORDING_TRIGGER_TIMER] = async_call_later(
@@ -502,7 +506,8 @@ async def _async_request_camera_work(
         if not entry_data.get(DATA_MEDIA_SYNC_RUNNING):
             entry_data[DATA_MEDIA_SYNC_PENDING] = True
         queued = True
-    if thumbnails and (not require_media_sync or client.media_sync_enabled):
+    thumbnail_enabled = bool(getattr(client, "thumbnail_sync_enabled", False))
+    if thumbnails and (client.media_sync_enabled or thumbnail_enabled or not require_media_sync):
         if not entry_data.get(DATA_THUMBNAIL_SYNC_RUNNING):
             entry_data[DATA_THUMBNAIL_SYNC_PENDING] = True
             entry_data[DATA_THUMBNAIL_SYNC_LIMIT] = max(int(entry_data.get(DATA_THUMBNAIL_SYNC_LIMIT) or 0), thumbnail_limit)
@@ -545,6 +550,8 @@ async def _async_run_camera_work(hass: HomeAssistant, entry_id: str, reason: str
             limit = int(entry_data.pop(DATA_THUMBNAIL_SYNC_LIMIT, THUMBNAIL_SYNC_LIMIT) or THUMBNAIL_SYNC_LIMIT)
             require_media_sync = bool(entry_data.pop(DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA, True))
             if require_media_sync and not client.media_sync_enabled:
+                continue
+            if not require_media_sync and not client.media_sync_enabled and not client.thumbnail_sync_enabled:
                 continue
             entry_data[DATA_THUMBNAIL_SYNC_RUNNING] = True
             try:

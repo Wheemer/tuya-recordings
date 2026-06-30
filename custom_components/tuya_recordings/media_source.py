@@ -297,6 +297,9 @@ class TuyaRecordingsMediaSource(MediaSource):
                 thumbnail_cached = self._path_ready(client.thumbnail_path(dev_id, start, end))
                 if not clip_cached or not thumbnail_cached:
                     continue
+            elif self._requires_thumbnail_cache(client):
+                if not self._path_ready(client.thumbnail_path(dev_id, start, end)):
+                    continue
             visible.append(clip)
         return visible
 
@@ -306,6 +309,10 @@ class TuyaRecordingsMediaSource(MediaSource):
     @staticmethod
     def _requires_ready_cache(client: Any) -> bool:
         return bool(getattr(client, "media_sync_enabled", False))
+
+    @staticmethod
+    def _requires_thumbnail_cache(client: Any) -> bool:
+        return bool(getattr(client, "thumbnail_sync_enabled", False))
 
     @staticmethod
     def _path_ready(path: Path) -> bool:

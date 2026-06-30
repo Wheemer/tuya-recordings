@@ -7,6 +7,7 @@ class FakeClient:
     def __init__(self, tmp_path):
         self.tmp_path = tmp_path / "tuya_recordings"
         self.media_sync_enabled = True
+        self.thumbnail_sync_enabled = False
 
     def clip_path(self, dev_id, start, end):
         return self.tmp_path / "videos" / f"{dev_id}_{start}_{end}.mp4"
@@ -206,3 +207,39 @@ def test_build_panel_data_lazy_mode_shows_uncached_files(tmp_path):
     assert data["stats"]["pending_clips"] == 1
     assert data["stats"]["visible_clips"] == 1
     assert data["stats"]["latest_clip"]["camera_name"] == "Front"
+
+
+def test_build_panel_data_thumbnail_sync_shows_thumbnailed_uncached_files(tmp_path):
+    client = FakeClient(tmp_path)
+    client.media_sync_enabled = False
+    client.thumbnail_sync_enabled = True
+    thumb_path = client.thumbnail_path("camera 1", 100, 130)
+    thumb_path.parent.mkdir(parents=True)
+    thumb_path.write_bytes(b"jpg")
+
+    data = build_panel_data(
+        client,
+        {
+            "generatedAt": "now",
+            "cameras": [
+                {
+                    "devId": "camera 1",
+                    "name": "Front",
+                    "online": True,
+                    "clips": [
+                        {"start": 100, "end": 130, "date": "2026-06-28"},
+                        {"start": 200, "end": 230, "date": "2026-06-28"},
+                    ],
+                }
+            ],
+        },
+        media_root=tmp_path,
+    )
+
+    camera = data["cameras"][0]
+    assert [clip["start"] for clip in camera["clips"]] == [100]
+    assert camera["clips"][0]["cached"] is False
+    assert camera["clips"][0]["thumbnail_cached"] is True
+    assert camera["clips"][0]["playback_url"] == "/api/tuya_recordings/play/camera%201/100/130"
+    assert data["stats"]["thumbnail_cache_only"] is True
+    assert data["stats"]["visible_clips"] == 1

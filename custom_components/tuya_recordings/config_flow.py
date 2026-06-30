@@ -19,10 +19,12 @@ from .const import (
     CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_REGION,
+    CONF_THUMBNAIL_SYNC_ENABLED,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_SYNC_ENABLED,
     DEFAULT_MEDIA_SYNC_HOURS,
     DEFAULT_MEDIA_STORAGE_PATH,
+    DEFAULT_THUMBNAIL_SYNC_ENABLED,
     DEFAULT_REGION,
     DOMAIN,
     MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS,
@@ -49,6 +51,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_MEDIA_SYNC_ENABLED: user_input[CONF_MEDIA_SYNC_ENABLED],
                 CONF_MEDIA_SYNC_HOURS: user_input[CONF_MEDIA_SYNC_HOURS],
                 CONF_MEDIA_VIEW_RECORDINGS_ORDER: user_input[CONF_MEDIA_VIEW_RECORDINGS_ORDER],
+                CONF_THUMBNAIL_SYNC_ENABLED: user_input[CONF_THUMBNAIL_SYNC_ENABLED],
             }
             unique = _localtuya_unique_id(self.hass)
             await self.async_set_unique_id(f"{DOMAIN}_{unique}")
@@ -89,6 +92,7 @@ class TuyaRecordingsOptionsFlow(OptionsFlow):
         media_sync_hours = options.get(CONF_MEDIA_SYNC_HOURS, DEFAULT_MEDIA_SYNC_HOURS)
         media_storage_path = options.get(CONF_MEDIA_STORAGE_PATH, data.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH))
         recordings_order = options.get(CONF_MEDIA_VIEW_RECORDINGS_ORDER, "Descending")
+        thumbnail_sync_enabled = options.get(CONF_THUMBNAIL_SYNC_ENABLED, data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED))
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -105,6 +109,7 @@ class TuyaRecordingsOptionsFlow(OptionsFlow):
                         selector.SelectSelectorConfig(options=MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS)
                     ),
                     vol.Required(CONF_MEDIA_SYNC_ENABLED, default=media_sync_enabled): selector.BooleanSelector(),
+                    vol.Required(CONF_THUMBNAIL_SYNC_ENABLED, default=thumbnail_sync_enabled): selector.BooleanSelector(),
                     vol.Required(CONF_MEDIA_SYNC_HOURS, default=media_sync_hours): selector.NumberSelector(
                         selector.NumberSelectorConfig(
                             min=0,
@@ -179,6 +184,10 @@ def _user_schema(user_input: dict[str, Any]) -> vol.Schema:
             vol.Required(
                 CONF_MEDIA_SYNC_ENABLED,
                 default=user_input.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_THUMBNAIL_SYNC_ENABLED,
+                default=user_input.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED),
             ): selector.BooleanSelector(),
             vol.Required(
                 CONF_MEDIA_SYNC_HOURS,

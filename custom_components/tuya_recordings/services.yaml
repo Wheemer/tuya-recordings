@@ -33,7 +33,7 @@ sync_media:
 
 populate_thumbnails:
   name: Populate thumbnails
-  description: Create missing Tuya SD-card recording thumbnails from cached videos.
+  description: Create missing Tuya SD-card recording thumbnails from cached videos or short thumbnail samples when Thumbnail Sync is enabled.
   fields:
     entry_id:
       name: Config entry ID
@@ -43,7 +43,7 @@ populate_thumbnails:
         text:
     limit:
       name: Limit
-      description: Maximum number of missing thumbnails to attempt. Thumbnails are generated only from cached videos.
+      description: Maximum number of missing thumbnails to attempt.
       required: false
       default: 10
       selector:

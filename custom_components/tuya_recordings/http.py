@@ -18,7 +18,8 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
     """Build cache-backed panel data from the recording index."""
     cameras: list[dict[str, Any]] = []
     stats: dict[str, Any] = _empty_stats(client)
-    cache_only = bool(getattr(client, "media_sync_enabled", False))
+    media_cache_only = bool(getattr(client, "media_sync_enabled", False))
+    thumbnail_cache_only = bool(getattr(client, "thumbnail_sync_enabled", False))
     for camera in index.get("cameras", []):
         dev_id = str(camera.get("devId") or "")
         if not dev_id:
@@ -65,7 +66,9 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
             if ready:
                 stats["ready_clips"] += 1
                 camera_stats["ready_clips"] += 1
-            if cache_only and not ready:
+            if media_cache_only and not ready:
+                continue
+            if thumbnail_cache_only and not media_cache_only and not thumbnail_cached:
                 continue
             dates.add(clip_date)
             stats["visible_clips"] += 1
@@ -129,6 +132,7 @@ def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
         "sync": {},
         "camera_stats": [],
         "cache_only": bool(getattr(client, "media_sync_enabled", False)),
+        "thumbnail_cache_only": bool(getattr(client, "thumbnail_sync_enabled", False)),
     }
 
 

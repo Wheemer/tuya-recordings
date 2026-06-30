@@ -9,6 +9,7 @@
           "media_storage_path": "Private video storage path",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
+          "thumbnail_sync_enabled": "Preload thumbnails",
           "media_sync_hours": "Sync window in hours"
         },
         "data_description": {
@@ -16,6 +17,7 @@
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "Download recordings in the background so only cached, thumbnailed clips are shown.",
+          "thumbnail_sync_enabled": "Create preview thumbnails in the background without keeping full video files.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space."
         }
       }
@@ -41,6 +43,7 @@
           "lookback_days": "Days to check (0 = all)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
+          "thumbnail_sync_enabled": "Preload thumbnails",
           "media_sync_hours": "Sync window in hours",
           "media_storage_path": "Private video storage path"
         },
@@ -48,6 +51,7 @@
           "lookback_days": "Use 0 to scan until the camera reports no older recordings for several days.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
+          "thumbnail_sync_enabled": "When enabled, the integration samples each recording briefly to create a thumbnail, but does not keep the full video unless pre-cache is also enabled.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",
           "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media."
         }

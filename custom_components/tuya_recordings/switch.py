@@ -11,9 +11,12 @@ from .const import (
     CONF_MEDIA_SYNC_ENABLED,
     CONF_MEDIA_SYNC_HOURS,
     CONF_MEDIA_STORAGE_PATH,
+    CONF_THUMBNAIL_SYNC_ENABLED,
     DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_MEDIA_SYNC_ENABLED,
     DEFAULT_MEDIA_SYNC_HOURS,
     DEFAULT_MEDIA_STORAGE_PATH,
+    DEFAULT_THUMBNAIL_SYNC_ENABLED,
     DOMAIN,
     LOGGER,
     MANUFACTURER,
@@ -27,8 +30,13 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Tuya Recordings switches."""
-    LOGGER.debug("Setting up Tuya Recordings media sync switch for %s", entry.entry_id)
-    async_add_entities([TuyaRecordingsMediaSyncSwitch(hass, entry)])
+    LOGGER.debug("Setting up Tuya Recordings switches for %s", entry.entry_id)
+    async_add_entities(
+        [
+            TuyaRecordingsMediaSyncSwitch(hass, entry),
+            TuyaRecordingsThumbnailSyncSwitch(hass, entry),
+        ]
+    )
 
 
 class TuyaRecordingsMediaSyncSwitch(SwitchEntity):
@@ -51,7 +59,7 @@ class TuyaRecordingsMediaSyncSwitch(SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self.entry.options.get(CONF_MEDIA_SYNC_ENABLED, True))
+        return bool(self.entry.options.get(CONF_MEDIA_SYNC_ENABLED, self.entry.data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED)))
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -80,6 +88,61 @@ class TuyaRecordingsMediaSyncSwitch(SwitchEntity):
                 self.hass.services.async_call(
                     DOMAIN,
                     "sync_media",
+                    {"entry_id": self.entry.entry_id},
+                    blocking=False,
+                )
+            )
+
+
+class TuyaRecordingsThumbnailSyncSwitch(SwitchEntity):
+    """Enable lightweight background thumbnail previews."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Thumbnail Sync"
+    _attr_icon = "mdi:image-sync"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_thumbnail_sync"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title or NAME,
+            manufacturer=MANUFACTURER,
+            model=NAME,
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.entry.options.get(CONF_THUMBNAIL_SYNC_ENABLED, self.entry.data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED)))
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "lookback_days": self.entry.options.get(CONF_LOOKBACK_DAYS, DEFAULT_LOOKBACK_DAYS),
+            "storage_path": self.entry.options.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH),
+            "keeps_full_videos": bool(self.entry.options.get(CONF_MEDIA_SYNC_ENABLED, self.entry.data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))),
+        }
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._async_set_enabled(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._async_set_enabled(False)
+
+    async def _async_set_enabled(self, enabled: bool) -> None:
+        options = dict(self.entry.options)
+        options[CONF_THUMBNAIL_SYNC_ENABLED] = enabled
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
+        if isinstance(entry_data, dict) and (client := entry_data.get("client")):
+            client.thumbnail_sync_enabled = enabled
+        self.async_write_ha_state()
+        if enabled and self.hass.services.has_service(DOMAIN, "populate_thumbnails"):
+            self.hass.async_create_task(
+                self.hass.services.async_call(
+                    DOMAIN,
+                    "populate_thumbnails",
                     {"entry_id": self.entry.entry_id},
                     blocking=False,
                 )
