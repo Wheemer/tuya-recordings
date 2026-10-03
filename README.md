@@ -2,8 +2,9 @@
 
 # Tuya Recordings
 
-##
-# SD-card recording playback for Tuya and Smart Life cameras in Home Assistant
+### Browse SD-card recordings from Tuya / Smart Life cameras in Home Assistant
+
+<img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="520">
 
 [![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
 [![Home Assistant Custom Integration](https://img.shields.io/badge/HOME%20ASSISTANT-CUSTOM%20INTEGRATION-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://www.home-assistant.io/)
@@ -11,7 +12,7 @@
 [![Downloads](https://img.shields.io/github/downloads/Wheemer/tuya-recordings/total?style=for-the-badge&logo=github&logoColor=white&label=DOWNLOADS&labelColor=555555&color=8A2BE2)](https://github.com/Wheemer/tuya-recordings/releases)
 
 <p>
-  <strong>SD-card playback with audio, optional private caching, and camera detection entities.</strong><br>
+  <strong>Smart Life SD-card playback, audio, optional private caching, and camera detection entities.</strong><br>
   Built to complement the official Home Assistant Tuya integration.
 </p>
 
@@ -29,10 +30,6 @@ copy.
 
 Optional local caching is available for people who want a private MP4 library
 and fast repeat playback. It is off by default.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="260">
-</p>
 
 <div style="border: 1px solid rgba(65, 189, 245, 0.45); border-radius: 8px; padding: 16px 18px; margin: 18px 0;">
   <strong style="color: #41bdf5;">Requires:</strong> The official Home Assistant Tuya integration, a camera with an SD card, the Smart Life app for one QR approval, and Home Assistant's <code>ffmpeg</code> integration.
