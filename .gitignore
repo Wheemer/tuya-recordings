@@ -14,7 +14,6 @@ tools/dev_host/
 tools/ghidra/
 tools/controlled_relay_probe.py
 tools/disassemble_elf_symbol.py
-tools/inspect_camera_native.py
 tools/inspect_upstream_sdk.py
 
 tools/pion_offer_probe.exe

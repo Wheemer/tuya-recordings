@@ -38,6 +38,7 @@ CONF_MEDIA_SYNC_ENABLED = "media_sync_enabled"
 CONF_MEDIA_SYNC_HOURS = "media_sync_hours"
 CONF_MEDIA_STORAGE_PATH = "media_storage_path"
 CONF_MEDIA_VIEW_RECORDINGS_ORDER = "media_view_recordings_order"
+CONF_ALERT_RESET_SECONDS = "alert_reset_seconds"
 CONF_THUMBNAIL_SYNC_ENABLED = "thumbnail_sync_enabled"
 DATA_INTERACTIVE_PLAYBACK_ACTIVE = "interactive_playback_active"
 CONF_CLOUD_ACTIVITY_PAUSED = "cloud_activity_paused"
@@ -53,6 +54,7 @@ DEFAULT_MEDIA_SYNC_HOURS = 0
 DEFAULT_MEDIA_STORAGE_PATH = "/media/tuya_recordings"
 DEFAULT_THUMBNAIL_SYNC_ENABLED = False
 DEFAULT_CLOUD_ACTIVITY_PAUSED = False
+DEFAULT_ALERT_RESET_SECONDS = 60
 MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS = ["Descending", "Ascending"]
 
 REGION_LABELS = {

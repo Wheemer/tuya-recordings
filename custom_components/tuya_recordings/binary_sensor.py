@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import timedelta
 from typing import Any
 
-from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
 from .alerts import (
@@ -26,7 +30,13 @@ from .alerts import (
     tuya_camera_event_entities,
     tuya_notification_source,
 )
-from .const import DOMAIN, MANUFACTURER, NAME
+from .const import (
+    CONF_ALERT_RESET_SECONDS,
+    DEFAULT_ALERT_RESET_SECONDS,
+    DOMAIN,
+    MANUFACTURER,
+    NAME,
+)
 
 PERSON_CODES = frozenset({"ipc_human", "ipc_linger", "ipc_passby"})
 MOTION_CODES = frozenset(
@@ -42,7 +52,9 @@ async def async_setup_entry(
     """Set up detection sensors from the official Tuya event sources."""
     entities: list[TuyaRecordingAlertBinarySensor] = []
     for entity_id in tuya_camera_event_entities(hass):
-        camera_name = camera_name_from_event_state(hass.states.get(entity_id), entity_id)
+        camera_name = camera_name_from_event_state(
+            hass.states.get(entity_id), entity_id
+        )
         tuya_device_id, tuya_manager = tuya_notification_source(hass, entity_id)
         entities.extend(
             (
@@ -76,7 +88,7 @@ async def async_setup_entry(
 
 
 class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
-    """Expose a camera's classified detection notification as a binary sensor."""
+    """Expose a recent camera detection as a resettable binary sensor."""
 
     _attr_has_entity_name = False
     _attr_should_poll = False
@@ -96,6 +108,7 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         tuya_manager: Any,
     ) -> None:
         self.hass = hass
+        self.entry = entry
         self.event_entity_id = event_entity_id
         self.codes = codes
         self.tuya_device_id = tuya_device_id
@@ -106,7 +119,9 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         )
         self._attr_device_class = device_class
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_{safe_unique_fragment(event_entity_id)}")},
+            identifiers={
+                (DOMAIN, f"{entry.entry_id}_{safe_unique_fragment(event_entity_id)}")
+            },
             name=camera_name,
             manufacturer=MANUFACTURER,
             model=NAME,
@@ -116,6 +131,8 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         self._last_event_type: str | None = None
         self._last_event_attributes: dict[str, Any] = {}
         self._last_notification_values: dict[str, str | bytes] = {}
+        self._reset_cancel: Callable[[], None] | None = None
+        self._reset_generation = 0
 
     @property
     def is_on(self) -> bool:
@@ -131,6 +148,7 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
             "last_event_at": self._last_event_at,
             "last_event_type": self._last_event_type,
             "last_event_attributes": self._last_event_attributes,
+            "reset_after_seconds": self._reset_seconds,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -148,13 +166,28 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
                 )
             )
         self.async_write_ha_state()
+        self.async_on_remove(self._cancel_reset)
+
+    @property
+    def _reset_seconds(self) -> int:
+        """Return the configured recent-detection interval within safe bounds."""
+        value = self.entry.options.get(
+            CONF_ALERT_RESET_SECONDS,
+            self.entry.data.get(CONF_ALERT_RESET_SECONDS, DEFAULT_ALERT_RESET_SECONDS),
+        )
+        try:
+            return max(5, min(3600, int(value)))
+        except (TypeError, ValueError):
+            return DEFAULT_ALERT_RESET_SECONDS
 
     @callback
     def _handle_event_state_change(self, event: Event) -> None:
         new_state = event.data.get("new_state")
         if not isinstance(new_state, State):
             return
-        code = matching_ipc_alert_code(new_state.state, new_state.attributes, self.codes)
+        code = matching_ipc_alert_code(
+            new_state.state, new_state.attributes, self.codes
+        )
         if code is not None:
             self._record_notification(code, dict(new_state.attributes))
 
@@ -165,7 +198,11 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         dp_timestamps: dict[str, int] | None,
     ) -> None:
         """Handle a camera notification from the official Tuya dispatcher."""
-        if not updated_status_properties or self.tuya_manager is None or self.tuya_device_id is None:
+        if (
+            not updated_status_properties
+            or self.tuya_manager is None
+            or self.tuya_device_id is None
+        ):
             return
         device = self.tuya_manager.device_map.get(self.tuya_device_id)
         if device is None:
@@ -194,9 +231,37 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
 
     @callback
     def _record_notification(self, code: str, attributes: Mapping[str, Any]) -> None:
-        """Reflect only explicit camera notifications on Home Assistant's loop."""
-        self._is_on = not notification_is_cleared(attributes)
+        """Record a detection, or honor an explicit clear from the camera."""
+        self._cancel_reset()
         self._last_event_at = dt_util.utcnow().isoformat()
         self._last_event_type = code
         self._last_event_attributes = dict(attributes)
+        if notification_is_cleared(attributes):
+            self._is_on = False
+            self.async_write_ha_state()
+            return
+        self._is_on = True
+        self._reset_generation += 1
+        generation = self._reset_generation
+        self._reset_cancel = async_call_later(
+            self.hass,
+            timedelta(seconds=self._reset_seconds),
+            lambda _now: self._async_reset_after_timeout(generation),
+        )
         self.async_write_ha_state()
+
+    @callback
+    def _async_reset_after_timeout(self, generation: int) -> None:
+        """Clear a detection indicator unless a newer event replaced it."""
+        if generation != self._reset_generation:
+            return
+        self._reset_cancel = None
+        self._is_on = False
+        self.async_write_ha_state()
+
+    @callback
+    def _cancel_reset(self) -> None:
+        """Cancel the currently scheduled clear, if any."""
+        if self._reset_cancel is not None:
+            self._reset_cancel()
+            self._reset_cancel = None

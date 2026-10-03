@@ -1,5 +1,23 @@
 # Changelog
 
+## Tuya Recordings v0.4.1 (2026-10-03)
+
+Detection-sensor reliability and release validation fix.
+
+### Highlights
+
+- Adds a configurable **Detection reset time** (default: 60 seconds) for the
+  existing **Motion detected** and **Person detected** binary sensors. A newer
+  matching camera notification restarts the interval; explicit camera clears
+  still clear immediately.
+- Keeps the existing motion and person entity names unchanged.
+- Restores the offline Smart Life native-library inspector required by its test
+  and stops `.gitignore` from excluding that tracked source file.
+
+### Validation
+
+- 481 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
+
 ## Tuya Recordings v0.4.0 (2026-10-03)
 
 Native Smart Life SD-card playback redesign.

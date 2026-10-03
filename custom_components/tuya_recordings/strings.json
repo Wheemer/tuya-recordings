@@ -9,14 +9,16 @@
           "media_storage_path": "Private video storage path",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
-          "media_sync_hours": "Sync window in hours"
+          "media_sync_hours": "Sync window in hours",
+          "alert_reset_seconds": "Detection reset time"
         },
         "data_description": {
           "region": "Choose the region used by this Smart Life account.",
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "Download recordings in the background so only cached, thumbnailed clips are shown.",
-          "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space."
+          "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space.",
+          "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
           }
       },
       "native_authorize": {
@@ -50,6 +52,7 @@
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
           "media_sync_hours": "Sync window in hours",
+          "alert_reset_seconds": "Detection reset time",
           "media_storage_path": "Private video storage path"
         },
         "data_description": {
@@ -57,7 +60,8 @@
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",
-          "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media."
+          "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media.",
+          "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
         }
       },
       "storage_path_changed": {
