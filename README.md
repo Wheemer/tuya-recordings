@@ -4,6 +4,8 @@
 
 ### SD-card playback for Tuya and Smart Life cameras in Home Assistant
 
+<img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="300">
+
 [![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
 [![Home Assistant Custom Integration](https://img.shields.io/badge/HOME%20ASSISTANT-CUSTOM%20INTEGRATION-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://www.home-assistant.io/)
 [![Latest release](https://img.shields.io/github/v/release/Wheemer/tuya-recordings?style=for-the-badge&logo=github&logoColor=white&label=RELEASE&labelColor=555555&color=22C55E)](https://github.com/Wheemer/tuya-recordings/releases/latest)
