@@ -2,18 +2,21 @@
 
 # Tuya Recordings
 
-### Browse SD-card recordings from Tuya / Smart Life cameras in Home Assistant
-
-<img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="520">
+### SD-card playback for Tuya and Smart Life cameras in Home Assistant
 
 [![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
 [![Home Assistant Custom Integration](https://img.shields.io/badge/HOME%20ASSISTANT-CUSTOM%20INTEGRATION-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://www.home-assistant.io/)
-[![Latest release](https://img.shields.io/github/v/release/Wheemer/tuya-recordings?include_prereleases&style=for-the-badge&logo=github&logoColor=white&label=RELEASE&labelColor=555555&color=22C55E)](https://github.com/Wheemer/tuya-recordings/releases)
+[![Latest release](https://img.shields.io/github/v/release/Wheemer/tuya-recordings?style=for-the-badge&logo=github&logoColor=white&label=RELEASE&labelColor=555555&color=22C55E)](https://github.com/Wheemer/tuya-recordings/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/Wheemer/tuya-recordings/total?style=for-the-badge&logo=github&logoColor=white&label=DOWNLOADS&labelColor=555555&color=8A2BE2)](https://github.com/Wheemer/tuya-recordings/releases)
+
+<p>
+  <strong>Smart Life SD-card playback, audio, optional private caching, and camera detection entities.</strong><br>
+  Built to complement the official Home Assistant Tuya integration.
+</p>
 
 </div>
 
-## What It Does
+## Overview
 
 Tuya Recordings adds SD-card recording playback to Home Assistant for cameras
 already set up in the official Home Assistant **Tuya** integration. It follows
