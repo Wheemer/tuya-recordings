@@ -2,89 +2,90 @@ from __future__ import annotations
 
 import json
 import queue
-import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .const import (
     CONF_CLOUD_ACTIVITY_PAUSED,
-    CONF_CLIENT_ID,
-    CONF_CLIENT_SECRET,
     CONF_LOOKBACK_DAYS,
+    CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_SYNC_ENABLED,
     CONF_MEDIA_SYNC_HOURS,
-    CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_REGION,
     CONF_THUMBNAIL_SYNC_ENABLED,
-    CONF_USER_ID,
-    DEFAULT_LOOKBACK_DAYS,
     DEFAULT_CLOUD_ACTIVITY_PAUSED,
-    DEFAULT_MEDIA_SYNC_ENABLED,
+    DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_STORAGE_PATH,
-    DEFAULT_THUMBNAIL_SYNC_ENABLED,
+    DEFAULT_MEDIA_SYNC_ENABLED,
     DEFAULT_REGION,
+    DEFAULT_THUMBNAIL_SYNC_ENABLED,
     LOGGER,
 )
 from .lib import (
     CachedClipKey,
     MediaSyncStatus,
-    TuyaIpcRecordingBackend,
-    as_epoch_seconds as _as_epoch_seconds,
-    best_clip_match as _best_clip_match,
-    browser_relay_candidate_list as _browser_relay_candidate_list,
-    clip_key as _clip_key,
     cleanup_cached_media,
-    create_webrtc_offer as _lib_create_webrtc_offer,
-    extract_h264_thumbnail as _extract_h264_thumbnail,
-    extract_mp4_thumbnail as _extract_mp4_thumbnail,
-    finalize_mp4_for_browser as _finalize_mp4_for_browser,
-    filter_webrtc_candidates as _filter_webrtc_candidates,
-    finish_live_h264_remux as _finish_live_h264_remux,
-    first_thumbnail_value as _first_thumbnail_value,
-    looks_like_thumbnail_key as _looks_like_thumbnail_key,
-    merge_cached_clips as _merge_cached_clips,
-    normalize_clip as _normalize_clip,
-    normalize_outgoing_candidate as _normalize_outgoing_candidate,
-    drain_helper_events as _lib_drain_helper_events,
-    pion_helper_path as _lib_pion_helper_path,
-    remux_h264_to_mp4 as _remux_h264_to_mp4,
+    extract_thumbnail_from_mp4,
     safe_segment,
-    start_live_h264_remux as _start_live_h264_remux,
-    start_pion_helper as _lib_start_pion_helper,
-    strip_sdp_candidates as _strip_sdp_candidates,
 )
-from .lib.openapi import TuyaOpenApiAuthError as TuyaRecordingsAuthError
-from .lib.openapi import TuyaOpenApiClient, TuyaOpenApiError as TuyaRecordingsApiError
+from .lib import (
+    as_epoch_seconds as _as_epoch_seconds,
+)
+from .lib import (
+    best_clip_match as _best_clip_match,
+)
+from .lib import (
+    finalize_mp4_for_browser as _finalize_mp4_for_browser,
+)
+from .lib import (
+    merge_cached_clips as _merge_cached_clips,
+)
+from .lib.catalog import (
+    catalog_queries,
+    next_catalog_retry_after,
+)
+from .lib.commands import (
+    CameraWorkBusy,
+    CameraWorkCancelled,
+    Cancellation,
+    Deadline,
+    camera_work_scope,
+)
+from .lib.native_backend import RecordingBackend, RecordingBackendAuthError
+from .lib.native_playback import native_playback_request
+from .lib.native_session import NativePlaybackRequest
+from .lib.native_setup import build_recordings_backend
+from .lib.storage import write_catalog
 
 CACHE_TTL = timedelta(minutes=10)
 STALE_CACHE_TTL = timedelta(hours=12)
-P2P_QUERY_TIMEOUT = 25
-P2P_PLAYBACK_TIMEOUT = 45
-P2P_PLAYBACK_MAX_TIMEOUT = 180
 RECORDING_SCAN_MAX_DAYS = 31
 RECORDING_SCAN_EMPTY_DAY_STOP = 7
 RECENT_RECORDING_SCAN_DAYS = 2
 THUMBNAIL_FAILURE_COOLDOWN = 6 * 60 * 60
+THUMBNAIL_CAMERA_FAILURE_COOLDOWN = 5 * 60
+THUMBNAIL_FAILURE_CACHE_LIMIT = 1024
 MEDIA_FAILURE_CACHE_VERSION = 2
 MEDIA_FAILURE_COOLDOWN = 15 * 60
-MEDIA_MAX_ATTEMPTS_PER_CAMERA = 80
+MEDIA_MAX_ATTEMPTS_PER_CAMERA = 1
 MEDIA_SYNC_INTER_ATTEMPT_DELAY = 0.5
 MEDIA_SYNC_MIN_CLIP_AGE = 2 * 60
-MEDIA_SYNC_MAX_CAMERA_WORKERS = 2
-MEDIA_SYNC_CAMERA_PASS_TIMEOUT = 10 * 60
+MEDIA_SYNC_CAMERA_PASS_TIMEOUT = 2 * 60
 THUMBNAIL_AUTOFILL_LIMIT = 10
 THUMBNAIL_AUTOFILL_COOLDOWN = 45
-THUMBNAIL_SAMPLE_SECONDS = 2
-THUMBNAIL_SAMPLE_TIMEOUT = 8
-INDEX_SOURCE = "tuya_ipc_recordings"
+INDEX_SOURCE = "tuya_apk_native_recordings"
+CATALOG_DAYS_PER_SESSION = 2
 KNOWN_CAMERA_CATEGORIES = {"sp", "dghsxj"}
 KNOWN_CAMERA_CATEGORY_HINTS = ("camera", "ipc", "cam", "doorbell")
 CAMERA_NAME_HINTS = ("camera", "doorbell", "lobby", "ipc", "ip camera")
+
+TuyaRecordingsAuthError = RecordingBackendAuthError
+TuyaRecordingsApiError = RuntimeError
 
 
 class TuyaRecordingsClient:
@@ -93,19 +94,18 @@ class TuyaRecordingsClient:
         entry_data: dict[str, Any],
         cache_path: Path | None = None,
         media_storage_path: Path | None = None,
+        recordings_backend: RecordingBackend | None = None,
+        hass: Any | None = None,
     ) -> None:
+        self._closed = False
+        self._camera_inventory: dict[str, str] | None = None
+        self._lifecycle_lock = threading.RLock()
+        self._cloud_pause_event = threading.Event()
+        self._background_pause_event = threading.Event()
+        self._media_cancel_event = threading.Event()
+        self._thumbnail_cancel_event = threading.Event()
+        self._media_sync_lock = threading.Lock()
         self.region = str(entry_data.get(CONF_REGION) or DEFAULT_REGION)
-        self.client_id = str(entry_data.get(CONF_CLIENT_ID) or "")
-        self.client_secret = str(entry_data.get(CONF_CLIENT_SECRET) or "")
-        self.user_id = str(entry_data.get(CONF_USER_ID) or "")
-        self._api: TuyaOpenApiClient | None = None
-        if self.client_id and self.client_secret and self.user_id:
-            self._api = TuyaOpenApiClient(
-                region=self.region,
-                client_id=self.client_id,
-                client_secret=self.client_secret,
-                user_id=self.user_id,
-            )
         self._media_storage_path_override = media_storage_path
         self.update_options(entry_data)
         self._cache_path = cache_path
@@ -113,17 +113,106 @@ class TuyaRecordingsClient:
         self._camera_index_cache: dict[str, Any] | None = None
         self._camera_index_cache_until = datetime.min.replace(tzinfo=timezone.utc)
         self._refresh_lock = threading.Lock()
+        self._browse_devices_until = 0.0
+        self._browse_days: dict[tuple[str, str], float] = {}
+        self._browse_failures: dict[tuple[str, str], str] = {}
+        self._browse_discovery_error = ""
         self._thumbnail_autofill_lock = threading.Lock()
+        self._thumbnail_create_lock = threading.Lock()
         self._thumbnail_autofill_after = 0.0
         self._thumbnail_failures: dict[tuple[str, int, int], float] = {}
+        self._thumbnail_camera_failures: dict[str, float] = {}
         self._media_failures: dict[tuple[str, int, int], float] = {}
         self._media_sync_status = MediaSyncStatus()
-        self._ipc = TuyaIpcRecordingBackend(
-            logger=LOGGER,
-            query_timeout=P2P_QUERY_TIMEOUT,
-            playback_timeout=P2P_PLAYBACK_TIMEOUT,
-            playback_max_timeout=P2P_PLAYBACK_MAX_TIMEOUT,
-        )
+        self._backend = recordings_backend or build_recordings_backend(entry_data)
+
+    @property
+    def _recordings_backend(self) -> RecordingBackend:
+        """Current recordings backend.
+
+        This is injectable for tests; production setup selects only the
+        in-process APK-native direct-ICE playback backend.
+        """
+        return self._backend
+
+    @property
+    def _native_clip_playback_available(self) -> bool:
+        return bool(getattr(self._recordings_backend, "clip_playback_available", False))
+
+    @property
+    def clip_playback_available(self) -> bool:
+        """Return whether uncached clip playback can be attempted."""
+        return self._native_clip_playback_available
+
+    @property
+    def cloud_activity_paused(self) -> bool:
+        return self._cloud_pause_event.is_set()
+
+    @cloud_activity_paused.setter
+    def cloud_activity_paused(self, paused: bool) -> None:
+        with self._lifecycle_lock:
+            if paused or self._closed:
+                self._cloud_pause_event.set()
+            elif self._cloud_pause_event.is_set():
+                # Keep cancellation latched for already queued/active operations.
+                self._cloud_pause_event = threading.Event()
+
+    def close(self) -> None:
+        """Latch cancellation for an unloaded entry without changing its options."""
+        with self._lifecycle_lock:
+            self._closed = True
+            self.cloud_activity_paused = True
+        close_backend = getattr(self._recordings_backend, "close", None)
+        if callable(close_backend):
+            close_backend()
+
+    @property
+    def background_work_paused(self) -> bool:
+        """Return whether camera-facing background work is suspended for playback."""
+        return self._background_pause_event.is_set()
+
+    def pause_background_work(self) -> None:
+        """Cancel the current generation of background camera work."""
+        with self._lifecycle_lock:
+            self._background_pause_event.set()
+
+    def resume_background_work(self) -> None:
+        """Allow a new generation of background work after playback finishes."""
+        with self._lifecycle_lock:
+            if self._background_pause_event.is_set() and not self._closed:
+                # Running jobs retain the set event they captured. New jobs get
+                # a clean generation and cannot revive cancelled camera work.
+                self._background_pause_event = threading.Event()
+
+    def background_work_cancellation(self, *events: object) -> Cancellation:
+        """Capture playback suspension with any mode-specific cancellation."""
+        with self._lifecycle_lock:
+            return Cancellation(self._cloud_pause_event, self._background_pause_event, *events)
+
+    @property
+    def media_sync_enabled(self) -> bool:
+        return not self._media_cancel_event.is_set()
+
+    @media_sync_enabled.setter
+    def media_sync_enabled(self, enabled: bool) -> None:
+        with self._lifecycle_lock:
+            if not enabled or self._closed:
+                self._media_cancel_event.set()
+            elif self._media_cancel_event.is_set():
+                self._media_cancel_event = threading.Event()
+
+    @property
+    def thumbnail_sync_enabled(self) -> bool:
+        return not self._thumbnail_cancel_event.is_set()
+
+    @thumbnail_sync_enabled.setter
+    def thumbnail_sync_enabled(self, enabled: bool) -> None:
+        with self._lifecycle_lock:
+            if not enabled or self._closed:
+                self._thumbnail_cancel_event.set()
+            elif self._thumbnail_cancel_event.is_set():
+                self._thumbnail_cancel_event = threading.Event()
+
     def update_options(self, entry_data: dict[str, Any]) -> None:
         self.lookback_days = int(entry_data.get(CONF_LOOKBACK_DAYS, DEFAULT_LOOKBACK_DAYS) or 0)
         self.cloud_activity_paused = bool(entry_data.get(CONF_CLOUD_ACTIVITY_PAUSED, DEFAULT_CLOUD_ACTIVITY_PAUSED))
@@ -137,14 +226,18 @@ class TuyaRecordingsClient:
     def camera_index(self, force_refresh: bool = False) -> dict[str, Any]:
         if self.cloud_activity_paused:
             return self._paused_index()
+        if self.background_work_paused:
+            return self._busy_cache()
         if not self._refresh_lock.acquire(blocking=False):
             return self._busy_cache()
         try:
-            return self._camera_index_locked(force_refresh)
+            with camera_work_scope(self.background_work_cancellation()):
+                return self._camera_index_locked(force_refresh)
         finally:
             self._refresh_lock.release()
 
     def _camera_index_locked(self, force_refresh: bool = False) -> dict[str, Any]:
+        cancellation = self._cloud_pause_event
         now = datetime.now(timezone.utc)
         if not force_refresh and self._camera_index_cache and now < self._camera_index_cache_until:
             cached = dict(self._camera_index_cache)
@@ -153,6 +246,8 @@ class TuyaRecordingsClient:
             return cached
         try:
             devices = self._camera_devices()
+        except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
+            raise
         except Exception as exc:
             if self._camera_index_cache:
                 return self._stale_cache(now, str(exc))
@@ -168,9 +263,10 @@ class TuyaRecordingsClient:
         if not camera_devices:
             camera_devices = self._camera_candidates_fallback(devices, previous_by_dev_id)
         if not camera_devices:
-            LOGGER.warning("Tuya Recordings did not find camera-like Tuya devices for category discovery; proceeding with available devices")
-            camera_devices = devices
+            LOGGER.warning("Tuya Recordings found no camera candidates; no devices will be probed")
         for device in camera_devices:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording catalog refresh cancelled")
             dev_id = self._device_id(device)
             if not dev_id:
                 continue
@@ -182,6 +278,8 @@ class TuyaRecordingsClient:
             else:
                 try:
                     clips, days_checked = self.sd_recordings(dev_id)
+                except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
+                    raise
                 except TuyaRecordingsApiError as exc:
                     error = str(exc)
                 except Exception as exc:
@@ -212,6 +310,8 @@ class TuyaRecordingsClient:
             "recordingScanEmptyDayStop": RECORDING_SCAN_EMPTY_DAY_STOP,
             "cameras": cameras,
         }
+        if cancellation.is_set():
+            raise CameraWorkCancelled("Recording catalog refresh cancelled")
         self._store_cache(index, CACHE_TTL)
         LOGGER.info("Refreshed Tuya recordings cache for %s camera(s)", len(cameras))
         return index
@@ -247,7 +347,7 @@ class TuyaRecordingsClient:
     def _paused_index(self) -> dict[str, Any]:
         cached = self.cached_camera_index()
         cached["cloudPaused"] = True
-        cached["warning"] = "Tuya Recordings cloud activity is paused; using cached recordings only."
+        cached["warning"] = "Tuya Recordings camera activity is paused; using cached recordings only."
         return cached
 
     def clear_cache(self) -> None:
@@ -266,6 +366,108 @@ class TuyaRecordingsClient:
         finally:
             self._refresh_lock.release()
 
+    def browse_recordings(self, dev_id: str = "", day: date | None = None) -> dict[str, Any]:
+        """Read a camera list or one day on demand, without a disk catalog scan."""
+        if self.cloud_activity_paused:
+            return self._paused_index()
+        if self.background_work_paused:
+            return self._busy_cache()
+        with camera_work_scope(self.background_work_cancellation()):
+            return self._browse_recordings(dev_id, day)
+
+    def browse_refresh_due(self, dev_id: str = "", day: date | None = None) -> bool:
+        """Return whether an on-demand browse may contact a camera now."""
+        if self.cloud_activity_paused or self.background_work_paused:
+            return False
+        now = time.monotonic()
+        if not dev_id:
+            return now >= self._browse_devices_until
+        if day is None:
+            return False
+        return now >= self._browse_days.get((dev_id, day.isoformat()), 0)
+
+    def _browse_recordings(self, dev_id: str, day: date | None) -> dict[str, Any]:
+        """Run one cancellable on-demand catalog operation."""
+        if not self._refresh_lock.acquire(blocking=False):
+            return self._busy_cache()
+        try:
+            now = time.monotonic()
+            index = self._camera_index_cache or {"source": INDEX_SOURCE, "cameras": []}
+            discovery_refreshed = False
+            if now >= self._browse_devices_until:
+                # Cache failed discovery briefly too; a UI refresh is not a retry loop.
+                self._browse_devices_until = now + 30
+                try:
+                    devices = self._camera_devices()
+                except Exception as exc:
+                    self._browse_discovery_error = str(exc)
+                    raise
+                self._browse_discovery_error = ""
+                previous = {camera["devId"]: camera for camera in index.get("cameras", [])}
+                candidates = self._camera_candidates(devices)
+                if not candidates:
+                    candidates = self._camera_candidates_fallback(devices, previous)
+                index = {"source": INDEX_SOURCE, "cameras": [
+                    {**previous.get(self._device_id(device), {}),
+                     "devId": self._device_id(device),
+                     "name": device.get("name") or device.get("deviceName") or self._device_id(device),
+                     "online": bool(device.get("online")),
+                     "clips": list(previous.get(self._device_id(device), {}).get("clips", []))}
+                    for device in candidates if self._device_id(device)
+                ]}
+                self._browse_devices_until = now + 300
+                self._camera_index_cache = index
+                discovery_refreshed = True
+            if self._browse_discovery_error:
+                raise RuntimeError(self._browse_discovery_error)
+            day_refreshed = False
+            if dev_id and day is not None:
+                camera = next((item for item in index["cameras"] if item["devId"] == dev_id), None)
+                if camera is None:
+                    raise ValueError("Unknown camera")
+                key = (dev_id, day.isoformat())
+                if now < self._browse_days.get(key, 0) and key in self._browse_failures:
+                    raise RuntimeError(self._browse_failures[key])
+                if camera.get("online") and now >= self._browse_days.get(key, 0):
+                    self._browse_days[key] = now + 30
+                    if len(self._browse_days) > 64:
+                        oldest = next(iter(self._browse_days))
+                        self._browse_days.pop(oldest)
+                        self._browse_failures.pop(oldest, None)
+                    try:
+                        clips = self._recordings_for_day(dev_id, day)
+                    except Exception as exc:
+                        self._browse_failures[key] = str(exc)
+                        raise
+                    self._browse_failures.pop(key, None)
+                    previous_clips = list(camera.get("clips", []))
+                    previous_day_clips = [
+                        clip
+                        for clip in previous_clips
+                        if clip.get("date") == day.isoformat()
+                    ]
+                    if clips or not previous_day_clips:
+                        camera["clips"] = [
+                            clip
+                            for clip in previous_clips
+                            if clip.get("date") != day.isoformat()
+                        ] + clips
+                    refreshed_at = datetime.now(timezone.utc).isoformat()
+                    catalog_days = dict(camera.get("catalogDays") or {})
+                    catalog_days[day.isoformat()] = refreshed_at
+                    camera["catalogDays"] = catalog_days
+                    day_refreshed = True
+                    self._browse_days[key] = time.monotonic() + 60
+            if discovery_refreshed or day_refreshed:
+                index["generatedAt"] = datetime.now(timezone.utc).isoformat()
+            if day_refreshed:
+                self._store_cache(index, CACHE_TTL)
+            else:
+                self._camera_index_cache = index
+            return index
+        finally:
+            self._refresh_lock.release()
+
     def clear_video_cache(self) -> dict[str, Any]:
         """Delete cached video files while preserving the index and thumbnails."""
         video_folder = Path(self.media_storage_path) / "videos"
@@ -278,7 +480,7 @@ class TuyaRecordingsClient:
         if not video_folder.exists() or not video_folder.is_dir():
             return result
 
-        patterns = ("*.mp4", "*.tmp.mp4", "*.h264.pipe", "*.sample.h264")
+        patterns = ("*.mp4", "*.tmp.mp4")
         candidates: set[Path] = set()
         for pattern in patterns:
             for path in video_folder.glob(pattern):
@@ -303,16 +505,15 @@ class TuyaRecordingsClient:
     def diagnostics(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         return {
-            "api_source": "tuya_openapi",
+            "camera_inventory_source": "official_tuya_registry",
             "region": self.region,
-            "user_id": self.user_id,
-            "has_client_id": bool(self.client_id),
-            "has_client_secret": bool(self.client_secret),
+            "camera_inventory_count": len(self._camera_inventory or {}),
             "lookback_days": self.lookback_days,
             "cloud_activity_paused": self.cloud_activity_paused,
             "recording_scan_max_days": RECORDING_SCAN_MAX_DAYS,
             "recording_scan_empty_day_stop": RECORDING_SCAN_EMPTY_DAY_STOP,
             "media_sync_enabled": self.media_sync_enabled,
+            "thumbnail_sync_enabled": self.thumbnail_sync_enabled,
             "media_sync_hours": self.media_sync_hours,
             "media_storage_path": str(self.media_storage_path),
             "has_cache": self._camera_index_cache is not None,
@@ -321,13 +522,19 @@ class TuyaRecordingsClient:
             "cache_path_configured": self._cache_path is not None,
             "refresh_running": self._refresh_lock.locked(),
             "media_sync_status": self._media_sync_status.to_dict(),
+            "recordings_backend": {
+                "name": getattr(self._recordings_backend, "name", "unknown"),
+                "apk_native": bool(getattr(self._recordings_backend, "apk_native", False)),
+                "available": getattr(self._recordings_backend, "name", "") != "apk-native-not-configured",
+                "reason": str(getattr(self._recordings_backend, "reason", "")),
+            },
         }
 
     def clip_path(self, dev_id: str, start: int, end: int) -> Path:
         return Path(self.media_storage_path) / "videos" / f"{_safe_segment(dev_id)}_{start}_{end}.mp4"
 
     def clip_cached(self, dev_id: str, start: int, end: int) -> bool:
-        return _mp4_cached(self.clip_path(dev_id, start, end))
+        return self.clip_ready(dev_id, start, end)
 
     def clip_ready(self, dev_id: str, start: int, end: int) -> bool:
         return _mp4_ready(self.clip_path(dev_id, start, end))
@@ -336,41 +543,61 @@ class TuyaRecordingsClient:
         return Path(self.media_storage_path) / "thumbs" / f"{_safe_segment(dev_id)}_{start}_{end}.jpg"
 
     def ensure_thumbnail(self, dev_id: str, start: int, end: int) -> Path | None:
-        video_path = self.clip_path(dev_id, start, end)
+        """Render a JPEG from a cached recording without opening a camera session."""
         thumbnail_path = self.thumbnail_path(dev_id, start, end)
         if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
             return thumbnail_path
-        if not _mp4_ready(video_path):
+        if not self.clip_ready(dev_id, start, end):
             return None
-        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
-        _extract_mp4_thumbnail(video_path, thumbnail_path)
-        return thumbnail_path if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0 else None
+        return self.create_thumbnail(dev_id, start, end)
 
-    def _ipc_bootstrap(self, dev_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Fetch the Tuya IPC signaling credentials used by the camera stack."""
-        self._raise_if_cloud_paused()
-        api = self._require_api()
-        config = api.get_webrtc_config(dev_id)
-        mqtt_auth = api.get_open_iot_hub_config()
-        return config, mqtt_auth
+    def _direct_thumbnail_available(self, dev_id: str) -> bool:
+        check = getattr(self._recordings_backend, "direct_thumbnail_available", None)
+        return bool(callable(check) and check(dev_id))
+
+    def _indexed_clip(
+        self, dev_id: str, start: int, end: int
+    ) -> dict[str, Any] | None:
+        """Find one clip in the current normal recording catalog."""
+        for camera in (self.cached_camera_index().get("cameras") or []):
+            if str(camera.get("devId") or "") != dev_id:
+                continue
+            for clip in camera.get("clips") or []:
+                if (
+                    int(clip.get("start") or 0) == int(start)
+                    and int(clip.get("end") or 0) == int(end)
+                ):
+                    return clip
+        return None
 
     def sd_recordings(self, dev_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+        cancellation = self.background_work_cancellation()
         self._raise_if_cloud_paused()
+        if not self._native_clip_playback_available:
+            raise RuntimeError("Smart Life APK-native recording catalog is not available")
         today = date.today()
         all_clips: list[dict[str, Any]] = []
         days_checked: list[str] = []
-        config, mqtt_auth = self._ipc_bootstrap(dev_id)
         empty_days = 0
         scan_days = self.lookback_days if self.lookback_days > 0 else RECORDING_SCAN_MAX_DAYS
-        for offset in range(scan_days):
-            day = today - timedelta(days=offset)
-            days_checked.append(day.isoformat())
-            day_clips = self._ipc_recordings_for_day(dev_id, config, mqtt_auth, day)
-            if day_clips:
-                empty_days = 0
+        offset = 0
+        while offset < scan_days:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording catalog scan cancelled")
+            batch_size = min(CATALOG_DAYS_PER_SESSION, scan_days - offset)
+            if self.lookback_days <= 0:
+                batch_size = min(batch_size, RECORDING_SCAN_EMPTY_DAY_STOP - empty_days)
+            days = [today - timedelta(days=offset + index) for index in range(batch_size)]
+            queried = self._recordings_backend.recordings_for_days(
+                dev_id, {}, {}, days, cancel_event=cancellation,
+            )
+            if not queried:
+                raise RuntimeError("Recording catalog batch returned no days")
+            for day, day_clips in queried:
+                days_checked.append(day.isoformat())
+                empty_days = 0 if day_clips else empty_days + 1
                 all_clips.extend(day_clips)
-                continue
-            empty_days += 1
+            offset += len(queried)
             if self.lookback_days <= 0 and empty_days >= RECORDING_SCAN_EMPTY_DAY_STOP:
                 break
 
@@ -381,6 +608,8 @@ class TuyaRecordingsClient:
         """Refresh the cached index by scanning only the newest recording days."""
         if self.cloud_activity_paused:
             return self._paused_index()
+        if self.background_work_paused:
+            return self._busy_cache()
         if not self._camera_index_cache:
             return self.camera_index(True)
         if not self._refresh_lock.acquire(blocking=False):
@@ -390,10 +619,126 @@ class TuyaRecordingsClient:
         finally:
             self._refresh_lock.release()
 
+    def thumbnail_work_cancellation(self, require_media_sync: bool = False) -> Cancellation:
+        """Capture the enabling switch before submitting work to HA's executor."""
+        with self._lifecycle_lock:
+            mode = self._media_cancel_event if require_media_sync or not self.thumbnail_sync_enabled else self._thumbnail_cancel_event
+            return Cancellation(self._cloud_pause_event, self._background_pause_event, mode)
+
+    def sync_thumbnails(
+        self,
+        limit: int,
+        cancellation: Cancellation,
+        refresh_catalog: bool = True,
+    ) -> dict[str, Any]:
+        """Render thumbnails from already cached clips without touching cameras."""
+        limit = max(1, int(limit or 1))
+        with camera_work_scope(cancellation) as active:
+            if active.is_set():
+                raise CameraWorkCancelled("Thumbnail sync cancelled before local thumbnail work")
+            return self.populate_thumbnails(
+                limit,
+                ignore_catalog_backoff=True,
+            )
+
+    def reset_camera_work_backoff(self) -> None:
+        """Allow one explicit resume attempt without stale failure delays."""
+        with self._refresh_lock:
+            self._thumbnail_failures.clear()
+            self._thumbnail_camera_failures.clear()
+            self._thumbnail_autofill_after = 0.0
+            index = self._camera_index_cache
+            if not isinstance(index, dict):
+                return
+            changed = False
+            for camera in index.get("cameras", []):
+                if not isinstance(camera, dict):
+                    continue
+                for key in ("catalogErrorAt", "catalogErrorCount", "catalogRetryAfter"):
+                    if key in camera:
+                        camera.pop(key, None)
+                        changed = True
+                status = camera.get("bridgeStatus")
+                if isinstance(status, dict) and (status.get("error") or status.get("retryAfter")):
+                    camera["bridgeStatus"] = {
+                        key: value
+                        for key, value in status.items()
+                        if key not in {"error", "retryAfter"}
+                    }
+                    changed = True
+            if changed:
+                self._store_cache(index, CACHE_TTL)
+
+    def refresh_background_catalog(self, limit: int = 2) -> dict[str, Any]:
+        """Persist a small catalog pass before the background image worker runs."""
+        cancellation = self.background_work_cancellation()
+        self._raise_if_cloud_paused()
+        if not self._refresh_lock.acquire(blocking=False):
+            raise CameraWorkBusy("Recording catalog refresh is already active")
+        try:
+            with camera_work_scope(cancellation) as active:
+                now = datetime.now(timezone.utc)
+                today = date.today()
+                devices = self._camera_devices()
+                previous = {str(camera.get("devId")): camera for camera in (self._camera_index_cache or {}).get("cameras", [])}
+                cameras = []
+                for device in self._camera_candidates(devices) or self._camera_candidates_fallback(devices, previous):
+                    dev_id = self._device_id(device)
+                    if not dev_id:
+                        continue
+                    old = previous.get(dev_id, {})
+                    cameras.append({**old, "devId": dev_id, "name": device.get("name") or device.get("deviceName") or dev_id,
+                                    "online": device.get("online"), "clips": list(old.get("clips") or [])})
+                days = self.lookback_days if self.lookback_days > 0 else RECORDING_SCAN_MAX_DAYS
+                index = {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "cameras": cameras}
+                by_id = {camera["devId"]: camera for camera in cameras}
+                for dev_id, day in catalog_queries(cameras, today=today, now=now, days=days, limit=limit):
+                    if active.is_set():
+                        raise CameraWorkCancelled("Recording catalog pass cancelled")
+                    camera = by_id[dev_id]
+                    try:
+                        clips = self._recordings_for_day(dev_id, day)
+                        if active.is_set():
+                            raise CameraWorkCancelled("Recording catalog pass cancelled")
+                        camera["clips"] = _merge_cached_clips(clips, camera["clips"])
+                        saved_days = camera.get("catalogDays")
+                        scanned = dict(saved_days) if isinstance(saved_days, dict) else {}
+                        scanned[day.isoformat()] = now.isoformat()
+                        cutoff = (today - timedelta(days=days - 1)).isoformat()
+                        camera["catalogDays"] = {key: value for key, value in scanned.items() if isinstance(key, str) and cutoff <= key <= today.isoformat()}
+                        camera.pop("catalogErrorAt", None)
+                        camera.pop("catalogErrorCount", None)
+                        camera.pop("catalogRetryAfter", None)
+                        camera["bridgeStatus"] = {"error": "", "listedCount": len(camera["clips"]), "daysChecked": sorted(camera["catalogDays"], reverse=True)}
+                    except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
+                        raise
+                    except Exception as error:
+                        failure_count, retry_after = next_catalog_retry_after(camera, now)
+                        camera["catalogErrorAt"] = now.isoformat()
+                        camera["catalogErrorCount"] = failure_count
+                        camera["catalogRetryAfter"] = retry_after.isoformat()
+                        camera["bridgeStatus"] = {
+                            "error": str(error),
+                            "listedCount": len(camera["clips"]),
+                            "retryAfter": camera["catalogRetryAfter"],
+                        }
+                        self._store_cache(index, CACHE_TTL)
+                        continue
+                    self._store_cache(index, CACHE_TTL)
+                if active.is_set():
+                    raise CameraWorkCancelled("Recording catalog pass cancelled")
+                self._store_cache(index, CACHE_TTL)
+                return index
+        finally:
+            self._refresh_lock.release()
+
     def _refresh_recent_recordings_locked(self) -> dict[str, Any]:
+        cancellation = self.background_work_cancellation()
         now = datetime.now(timezone.utc)
         try:
             devices = self._camera_devices()
+        except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
+            raise
         except Exception as exc:
             return self._stale_cache(now, str(exc))
 
@@ -411,9 +756,10 @@ class TuyaRecordingsClient:
         if not camera_devices:
             camera_devices = self._camera_candidates_fallback(devices, previous_by_dev_id)
         if not camera_devices:
-            LOGGER.warning("Tuya Recordings did not find camera-like Tuya devices during recent-recording refresh; proceeding with available devices")
-            camera_devices = devices
+            LOGGER.warning("Tuya Recordings found no camera candidates for recent refresh; no devices will be probed")
         for device in camera_devices:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording catalog refresh cancelled")
             dev_id = self._device_id(device)
             if not dev_id:
                 continue
@@ -427,11 +773,22 @@ class TuyaRecordingsClient:
                 clips = previous_clips
             else:
                 try:
-                    config, mqtt_auth = self._ipc_bootstrap(dev_id)
-                    for day in recent_days:
-                        days_checked.append(day.isoformat())
-                        clips.extend(self._ipc_recordings_for_day(dev_id, config, mqtt_auth, day))
+                    if not self._native_clip_playback_available:
+                        raise RuntimeError("Smart Life APK-native recording catalog is not available")
+                    remaining_days = list(recent_days)
+                    while remaining_days:
+                        queried = self._recordings_backend.recordings_for_days(
+                            dev_id, {}, {}, remaining_days, cancel_event=cancellation,
+                        )
+                        if not queried:
+                            raise RuntimeError("Recording catalog batch returned no days")
+                        for day, day_clips in queried:
+                            days_checked.append(day.isoformat())
+                            clips.extend(day_clips)
+                        remaining_days = remaining_days[len(queried):]
                     clips = _merge_cached_clips(clips, previous_clips)
+                except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
+                    raise
                 except TuyaRecordingsApiError as exc:
                     error = str(exc)
                     clips = previous_clips
@@ -463,11 +820,19 @@ class TuyaRecordingsClient:
             "recentRecordingScanDays": RECENT_RECORDING_SCAN_DAYS,
             "cameras": cameras,
         }
+        if cancellation.is_set():
+            raise CameraWorkCancelled("Recording catalog refresh cancelled")
         self._store_cache(index, CACHE_TTL)
         LOGGER.info("Refreshed recent Tuya recordings cache for %s camera(s)", len(cameras))
         return index
 
-    def download_clip(
+    def download_clip(self, dev_id: str, start: int, end: int, output_path: Path, *,
+                      verify_clip: bool = True, log_traceback: bool = True) -> Path:
+        with camera_work_scope(self._cloud_pause_event) as cancellation:
+            return self._download_clip(dev_id, start, end, output_path, verify_clip=verify_clip,
+                                       log_traceback=log_traceback, cancellation=cancellation)
+
+    def _download_clip(
         self,
         dev_id: str,
         start: int,
@@ -476,6 +841,7 @@ class TuyaRecordingsClient:
         *,
         verify_clip: bool = True,
         log_traceback: bool = True,
+        cancellation: Cancellation,
     ) -> Path:
         output_path = Path(output_path)
         if _mp4_ready(output_path):
@@ -489,72 +855,49 @@ class TuyaRecordingsClient:
         if output_path.exists():
             LOGGER.warning("Removing invalid cached Tuya recording for %s %s-%s at %s", dev_id, start, end, output_path)
             output_path.unlink(missing_ok=True)
+        if not self._native_clip_playback_available:
+            raise RuntimeError("Smart Life APK-native playback is not available")
 
+        playback_metadata = self._clip_playback_metadata(dev_id, start, end)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        h264_path = output_path.with_name(f"{output_path.name}.h264.pipe")
         temp_output_path = output_path.with_suffix(".tmp.mp4")
-        h264_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
         temp_output_path.unlink(missing_ok=True)
 
-        LOGGER.info("Downloading Tuya IPC recording for %s %s-%s to %s", dev_id, start, end, output_path)
-        config, mqtt_auth = self._ipc_bootstrap(dev_id)
-        attempts = [verify_clip]
-        if not verify_clip:
-            attempts.append(True)
-        for attempt_index, attempt_verify_clip in enumerate(attempts, start=1):
-            remux_proc: subprocess.Popen[str] | None = None
-            h264_path.unlink(missing_ok=True)
+        LOGGER.info("Downloading APK-native Tuya recording for %s %s-%s to %s", dev_id, start, end, output_path)
+        try:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording download cancelled")
+            self._recordings_backend.receive_clip(
+                dev_id,
+                {},
+                {},
+                int(start),
+                int(end),
+                temp_output_path,
+                verify_clip=verify_clip,
+                cancel_event=cancellation,
+                **playback_metadata,
+            )
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording download cancelled")
+            _finalize_mp4_for_browser(temp_output_path, output_path)
             temp_output_path.unlink(missing_ok=True)
-            try:
-                remux_proc = _start_live_h264_remux(h264_path, temp_output_path)
-                self._ipc_download_clip_h264(dev_id, config, mqtt_auth, int(start), int(end), h264_path, verify_clip=attempt_verify_clip)
-                _finish_live_h264_remux(remux_proc, temp_output_path)
-                _finalize_mp4_for_browser(temp_output_path, output_path)
-                temp_output_path.unlink(missing_ok=True)
-                break
-            except Exception as exc:
-                if self._try_finalize_partial_remux(temp_output_path, output_path, remux_proc):
-                    LOGGER.info(
-                        "Recovered partial Tuya IPC recording for %s %s-%s; mp4_bytes=%s",
-                        dev_id,
-                        start,
-                        end,
-                        output_path.stat().st_size,
-                    )
-                    break
-                should_retry = attempt_index < len(attempts)
-                if should_retry:
-                    LOGGER.warning(
-                        "Tuya IPC recording primary stream failed for %s %s-%s; retrying with camera-queried playback bounds: %s",
-                        dev_id,
-                        start,
-                        end,
-                        exc,
-                    )
-                else:
-                    self._log_download_failure(
-                        dev_id,
-                        start,
-                        end,
-                        h264_path,
-                        temp_output_path,
-                        output_path,
-                        remux_proc,
-                        log_traceback,
-                    )
-                    raise
-                self._cleanup_failed_remux(h264_path, temp_output_path, output_path, remux_proc)
-                continue
-        else:
-            raise RuntimeError("Tuya IPC recording download did not run")
-        h264_path.unlink(missing_ok=True)
+        except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
+            self._cleanup_failed_download(temp_output_path, output_path)
+            raise
+        except Exception as exc:
+            if cancellation.is_set():
+                self._cleanup_failed_download(temp_output_path, output_path)
+                raise CameraWorkCancelled("Recording download cancelled") from exc
+            self._log_download_failure(dev_id, start, end, temp_output_path, output_path, log_traceback)
+            raise
         try:
             self.ensure_thumbnail(dev_id, start, end)
         except Exception as exc:
             LOGGER.debug("Could not create Tuya recording thumbnail for %s %s-%s: %s", dev_id, start, end, exc)
         LOGGER.info(
-            "Downloaded Tuya IPC recording for %s %s-%s; mp4_bytes=%s",
+            "Downloaded APK-native Tuya recording for %s %s-%s; mp4_bytes=%s",
             dev_id,
             start,
             end,
@@ -562,262 +905,293 @@ class TuyaRecordingsClient:
         )
         return output_path
 
+    def stream_clip(
+        self,
+        dev_id: str,
+        start: int,
+        end: int,
+        chunk_callback: Callable[[bytes], None],
+        *,
+        play_time: int | None = None,
+        cancel_event: threading.Event | None = None,
+        log_traceback: bool = True,
+    ) -> None:
+        with camera_work_scope(Cancellation(self._cloud_pause_event, cancel_event)) as cancellation:
+            self._stream_clip(
+                dev_id,
+                start,
+                end,
+                chunk_callback,
+                play_time=play_time,
+                log_traceback=log_traceback,
+                cancellation=cancellation,
+            )
+
+    def _stream_clip(
+        self,
+        dev_id: str,
+        start: int,
+        end: int,
+        chunk_callback: Callable[[bytes], None],
+        *,
+        play_time: int | None,
+        log_traceback: bool,
+        cancellation: Cancellation,
+    ) -> None:
+        self._raise_if_cloud_paused()
+        if not self._native_clip_playback_available:
+            raise RuntimeError("Smart Life APK-native playback is not available")
+        playback_metadata = self._clip_playback_metadata(dev_id, start, end)
+        if play_time is not None:
+            playback_metadata["play_time"] = play_time
+        LOGGER.info("Streaming APK-native Tuya recording for %s %s-%s", dev_id, start, end)
+        try:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Recording stream cancelled")
+            stream = getattr(self._recordings_backend, "stream_clip", None)
+            if not callable(stream):
+                raise RuntimeError("Smart Life APK-native streaming playback is not available")
+            stream(
+                dev_id,
+                {},
+                {},
+                int(start),
+                int(end),
+                chunk_callback,
+                cancel_event=cancellation,
+                **playback_metadata,
+            )
+        except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
+            raise
+        except Exception:
+            message = "Failed to stream APK-native Tuya recording for %s %s-%s"
+            if log_traceback:
+                LOGGER.exception(message, dev_id, start, end)
+            else:
+                LOGGER.warning(message, dev_id, start, end)
+            raise
+
+    def timeline_request(
+        self,
+        dev_id: str,
+        start: int,
+        end: int,
+        play_time: int,
+    ) -> NativePlaybackRequest:
+        """Build a validated APK playback request for one catalog range."""
+        metadata = self._clip_playback_metadata(dev_id, start, end)
+        return native_playback_request(
+            int(start),
+            int(end),
+            play_time=int(play_time),
+            **metadata,
+        )
+
+    def stream_timeline(
+        self,
+        dev_id: str,
+        request: NativePlaybackRequest,
+        commands: queue.Queue[tuple[str, NativePlaybackRequest | None]],
+        chunk_callback: Callable[[bytes], None],
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Run one persistent APK-style SD-card timeline session."""
+        with camera_work_scope(
+            Cancellation(self._cloud_pause_event, cancel_event)
+        ) as cancellation:
+            self._raise_if_cloud_paused()
+            stream = getattr(self._recordings_backend, "stream_timeline", None)
+            if not callable(stream):
+                raise RuntimeError("Smart Life timeline playback is not available")
+            stream(
+                dev_id,
+                {},
+                {},
+                request,
+                commands,
+                chunk_callback,
+                cancel_event=cancellation,
+            )
+
+    def _clip_playback_metadata(self, dev_id: str, start: int, end: int) -> dict[str, Any]:
+        clip = self._find_cached_clip(dev_id, start, end)
+        raw = clip.get("raw") if isinstance(clip, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        encrypted = _truthy(raw.get("encrypt")) or bool(
+            raw.get("uuid")
+            and (raw.get("encryptMD5") or raw.get("encrypt_md5"))
+        )
+        metadata: dict[str, Any] = {"encrypted": encrypted}
+        encryption_uuid = raw.get("uuid")
+        if isinstance(encryption_uuid, str) and encryption_uuid.strip():
+            metadata["encryption_uuid"] = encryption_uuid.strip()
+        if isinstance(clip, dict) and isinstance(clip.get("date"), str):
+            try:
+                metadata["catalog_day"] = date.fromisoformat(clip["date"])
+            except ValueError:
+                pass
+        # Smart Life constructs play-mode JSON from the selected TimePieceBean,
+        # not from an optional nested field in the catalog response.
+        metadata["fragments_json"] = _playback_fragments_json(start, end)
+        return metadata
+
+    def _find_cached_clip(self, dev_id: str, start: int, end: int) -> dict[str, Any] | None:
+        index = self.cached_camera_index()
+        for camera in index.get("cameras", []):
+            if str(camera.get("devId") or "") != str(dev_id):
+                continue
+            clips = camera.get("clips")
+            if isinstance(clips, list):
+                return _best_clip_match(clips, int(start), int(end))
+        return None
+
     @staticmethod
-    def _cleanup_failed_remux(
-        h264_path: Path,
+    def _cleanup_failed_download(
         temp_output_path: Path,
         output_path: Path,
-        remux_proc: subprocess.Popen[str] | None,
     ) -> None:
-        if remux_proc is not None and remux_proc.poll() is None:
-            remux_proc.terminate()
-            try:
-                remux_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                remux_proc.kill()
-        if h264_path.exists() and h264_path.stat().st_size <= 0:
-            h264_path.unlink(missing_ok=True)
         temp_output_path.unlink(missing_ok=True)
         if output_path.exists() and output_path.stat().st_size <= 0:
             output_path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _try_finalize_partial_remux(
-        temp_output_path: Path,
-        output_path: Path,
-        remux_proc: subprocess.Popen[str] | None,
-    ) -> bool:
-        def promote_fragmented_mp4() -> bool:
-            if _mp4_ready(temp_output_path):
-                temp_output_path.replace(output_path)
-                return _mp4_ready(output_path)
-            return False
-
-        try:
-            if remux_proc is None:
-                return False
-            if not temp_output_path.exists() or temp_output_path.stat().st_size < 1024:
-                return False
-            try:
-                _finish_live_h264_remux(remux_proc, temp_output_path)
-            except Exception:
-                return promote_fragmented_mp4()
-            try:
-                _finalize_mp4_for_browser(temp_output_path, output_path)
-                temp_output_path.unlink(missing_ok=True)
-                return _mp4_ready(output_path)
-            except Exception:
-                return promote_fragmented_mp4()
-        except Exception as exc:
-            LOGGER.debug("Could not recover partial Tuya recording remux at %s: %s", temp_output_path, exc)
-            return False
 
     def _log_download_failure(
         self,
         dev_id: str,
         start: int,
         end: int,
-        h264_path: Path,
         temp_output_path: Path,
         output_path: Path,
-        remux_proc: subprocess.Popen[str] | None,
         log_traceback: bool,
     ) -> None:
-            h264_size = h264_path.stat().st_size if h264_path.exists() else 0
-            output_size = temp_output_path.stat().st_size if temp_output_path.exists() else output_path.stat().st_size if output_path.exists() else 0
-            message = "Failed to transfer Tuya IPC recording for %s %s-%s; temp_h264_bytes=%s output_bytes=%s"
-            if log_traceback:
-                LOGGER.exception(message, dev_id, start, end, h264_size, output_size)
-            else:
-                LOGGER.warning(message, dev_id, start, end, h264_size, output_size)
-            self._cleanup_failed_remux(h264_path, temp_output_path, output_path, remux_proc)
+        output_size = temp_output_path.stat().st_size if temp_output_path.exists() else output_path.stat().st_size if output_path.exists() else 0
+        message = "Failed to transfer APK-native Tuya recording for %s %s-%s; output_bytes=%s"
+        if log_traceback:
+            LOGGER.exception(message, dev_id, start, end, output_size)
+        else:
+            LOGGER.warning(message, dev_id, start, end, output_size)
+        self._cleanup_failed_download(temp_output_path, output_path)
 
-    def sync_recordings(self) -> dict[str, Any]:
+    def media_work_cancellation(self) -> Cancellation:
+        with self._lifecycle_lock:
+            return Cancellation(self._cloud_pause_event, self._background_pause_event, self._media_cancel_event)
+
+    def sync_recordings(self, cancellation: Cancellation | None = None) -> dict[str, Any]:
+        if not self._media_sync_lock.acquire(blocking=False):
+            return {"enabled": self.media_sync_enabled, "running": True}
+        deadline = Deadline(MEDIA_SYNC_CAMERA_PASS_TIMEOUT)
+        try:
+            with camera_work_scope(Cancellation(cancellation, self.media_work_cancellation(), deadline)) as cancellation:
+                return self._sync_recordings(cancellation, deadline)
+        finally:
+            self._media_sync_lock.release()
+
+    def _sync_recordings(self, cancellation: Cancellation, deadline: Deadline) -> dict[str, Any]:
+        result = {"enabled": self.media_sync_enabled, "downloaded": 0, "skipped": 0, "failed": 0,
+                  "deleted_videos": 0, "deleted_thumbnails": 0, "recovered_partials": 0, "stalled_cameras": []}
         if self.cloud_activity_paused:
-            result = {"enabled": False, "paused": True, "downloaded": 0, "skipped": 0, "failed": 0, "deleted_videos": 0, "deleted_thumbnails": 0}
+            result.update(enabled=False, paused=True)
             self._set_media_sync_status("paused", last_result=result)
             return result
         if not self.media_sync_enabled:
-            result = {"enabled": False, "downloaded": 0, "skipped": 0, "failed": 0, "deleted_videos": 0, "deleted_thumbnails": 0}
             self._set_media_sync_status("disabled", last_result=result)
             return result
 
-        recovered_partials = self._recover_interrupted_media_sync()
-        index = self.refresh_recent_recordings()
-        clips_by_camera: dict[str, list[dict[str, Any]]] = {}
-        for camera in index.get("cameras", []):
-            dev_id = camera.get("devId")
-            if not dev_id:
-                continue
-            camera_clips: list[dict[str, Any]] = []
-            for clip in camera.get("clips", []):
-                camera_clips.append(clip)
-            camera_clips.sort(key=lambda item: int(item.get("start") or 0), reverse=True)
-            clips_by_camera[str(dev_id)] = camera_clips
+        def check_cancelled() -> None:
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Media sync cancelled")
 
-        if not clips_by_camera:
-            result = {"enabled": True, "downloaded": 0, "skipped": 0, "failed": 0, "deleted_videos": 0, "deleted_thumbnails": 0}
-            self._set_media_sync_status("idle", total=0, current=None, last_result=result)
-            return result
-
-        clips = self._round_robin_clips(clips_by_camera)
-
-        cutoff = None
-        if self.media_sync_hours > 0:
-            newest_end = max(int(clip.get("end") or 0) for _, clip in clips)
-            cutoff = newest_end - (self.media_sync_hours * 60 * 60)
-        desired_clips = {
-            CachedClipKey.from_raw(str(dev_id), int(clip.get("start") or 0), int(clip.get("end") or 0))
-            for dev_id, clip in clips
-            if int(clip.get("start") or 0) and int(clip.get("end") or 0) and (cutoff is None or int(clip.get("end") or 0) >= cutoff)
-        }
-        downloaded = 0
-        skipped = 0
-        failed = 0
-        total = len(desired_clips)
-        newest_sync_end = int(time.time()) - MEDIA_SYNC_MIN_CLIP_AGE
-        media_failures_changed = False
-        progress_position = 0
-        progress_lock = threading.Lock()
-
-        def mark_skipped(count: int = 1) -> None:
-            nonlocal skipped
-            with progress_lock:
-                skipped += count
-
-        def set_current(dev_id: str, start: int, end: int) -> None:
-            nonlocal progress_position
-            with progress_lock:
-                progress_position += 1
-                self._set_media_sync_status(
-                    "running",
-                    downloaded=downloaded,
-                    skipped=skipped,
-                    failed=failed,
-                    current={"dev_id": dev_id, "start": start, "end": end, "position": min(progress_position, total), "total": total},
-                )
-
-        def clear_failure(key: tuple[str, int, int]) -> None:
-            nonlocal media_failures_changed
-            with progress_lock:
-                if self._media_failures.pop(key, None) is not None:
-                    media_failures_changed = True
-
-        def remember_failure(key: tuple[str, int, int], exc: Exception) -> None:
-            nonlocal failed, media_failures_changed
-            with progress_lock:
-                failed += 1
-                self._media_failures[key] = time.time()
-                media_failures_changed = True
-                self._set_media_sync_status("running", failed=failed, last_error=str(exc))
-
-        def mark_downloaded(key: tuple[str, int, int]) -> None:
-            nonlocal downloaded, media_failures_changed
-            with progress_lock:
-                self._media_failures.pop(key, None)
-                media_failures_changed = True
-                downloaded += 1
-                self._set_media_sync_status("running", downloaded=downloaded, skipped=skipped, failed=failed)
-
-        def recently_failed(key: tuple[str, int, int]) -> bool:
-            with progress_lock:
-                failed_at = self._media_failures.get(key)
-                if failed_at is None:
-                    return False
-                if time.time() - failed_at < MEDIA_FAILURE_COOLDOWN:
-                    return True
-                self._media_failures.pop(key, None)
-                return False
-
-        def sync_camera(dev_id: str, camera_clips: list[dict[str, Any]]) -> None:
-            attempted = 0
-            for clip in camera_clips:
-                if self.cloud_activity_paused:
-                    mark_skipped()
+        current_device = None
+        failures_changed = False
+        state = "idle"
+        try:
+            check_cancelled()
+            result["recovered_partials"] = self._recover_interrupted_media_sync()
+            index = self.refresh_recent_recordings()
+            check_cancelled()
+            clips = sorted(
+                [(str(camera["devId"]), clip) for camera in index.get("cameras", []) if camera.get("devId")
+                 for clip in camera.get("clips", [])
+                 if int(clip.get("start") or 0) > 0 and int(clip.get("end") or 0) > int(clip.get("start") or 0)],
+                key=lambda item: int(item[1]["start"]), reverse=True,
+            )
+            cutoff = max((int(clip["end"]) for _, clip in clips), default=0) - self.media_sync_hours * 3600 if self.media_sync_hours > 0 else None
+            desired_clips = {
+                CachedClipKey.from_raw(dev_id, int(clip["start"]), int(clip["end"]))
+                for dev_id, clip in clips if cutoff is None or int(clip["end"]) >= cutoff
+            }
+            self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0,
+                                        total=len(desired_clips), current=None, last_error=None)
+            newest_sync_end = int(time.time()) - MEDIA_SYNC_MIN_CLIP_AGE
+            attempts: dict[str, int] = {}
+            for position, (dev_id, clip) in enumerate(clips, start=1):
+                check_cancelled()
+                current_device = dev_id
+                start, end = int(clip["start"]), int(clip["end"])
+                key = (dev_id, start, end)
+                if (cutoff is not None and end < cutoff) or end > newest_sync_end:
+                    result["skipped"] += 1
                     continue
-                start = int(clip.get("start") or 0)
-                end = int(clip.get("end") or 0)
-                if not start or not end or (cutoff is not None and end < cutoff):
-                    mark_skipped()
-                    continue
-                if end > newest_sync_end:
-                    mark_skipped()
-                    continue
-                key = (str(dev_id), start, end)
-                set_current(str(dev_id), start, end)
                 output_path = self.clip_path(dev_id, start, end)
                 if _mp4_ready(output_path):
-                    try:
-                        self.ensure_thumbnail(dev_id, start, end)
-                    except Exception as exc:
-                        LOGGER.debug("Could not create cached Tuya recording thumbnail for %s %s-%s: %s", dev_id, start, end, exc)
-                    mark_skipped()
-                    clear_failure(key)
+                    self.ensure_thumbnail(dev_id, start, end)
+                    failures_changed |= self._media_failures.pop(key, None) is not None
+                    result["skipped"] += 1
                     continue
-                if attempted >= MEDIA_MAX_ATTEMPTS_PER_CAMERA:
-                    mark_skipped()
+                failed_at = self._media_failures.get(key)
+                if attempts.get(dev_id, 0) >= MEDIA_MAX_ATTEMPTS_PER_CAMERA or (
+                    failed_at is not None and time.time() - failed_at < MEDIA_FAILURE_COOLDOWN
+                ):
+                    result["skipped"] += 1
                     continue
-                if recently_failed(key):
-                    mark_skipped()
-                    continue
-                if attempted and MEDIA_SYNC_INTER_ATTEMPT_DELAY > 0:
+                if attempts and MEDIA_SYNC_INTER_ATTEMPT_DELAY > 0:
                     time.sleep(MEDIA_SYNC_INTER_ATTEMPT_DELAY)
-                attempted += 1
+                check_cancelled()
+                attempts[dev_id] = attempts.get(dev_id, 0) + 1
+                self._set_media_sync_status("running", **{key: result[key] for key in ("downloaded", "skipped", "failed")},
+                                           current={"dev_id": dev_id, "start": start, "end": end,
+                                                    "position": position, "total": len(desired_clips)})
                 try:
                     self.download_clip(dev_id, start, end, output_path, verify_clip=False, log_traceback=False)
+                    check_cancelled()
+                except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
+                    raise
                 except Exception as exc:
-                    remember_failure(key, exc)
-                    LOGGER.warning("Media Sync skipped Tuya recording %s %s-%s: %s", dev_id, start, end, exc)
-                    continue
-                mark_downloaded(key)
-
-        self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0, total=total, current=None, last_error=None)
-        max_workers = min(MEDIA_SYNC_MAX_CAMERA_WORKERS, len(clips_by_camera))
-        stalled_cameras: list[str] = []
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {executor.submit(sync_camera, dev_id, camera_clips): dev_id for dev_id, camera_clips in clips_by_camera.items()}
-            for future in as_completed(futures, timeout=MEDIA_SYNC_CAMERA_PASS_TIMEOUT):
-                future.result()
-        except TimeoutError:
-            stalled_cameras = [dev_id for future, dev_id in futures.items() if not future.done()]
-            failed += len(stalled_cameras)
-            self._set_media_sync_status(
-                "stalled",
-                downloaded=downloaded,
-                skipped=skipped,
-                failed=failed,
-                current=None,
-                stalled_cameras=stalled_cameras,
-                last_error=f"Timed out waiting for camera sync: {', '.join(stalled_cameras)}",
-            )
-            LOGGER.warning("Media Sync timed out waiting for Tuya camera workers: %s", ", ".join(stalled_cameras))
+                    check_cancelled()
+                    self._media_failures[key] = time.time()
+                    failures_changed = True
+                    result["failed"] += 1
+                    result["skipped"] += len(clips) - position
+                    self._set_media_sync_status("idle", last_error=str(exc))
+                    LOGGER.warning("Media Sync stopped after recording failure for %s %s-%s: %s", dev_id, start, end, exc)
+                    break
+                self._media_failures.pop(key, None)
+                failures_changed = True
+                result["downloaded"] += 1
+            check_cancelled()
+            if desired_clips and not result["failed"]:
+                result.update(self.cleanup_cached_media(desired_clips, cutoff))
+        except CameraWorkCancelled:
+            result["cancelled"] = True
+            if deadline.is_set():
+                state = "stalled"
+                result["timed_out"] = True
+                result["stalled_cameras"] = [current_device] if current_device else []
+            else:
+                state = "paused" if self.cloud_activity_paused else ("disabled" if not self.media_sync_enabled else "cancelled")
+        except (CameraWorkBusy, TuyaRecordingsAuthError):
+            self._set_media_sync_status("idle", current=None)
+            raise
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-        cleanup = self.cleanup_cached_media(desired_clips, cutoff)
-        if media_failures_changed:
-            self._store_media_failures()
-        result = {
-            "enabled": True,
-            "downloaded": downloaded,
-            "skipped": skipped,
-            "failed": failed,
-            "recovered_partials": recovered_partials,
-            "stalled_cameras": stalled_cameras,
-            **cleanup,
-        }
-        self._set_media_sync_status(
-            "stalled" if stalled_cameras else "idle",
-            downloaded=downloaded,
-            skipped=skipped,
-            failed=failed,
-            current=None,
-            deleted_videos=cleanup["deleted_videos"],
-            deleted_thumbnails=cleanup["deleted_thumbnails"],
-            recovered_partials=recovered_partials,
-            stalled_cameras=stalled_cameras,
-            last_result=result,
-        )
+            if failures_changed:
+                self._store_media_failures()
+
+        self._set_media_sync_status(state, downloaded=result["downloaded"], skipped=result["skipped"],
+                                    failed=result["failed"], current=None,
+                                    deleted_videos=result["deleted_videos"], deleted_thumbnails=result["deleted_thumbnails"],
+                                    recovered_partials=result["recovered_partials"],
+                                    stalled_cameras=result["stalled_cameras"], last_result=result)
         return result
 
     @staticmethod
@@ -853,87 +1227,50 @@ class TuyaRecordingsClient:
                 continue
             try:
                 dev_id, start, end = output_path.stem.rsplit("_", 2)
-                parsed = CachedClipKey.from_raw(dev_id, int(start), int(end))
+                CachedClipKey.from_raw(dev_id, int(start), int(end))
             except (TypeError, ValueError):
                 LOGGER.debug("Recovered Tuya recording has an unrecognized cache name: %s", output_path)
                 recovered += 1
                 continue
-            try:
-                self.ensure_thumbnail(parsed.dev_id, parsed.start, parsed.end)
-            except Exception as exc:
-                LOGGER.debug("Could not create thumbnail for recovered Tuya recording %s: %s", output_path, exc)
             recovered += 1
             LOGGER.info("Recovered interrupted Tuya recording cache file %s", output_path)
-        for pipe_path in video_folder.glob("*.mp4.h264.pipe"):
-            try:
-                pipe_path.unlink()
-            except OSError as exc:
-                LOGGER.debug("Could not delete interrupted Tuya recording pipe %s: %s", pipe_path, exc)
         return recovered
 
     def _set_media_sync_status(self, state: str, **updates: Any) -> None:
         self._media_sync_status.update(state, **updates)
 
-    def populate_thumbnails(self, limit: int = 3) -> dict[str, Any]:
-        if self.cloud_activity_paused:
-            return {"created": 0, "created_from_cache": 0, "skipped": 0, "failed": 0, "checked": 0, "limit": limit, "paused": True}
+    def populate_thumbnails(
+        self,
+        limit: int = 3,
+        *,
+        ignore_catalog_backoff: bool = False,
+    ) -> dict[str, Any]:
         index = self.cached_camera_index()
-        created = 0
-        created_from_cache = 0
-        skipped = 0
-        failed = 0
-        checked = 0
-        max_checks = max(0, int(limit or 0))
-        for camera in index.get("cameras", []):
-            dev_id = camera.get("devId")
-            if not dev_id:
-                continue
-            for clip in camera.get("clips", []):
-                if max_checks and checked >= max_checks:
-                    return {
-                        "created": created,
-                        "created_from_cache": created_from_cache,
-                        "skipped": skipped,
-                        "failed": failed,
-                        "checked": checked,
-                        "limit": limit,
-                    }
-                start = int(clip.get("start") or 0)
-                end = int(clip.get("end") or 0)
-                if not start or not end:
-                    skipped += 1
-                    continue
-                thumbnail_path = self.thumbnail_path(dev_id, start, end)
-                if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
-                    skipped += 1
-                    continue
-                checked += 1
-                try:
-                    if self.ensure_thumbnail(dev_id, start, end):
-                        created_from_cache += 1
-                    elif self.thumbnail_sync_enabled and self.create_thumbnail_sample(dev_id, start, end):
-                        created += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:
-                    LOGGER.debug("Could not populate Tuya recording thumbnail for %s %s-%s: %s", dev_id, start, end, exc)
-                    failed += 1
-        return {
-            "created": created,
-            "created_from_cache": created_from_cache,
-            "skipped": skipped,
-            "failed": failed,
-            "checked": checked,
-            "limit": limit,
-        }
+        candidates = [(camera["devId"], clip)
+                      for camera in index.get("cameras", []) if camera.get("devId")
+                      for clip in camera.get("clips", [])]
+        return self._populate_thumbnail_candidates(
+            candidates,
+            limit,
+            ignore_catalog_backoff=ignore_catalog_backoff,
+        )
 
     def _thumbnail_failure_is_recent(self, key: tuple[str, int, int]) -> bool:
         failed_at = self._thumbnail_failures.get(key)
         if failed_at is None:
             return False
-        if time.time() - failed_at < THUMBNAIL_FAILURE_COOLDOWN:
+        if time.monotonic() - failed_at < THUMBNAIL_FAILURE_COOLDOWN:
             return True
         self._thumbnail_failures.pop(key, None)
+        return False
+
+    def _thumbnail_camera_failure_is_recent(self, dev_id: str) -> bool:
+        failed_at = self._thumbnail_camera_failures.get(dev_id)
+        if failed_at is None:
+            return False
+        if time.monotonic() - failed_at < THUMBNAIL_CAMERA_FAILURE_COOLDOWN:
+            return True
+        self._thumbnail_camera_failures.pop(dev_id, None)
         return False
 
     def populate_thumbnails_for_clips(
@@ -942,134 +1279,144 @@ class TuyaRecordingsClient:
         clips: list[dict[str, Any]],
         limit: int = THUMBNAIL_AUTOFILL_LIMIT,
     ) -> dict[str, Any]:
+        return self._populate_thumbnail_candidates([(dev_id, clip) for clip in clips], limit, autofill=True)
+
+    def _populate_thumbnail_candidates(
+        self,
+        candidates,
+        limit: int,
+        *,
+        autofill: bool = False,
+        ignore_catalog_backoff: bool = False,
+    ) -> dict[str, Any]:
+        with camera_work_scope(self.background_work_cancellation(
+            self._thumbnail_cancel_event if self.thumbnail_sync_enabled else None
+        )) as cancellation:
+            return self._populate_thumbnail_candidates_inner(
+                candidates,
+                limit,
+                autofill,
+                cancellation,
+                ignore_catalog_backoff,
+            )
+
+    def _populate_thumbnail_candidates_inner(
+        self,
+        candidates,
+        limit,
+        autofill,
+        cancellation,
+        ignore_catalog_backoff,
+    ) -> dict[str, Any]:
+        result = {"created": 0, "skipped": 0, "failed": 0, "checked": 0, "limit": limit}
         if self.cloud_activity_paused:
-            return {"created": 0, "created_from_cache": 0, "skipped": 0, "failed": 0, "checked": 0, "limit": limit, "paused": True}
-        now = time.time()
-        if now < self._thumbnail_autofill_after:
-            return {"created": 0, "skipped": 0, "failed": 0, "checked": 0, "throttled": True}
+            return {**result, "paused": True}
         if not self._thumbnail_autofill_lock.acquire(blocking=False):
-            return {"created": 0, "skipped": 0, "failed": 0, "checked": 0, "running": True}
-        self._thumbnail_autofill_after = now + THUMBNAIL_AUTOFILL_COOLDOWN
+            return {**result, "running": True}
         try:
-            created = 0
-            created_from_cache = 0
-            skipped = 0
-            failed = 0
-            checked = 0
+            now = time.monotonic()
+            if autofill:
+                if now < self._thumbnail_autofill_after:
+                    return {**result, "throttled": True}
+                self._thumbnail_autofill_after = now + THUMBNAIL_AUTOFILL_COOLDOWN
             max_checks = max(0, int(limit or 0))
-            for clip in clips:
-                if max_checks and checked >= max_checks:
+            for dev_id, clip in sorted(candidates, key=lambda item: int(item[1].get("start") or 0), reverse=True):
+                if cancellation.is_set() or self.cloud_activity_paused or (max_checks and result["checked"] >= max_checks):
                     break
                 start = int(clip.get("start") or 0)
                 end = int(clip.get("end") or 0)
-                if not start or not end:
-                    skipped += 1
+                if not start or end <= start:
+                    result["skipped"] += 1
                     continue
+                key = (dev_id, start, end)
                 thumbnail_path = self.thumbnail_path(dev_id, start, end)
                 if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
-                    skipped += 1
+                    self._thumbnail_failures.pop(key, None)
+                    result["skipped"] += 1
                     continue
-                checked += 1
+                if self._thumbnail_failure_is_recent(key):
+                    result["skipped"] += 1
+                    continue
+                local_source_ready = self.clip_ready(dev_id, start, end)
+                if not local_source_ready:
+                    result["skipped"] += 1
+                    continue
+                result["checked"] += 1
                 try:
-                    if self.ensure_thumbnail(dev_id, start, end):
-                        created_from_cache += 1
-                    elif self.thumbnail_sync_enabled and self.create_thumbnail_sample(dev_id, start, end):
-                        created += 1
+                    if cancellation.is_set():
+                        break
+                    if self.media_sync_enabled:
+                        if not self.create_thumbnail(
+                            dev_id, start, end, cancel_event=cancellation
+                        ):
+                            raise ValueError("Thumbnail request produced no image")
+                        result["created"] += 1
                     else:
-                        skipped += 1
+                        result["skipped"] += 1
+                    self._thumbnail_failures.pop(key, None)
+                except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
+                    raise
                 except Exception as exc:
-                    LOGGER.debug("Could not populate Tuya recording thumbnail for %s %s-%s: %s", dev_id, start, end, exc)
-                    failed += 1
-            return {
-                "created": created,
-                "created_from_cache": created_from_cache,
-                "skipped": skipped,
-                "failed": failed,
-                "checked": checked,
-                "limit": limit,
-            }
+                    if cancellation.is_set():
+                        break
+                    LOGGER.debug("Could not render local Tuya recording thumbnail for %s %s-%s: %s", dev_id, start, end, exc)
+                    self._thumbnail_failures.pop(key, None)
+                    if len(self._thumbnail_failures) >= THUMBNAIL_FAILURE_CACHE_LIMIT:
+                        self._thumbnail_failures.pop(next(iter(self._thumbnail_failures)))
+                    self._thumbnail_failures[key] = time.monotonic()
+                    result["failed"] += 1
+            if cancellation.is_set() or self.cloud_activity_paused:
+                result["paused"] = True
+            return result
         finally:
             self._thumbnail_autofill_lock.release()
 
-    def create_thumbnail_sample(self, dev_id: str, start: int, end: int) -> Path | None:
-        """Create a thumbnail by briefly sampling the SD-card playback stream."""
+    def create_thumbnail(
+        self,
+        dev_id: str,
+        start: int,
+        end: int,
+        *,
+        cancel_event: Cancellation | threading.Event | None = None,
+    ) -> Path | None:
+        """Obtain a recording thumbnail through the safest available native path."""
+        with self._thumbnail_create_lock:
+            return self._create_thumbnail_locked(
+                dev_id, start, end, cancel_event=cancel_event
+            )
+
+    def _create_thumbnail_locked(
+        self,
+        dev_id: str,
+        start: int,
+        end: int,
+        *,
+        cancel_event: Cancellation | threading.Event | None = None,
+    ) -> Path | None:
+        """Create one JPEG from a local MP4 after concurrent callers collapse."""
         thumbnail_path = self.thumbnail_path(dev_id, start, end)
         if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
             return thumbnail_path
-        self._raise_if_cloud_paused()
-        sample_end = min(int(end), int(start) + THUMBNAIL_SAMPLE_SECONDS)
-        if sample_end <= int(start):
+        if int(end) <= int(start):
+            return None
+        clip_path = self.clip_path(dev_id, start, end)
+        if not _mp4_ready(clip_path):
             return None
         thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
-        sample_path = thumbnail_path.with_suffix(".sample.h264")
-        sample_path.unlink(missing_ok=True)
         try:
-            config, mqtt_auth = self._ipc_bootstrap(dev_id)
-            try:
-                self._ipc_download_clip_h264(
-                    dev_id,
-                    config,
-                    mqtt_auth,
-                    int(start),
-                    sample_end,
-                    sample_path,
-                    playback_timeout=THUMBNAIL_SAMPLE_TIMEOUT,
-                    verify_clip=False,
-                )
-            except Exception:
-                sample_path.unlink(missing_ok=True)
-                self._ipc_download_clip_h264(
-                    dev_id,
-                    config,
-                    mqtt_auth,
-                    int(start),
-                    int(end),
-                    sample_path,
-                    playback_timeout=THUMBNAIL_SAMPLE_TIMEOUT,
-                    verify_clip=True,
-                )
-            _extract_h264_thumbnail(sample_path, thumbnail_path)
+            extract_thumbnail_from_mp4(clip_path, thumbnail_path)
             return thumbnail_path
-        finally:
-            sample_path.unlink(missing_ok=True)
+        except BaseException:
+            thumbnail_path.unlink(missing_ok=True)
+            raise
 
-    def _ipc_recordings_for_day(
-        self,
-        dev_id: str,
-        config: dict[str, Any],
-        mqtt_auth: dict[str, Any],
-        day: date,
-    ) -> list[dict[str, Any]]:
-        return self._ipc.recordings_for_day(dev_id, config, mqtt_auth, day)
-
-    def _ipc_download_clip_h264(
-        self,
-        dev_id: str,
-        config: dict[str, Any],
-        mqtt_auth: dict[str, Any],
-        start: int,
-        end: int,
-        h264_path: Path,
-        playback_timeout: int | None = None,
-        verify_clip: bool = True,
-    ) -> None:
-        self._ipc.download_clip_h264(
-            dev_id,
-            config,
-            mqtt_auth,
-            start,
-            end,
-            h264_path,
-            playback_timeout=playback_timeout,
-            verify_clip=verify_clip,
-        )
+    def _recordings_for_day(self, dev_id: str, day: date) -> list[dict[str, Any]]:
+        return self._recordings_backend.recordings_for_day(dev_id, {}, {}, day)
 
     def validate_session(self) -> dict[str, Any]:
-        api = self._require_api()
         return {
-            "source": "tuya_openapi",
-            "user_id": api.user_id,
-            "devices": len(api.get_devices()),
+            "source": "official_tuya_registry",
+            "devices": len(self._camera_inventory or {}),
         }
 
     def load_cache(self) -> None:
@@ -1104,7 +1451,7 @@ class TuyaRecordingsClient:
         }
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_catalog(self._cache_path, payload)
             self._cache_mtime_ns = self._cache_path.stat().st_mtime_ns
         except OSError:
             pass
@@ -1119,7 +1466,7 @@ class TuyaRecordingsClient:
             payload["mediaFailureVersion"] = MEDIA_FAILURE_CACHE_VERSION
             payload["mediaFailures"] = _serialize_media_failures(self._media_failures)
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_catalog(self._cache_path, payload)
             self._cache_mtime_ns = self._cache_path.stat().st_mtime_ns
         except (OSError, ValueError, TypeError):
             pass
@@ -1147,28 +1494,38 @@ class TuyaRecordingsClient:
         if self._cache_path is not None:
             try:
                 self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-                self._cache_path.write_text(
-                    json.dumps(
-                        {
-                            "expiresAt": self._camera_index_cache_until.isoformat(),
-                            "index": stale,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
+                write_catalog(self._cache_path, {
+                    "expiresAt": self._camera_index_cache_until.isoformat(),
+                    "index": stale,
+                    "mediaFailureVersion": MEDIA_FAILURE_CACHE_VERSION,
+                    "mediaFailures": _serialize_media_failures(self._media_failures),
+                })
                 self._cache_mtime_ns = self._cache_path.stat().st_mtime_ns
             except OSError:
                 pass
         return stale
 
+    def set_camera_inventory(self, cameras: dict[str, str]) -> None:
+        """Replace the HA registry snapshot without accessing HA from workers."""
+        snapshot = dict(cameras)
+        if snapshot != self._camera_inventory:
+            self._camera_inventory = snapshot
+            self._camera_index_cache_until = datetime.min.replace(tzinfo=timezone.utc)
+            self._browse_devices_until = 0.0
+
     def _camera_devices(self) -> list[dict[str, Any]]:
         self._raise_if_cloud_paused()
-        devices = self._require_api().get_devices()
-        return [dict(device, devId=self._device_id(device)) for device in devices if isinstance(device, dict)]
+        inventory = self._camera_inventory
+        if not inventory:
+            return []
+        return [
+            {"devId": dev_id, "name": name, "online": True}
+            for dev_id, name in inventory.items()
+        ]
 
     def _camera_candidates(self, devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self._camera_inventory is not None:
+            return self._unique_devices([device for device in devices if self._device_id(device) in self._camera_inventory])
         return self._unique_devices(
             [device for device in devices if self._is_camera_category_device(device) or self._is_camera_name_device(device)]
         )
@@ -1222,79 +1579,7 @@ class TuyaRecordingsClient:
 
     def _raise_if_cloud_paused(self) -> None:
         if self.cloud_activity_paused:
-            raise RuntimeError("Tuya Recordings cloud activity is paused")
-
-    def _require_api(self) -> TuyaOpenApiClient:
-        if self._api is None:
-            raise TuyaRecordingsAuthError(
-                "tuya_openapi",
-                {
-                    "code": "missing_credentials",
-                    "msg": "Tuya OpenAPI credentials are missing. Configure with LocalTuya cloud credentials or enter Access ID, Access Secret, region, and user ID.",
-                },
-            )
-        return self._api
-
-
-def _create_webrtc_offer() -> str:
-    return _lib_create_webrtc_offer(_pion_helper_path(), process_module=subprocess)
-
-
-def _start_pion_helper(
-    config: dict[str, Any],
-    h264_output: Path | None = None,
-    helper_timeout: int | None = None,
-) -> subprocess.Popen[str]:
-    return _lib_start_pion_helper(
-        _pion_helper_path(),
-        config,
-        query_timeout=P2P_QUERY_TIMEOUT,
-        playback_timeout=P2P_PLAYBACK_TIMEOUT,
-        h264_output=h264_output,
-        helper_timeout=helper_timeout,
-        process_module=subprocess,
-    )
-
-
-def _drain_helper_errors(errors: queue.Queue[str]) -> str:
-    messages: list[str] = []
-    while True:
-        try:
-            messages.append(errors.get_nowait())
-        except queue.Empty:
-            break
-    return "; ".join(message for message in messages if message) or "no helper stderr"
-
-
-def _publish_helper_local_candidates(
-    events: queue.Queue[dict[str, Any]],
-    mqtt_client: Any,
-    topic: str,
-    msid: str,
-    dev_id: str,
-    moto_id: str,
-    session_id: str,
-    protocol_version: str,
-) -> None:
-    _drain_helper_events(events, mqtt_client, topic, msid, dev_id, moto_id, session_id, protocol_version)
-
-
-def _drain_helper_events(
-    events: queue.Queue[dict[str, Any]],
-    mqtt_client: Any,
-    topic: str,
-    msid: str,
-    dev_id: str,
-    moto_id: str,
-    session_id: str,
-    protocol_version: str,
-) -> list[dict[str, Any]]:
-    return _lib_drain_helper_events(events, mqtt_client, topic, msid, dev_id, moto_id, session_id, protocol_version)
-
-
-def _pion_helper_path() -> Path:
-    return _lib_pion_helper_path()
-
+            raise RuntimeError("Tuya Recordings camera activity is paused")
 
 def _safe_segment(value: str) -> str:
     return safe_segment(value)
@@ -1322,6 +1607,40 @@ def _mp4_cached(path: Path) -> bool:
     except OSError:
         return False
     return b"ftyp" in head
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _clip_has_event_thumbnail(clip: dict[str, Any]) -> bool:
+    """Match ``TimePieceBean.hasEvents()`` from Smart Life's SD event list."""
+    raw = clip.get("raw") if isinstance(clip, dict) else None
+    if not isinstance(raw, dict):
+        return False
+    for name in ("eventTypeArr", "event_types", "event_type_arr"):
+        value = raw.get(name)
+        if isinstance(value, (list, tuple)) and value:
+            return True
+    return False
+
+
+def _playback_fragments_json(start: int, end: int) -> str:
+    """Serialize one Smart Life ``TimePieceBean`` for play-mode playback."""
+    start = _as_epoch_seconds(start)
+    end = _as_epoch_seconds(end)
+    if start <= 0 or end <= start:
+        raise ValueError("Playback fragment bounds are invalid")
+    return json.dumps(
+        {"fragments": [{"start": start, "end": end}]},
+        separators=(",", ":"),
+    )
 
 
 def _serialize_media_failures(failures: dict[tuple[str, int, int], float]) -> dict[str, float]:

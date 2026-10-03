@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from custom_components.tuya_recordings import (
     _client_camera_tokens,
     _entries_for_call,
-    _localtuya_credential_entries,
     _official_tuya_camera_device_ids,
     _recording_trigger_entity_ids_from_states,
     _required_dependency_errors,
@@ -92,34 +91,20 @@ def test_client_camera_tokens_are_derived_from_cached_recording_cameras():
     assert _client_camera_tokens(client) == {"porch_cam", "garage_cam"}
 
 
-def test_required_dependency_errors_require_tuya_and_localtuya_cloud_credentials():
+def test_required_dependency_errors_require_only_official_tuya():
     hass = SimpleNamespace(config_entries=_ConfigEntries({}))
 
-    assert _required_dependency_errors(hass) == {"tuya_required", "localtuya_required"}
+    assert _required_dependency_errors(hass) == {"tuya_required"}
 
     hass = SimpleNamespace(
         config_entries=_ConfigEntries(
             {
                 "tuya": [SimpleNamespace(data={})],
-                "localtuya": [SimpleNamespace(data={"client_id": "id"})],
-            }
-        )
-    )
-
-    assert _required_dependency_errors(hass) == {"localtuya_cloud_credentials_required"}
-
-    localtuya_entry = SimpleNamespace(data={"client_id": "id", "client_secret": "secret", "user_id": "uid"})
-    hass = SimpleNamespace(
-        config_entries=_ConfigEntries(
-            {
-                "tuya": [SimpleNamespace(data={})],
-                "localtuya": [localtuya_entry],
             }
         )
     )
 
     assert _required_dependency_errors(hass) == set()
-    assert _localtuya_credential_entries(hass) == [localtuya_entry]
 
 
 def test_official_tuya_camera_device_ids_come_from_tuya_camera_entities():

@@ -1,5 +1,67 @@
 # Changelog
 
+## Tuya Recordings v0.4.0 (2026-10-03)
+
+Native Smart Life SD-card playback redesign.
+
+### Highlights
+
+- Replaces the experimental OpenAPI, WebRTC/Pion, and helper-binary paths with
+  an in-process implementation of the Smart Life APK's LAN-first protocol-302
+  signaling, bounded MQTT fallback, AES/KCP relay, recording catalog,
+  recording-thumbnail, and playback protocols.
+- Uses Tuya frame 32 over one serialized, non-reconnecting LAN socket when the
+  camera advertises LAN P2P policy and is locally discoverable; MQTT is opened
+  only when that bounded LAN discovery/connect attempt is unavailable.
+- Adds Smart Life QR authorization directly to the integration. LocalTuya and
+  a Tuya Developer project are no longer required.
+- Restores notification-driven motion and person binary sensors alongside the
+  camera event entity. The event entity is an additional automation/history
+  surface, not a replacement for the binary sensors.
+- Streams encoded camera video and audio without transcoding, with inline Plyr
+  controls for play, progress, volume, mute, and fullscreen.
+- Makes uncached browsing match Smart Life's playback model: one camera/day
+  wall-clock timeline, orange recording ranges, one active native session, and
+  wall-clock seeking without artificial clip-boundary stops.
+- Keeps the bounded thumbnail-and-clip library for optional full-video caching,
+  with the two playback contracts separated in both the API and frontend.
+- Makes Home Assistant Media Browser cached-file-only so browsing media cannot
+  start an uncached camera session or receive the native timeline stream.
+- Queries Smart Life's capability-gated event timeline and retrieves recording
+  JPEGs with the exact event bounds expected by `downloadPlaybackEventImageV2`,
+  serialized through one process-wide camera-command queue.
+- Keeps `PB_V21` limited to its actual purpose, selecting the ordinary V3
+  playback catalog. It is not treated as the thumbnail capability.
+- Derives thumbnails for ordinary timeline fragments from a bounded prefix of
+  the APK-native H.264 playback stream, stopping immediately after the first
+  decodable frame and retaining no temporary video.
+- Builds missing thumbnails from an already-cached MP4 before considering any
+  camera operation, using atomic validated JPEG publication.
+- Keeps local cached-file thumbnail extraction independent from camera/catalog
+  backoff without clearing a genuine remote camera cooldown.
+- Keeps optional full-video caching while making catalog and thumbnail upkeep
+  the default lightweight browsing mode.
+- Pauses background camera work while on-demand playback is active and drains
+  worker sessions cleanly during cancellation and integration unload.
+- Lets disconnected per-camera workers sleep until real work or shutdown instead
+  of polling an empty queue indefinitely.
+- Adds bounded catalog/thumbnail failure backoff, duplicate-thumbnail
+  single-flight protection, and credential-safe diagnostic representations.
+- Removes packaged executables, obsolete transport modules, stale browser
+  harnesses, and the LocalTuya runtime dependency.
+- Aligns the integration manifest with the non-beta `0.4.0` release and adds
+  deterministic pytest discovery, Ruff CI, and local brand-asset validation.
+
+### Validation
+
+- 475 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
+- Synthetic Chromium tests verify native H.264 plus PCM audio playback and the
+  cached panel at desktop, 390 px, and 320 px widths, plus the uncached
+  wall-clock timeline and continuous playback past a catalog boundary, without
+  contacting a camera.
+- Python compilation, JSON parsing, JavaScript syntax, packaging, secret, and
+  obsolete-transport checks pass.
+
 ## Tuya Recordings v0.3.0-beta.6
 
 Discovery and API compatibility hardening after additional report triage.

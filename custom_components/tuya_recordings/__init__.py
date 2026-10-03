@@ -1,40 +1,56 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import logging
+import time
+from pathlib import Path
 
 import voluptuous as vol
-
-from homeassistant.components import frontend
+from homeassistant.components import frontend as ha_frontend
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
-from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_time_interval,
+)
 
 from .client import TuyaRecordingsAuthError, TuyaRecordingsClient
 from .const import (
+    CATALOG_SYNC_DAYS_PER_PASS,
+    CATALOG_SYNC_INTERVAL,
+    CATALOG_SYNC_STARTUP_DELAY,
     CONF_CLOUD_ACTIVITY_PAUSED,
-    CONF_CLIENT_ID,
-    CONF_CLIENT_SECRET,
+    CONF_DEVICE_LOCAL_KEYS,
+    CONF_DEVICE_PROTOCOL_VERSIONS,
+    CONF_MEDIA_SYNC_ENABLED,
+    CONF_NATIVE_APP_SESSION,
+    CONF_THUMBNAIL_SYNC_ENABLED,
+    DATA_INTERACTIVE_PLAYBACK_ACTIVE,
     DOMAIN,
+    DEFAULT_MEDIA_SYNC_ENABLED,
     MEDIA_SYNC_INTERVAL,
     MEDIA_SYNC_STARTUP_DELAY,
-    RECORDING_TRIGGER_COOLDOWN,
-    RECORDING_TRIGGER_SETTLE_DELAY,
     PLATFORMS,
-    CONF_REGION,
-    CONF_USER_ID,
     SIGNAL_RECORDINGS_UPDATED,
-    THUMBNAIL_SYNC_INTERVAL,
+    THUMBNAIL_BACKGROUND_COOLDOWN,
+    THUMBNAIL_BACKGROUND_LIMIT,
     THUMBNAIL_SYNC_LIMIT,
-    THUMBNAIL_SYNC_STARTUP_DELAY,
 )
 from .frontend import FRONTEND_URL_PATH, async_register_frontend
-from .http import TuyaRecordingsPanelDataView, TuyaRecordingsPlaybackView, TuyaRecordingsThumbnailView
+from .http import (
+    TuyaRecordingsDebugView,
+    TuyaRecordingsPanelDataView,
+    TuyaRecordingsTimelineView,
+    TuyaRecordingsThumbnailView,
+)
+from .lib.commands import CameraWorkBusy, CameraWorkCancelled
+from .lib.native_setup import NativeBackendSetupError, native_app_session
 
 CONF_ENTRY_ID = "entry_id"
 CONF_LIMIT = "limit"
@@ -44,16 +60,48 @@ SERVICE_CLEAR_VIDEO_CACHE = "clear_video_cache"
 SERVICE_SYNC_MEDIA = "sync_media"
 SERVICE_POPULATE_THUMBNAILS = "populate_thumbnails"
 DATA_CAMERA_WORK_TASK = "camera_work_task"
+DATA_CATALOG_REFRESH_TASK = "catalog_refresh_task"
 DATA_MEDIA_SYNC_RUNNING = "media_sync_running"
 DATA_MEDIA_SYNC_PENDING = "media_sync_pending"
+DATA_MEDIA_SYNC_SCHEDULE = "media_sync_schedule"
 DATA_THUMBNAIL_SYNC_RUNNING = "thumbnail_sync_running"
 DATA_THUMBNAIL_SYNC_PENDING = "thumbnail_sync_pending"
 DATA_THUMBNAIL_SYNC_LIMIT = "thumbnail_sync_limit"
 DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA = "thumbnail_sync_require_media"
+DATA_THUMBNAIL_SYNC_REFRESH_CATALOG = "thumbnail_sync_refresh_catalog"
+DATA_THUMBNAIL_SYNC_RETRY_AFTER = "thumbnail_sync_retry_after"
+DATA_CAMERA_RESUME_TIMER = "camera_resume_timer"
 DATA_RECORDING_TRIGGER_TIMER = "recording_trigger_timer"
 DATA_RECORDING_TRIGGER_LAST = "recording_trigger_last"
+DATA_RECORDING_TRIGGER_UNSUB = "recording_trigger_unsub"
+CAMERA_RESUME_BACKGROUND_DELAY = 30
+NATIVE_SESSION_IMPORT_FILE = ".tuya_recordings_native_session_import.json"
+STALE_ENTRY_KEYS = {
+    "client_id",
+    "client_secret",
+    "cookies",
+    "go2rtc_url",
+    "login_result",
+    "protect_base_url",
+    "protect_cookie",
+    "protect_csrf",
+    "rtsp_port",
+    "server_host",
+}
 
 _LOGGER = logging.getLogger(__name__)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+def _monotonic(hass: HomeAssistant) -> float:
+    loop = getattr(hass, "loop", None)
+    if loop is not None and hasattr(loop, "time"):
+        return float(loop.time())
+    return time.monotonic()
+
+
+def _thumbnail_background_cooldown_until(hass: HomeAssistant) -> float:
+    return _monotonic(hass) + THUMBNAIL_BACKGROUND_COOLDOWN
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -63,27 +111,103 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate older Tuya Recordings config entries."""
-    stale_keys = {"cookies", "login_result", "server_host", "go2rtc_url", "rtsp_port"}
-    if entry.version < 2 or stale_keys.intersection(entry.data):
-        data = dict(entry.data)
+    stale_keys = STALE_ENTRY_KEYS
+    data = dict(entry.data)
+    changed = entry.version < 5 or bool(stale_keys.intersection(data))
+    if changed:
         for key in stale_keys:
             data.pop(key, None)
-        hass.config_entries.async_update_entry(entry, data=data, version=2)
+        if entry.version < 5:
+            # Version 4 populated this from moduleMap.wifi.pv, which is not
+            # DeviceBean's MQTT communication version.
+            data.pop(CONF_DEVICE_PROTOCOL_VERSIONS, None)
+
+    config = getattr(hass, "config", None)
+    if CONF_NATIVE_APP_SESSION not in data and config is not None:
+        import_path = Path(config.path(NATIVE_SESSION_IMPORT_FILE))
+        try:
+            imported = await hass.async_add_executor_job(
+                _read_native_session_import, import_path
+            )
+        except (OSError, ValueError) as err:
+            _LOGGER.error("Could not import the saved Smart Life session: %s", err)
+            return False
+        if imported is not None:
+            data.update(imported)
+            try:
+                native_app_session(data)
+            except NativeBackendSetupError as err:
+                _LOGGER.error("Saved Smart Life session import is incomplete: %s", err)
+                return False
+            await hass.async_add_executor_job(import_path.unlink)
+            changed = True
+
+    if changed:
+        hass.config_entries.async_update_entry(entry, data=data, version=5)
     return True
+
+
+def _read_native_session_import(path: Path) -> dict | None:
+    """Read and validate one explicitly staged beta-session migration file."""
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ValueError("session import is not valid JSON") from err
+    if not isinstance(payload, dict):
+        raise ValueError("session import must be an object")
+    session = payload.get(CONF_NATIVE_APP_SESSION)
+    local_keys = payload.get(CONF_DEVICE_LOCAL_KEYS)
+    protocols = payload.get(CONF_DEVICE_PROTOCOL_VERSIONS, {})
+    if not isinstance(session, dict):
+        raise ValueError("session import has no native app session")
+    if not isinstance(local_keys, dict) or not local_keys or any(
+        not isinstance(device_id, str)
+        or not device_id.strip()
+        or not isinstance(local_key, str)
+        or not local_key.strip()
+        for device_id, local_key in local_keys.items()
+    ):
+        raise ValueError("session import has no valid camera keys")
+    if not isinstance(protocols, dict):
+        raise ValueError("session import camera protocols are invalid")
+    return {
+        CONF_NATIVE_APP_SESSION: session,
+        CONF_DEVICE_LOCAL_KEYS: local_keys,
+        CONF_DEVICE_PROTOCOL_VERSIONS: protocols,
+    }
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     dependency_errors = _required_dependency_errors(hass)
     _async_update_dependency_issues(hass, dependency_errors)
     if dependency_errors:
-        raise ConfigEntryError("Tuya Recordings requires official Tuya and LocalTuya with cloud credentials")
+        raise ConfigEntryError("Tuya Recordings requires the official Tuya integration")
     _async_update_camera_repair_issues(hass)
 
     cache_path = Path(hass.config.path(".storage", DOMAIN, f"{entry.entry_id}_recordings.json"))
-    entry_data = _entry_data_with_localtuya_credentials(hass, entry)
+    entry_data = _entry_runtime_data(entry)
     _async_scrub_legacy_entry_data(hass, entry, entry_data)
-    client = TuyaRecordingsClient(entry_data, cache_path=cache_path)
+    try:
+        native_app_session(entry_data)
+    except NativeBackendSetupError:
+        raise ConfigEntryAuthFailed("Smart Life camera playback authorization is required")
+    client = TuyaRecordingsClient(
+        entry_data,
+        cache_path=cache_path,
+        hass=hass,
+    )
+    @callback
+    def update_camera_inventory(event=None):
+        client.set_camera_inventory(_official_tuya_camera_device_ids(
+            er.async_get(hass).entities.values(), dr.async_get(hass).devices,
+        ))
+
     await hass.async_add_executor_job(client.load_cache)
+    update_camera_inventory()
+    entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", update_camera_inventory))
+    entry.async_on_unload(hass.bus.async_listen("device_registry_updated", update_camera_inventory))
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"client": client, "entry": entry}
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     _async_register_services(hass)
@@ -96,48 +220,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 def _async_scrub_legacy_entry_data(hass: HomeAssistant, entry: ConfigEntry, entry_data: dict) -> None:
-    stale_keys = {"cookies", "login_result", "server_host", "go2rtc_url", "rtsp_port"}
-    clean_data = {key: value for key, value in entry_data.items() if key not in stale_keys}
-    if clean_data != dict(entry.data):
-        hass.config_entries.async_update_entry(entry, data=clean_data, version=2)
+    clean_data = {
+        key: value
+        for key, value in entry.data.items()
+        if key not in STALE_ENTRY_KEYS and key != CONF_THUMBNAIL_SYNC_ENABLED
+    }
+    clean_options = {
+        key: value
+        for key, value in entry.options.items()
+        if key not in STALE_ENTRY_KEYS and key != CONF_THUMBNAIL_SYNC_ENABLED
+    }
+    media_sync_enabled = bool(
+        clean_options.get(
+            CONF_MEDIA_SYNC_ENABLED,
+            clean_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED),
+        )
+    )
+    persisted_pause = clean_options.get(
+        CONF_CLOUD_ACTIVITY_PAUSED,
+        clean_data.get(CONF_CLOUD_ACTIVITY_PAUSED, False),
+    )
+    if not media_sync_enabled and persisted_pause:
+        clean_options[CONF_CLOUD_ACTIVITY_PAUSED] = False
+    if clean_data != dict(entry.data) or clean_options != dict(entry.options):
+        hass.config_entries.async_update_entry(entry, data=clean_data, options=clean_options, version=5)
 
 
-def _entry_data_with_localtuya_credentials(hass: HomeAssistant, entry: ConfigEntry) -> dict:
-    data = {**entry.data, **entry.options}
-    if data.get(CONF_CLIENT_ID) and data.get(CONF_CLIENT_SECRET) and data.get(CONF_USER_ID):
-        return data
-
-    for localtuya_entry in _localtuya_credential_entries(hass):
-        local_data = localtuya_entry.data
-        merged = {
-            **data,
-            CONF_CLIENT_ID: local_data["client_id"],
-            CONF_CLIENT_SECRET: local_data["client_secret"],
-            CONF_USER_ID: local_data["user_id"],
-            CONF_REGION: local_data.get("region", data.get(CONF_REGION, "us")),
-        }
-        _LOGGER.info("Tuya Recordings is using OpenAPI credentials from LocalTuya entry %s", localtuya_entry.title)
-        return merged
-    return data
+def _entry_runtime_data(entry: ConfigEntry) -> dict:
+    """Combine persisted setup and options for one runtime client."""
+    runtime = {**entry.data, **entry.options}
+    media_sync_enabled = bool(runtime.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
+    runtime[CONF_THUMBNAIL_SYNC_ENABLED] = media_sync_enabled
+    runtime[CONF_CLOUD_ACTIVITY_PAUSED] = bool(
+        media_sync_enabled and runtime.get(CONF_CLOUD_ACTIVITY_PAUSED, False)
+    )
+    return runtime
 
 
 def _required_dependency_errors(hass: HomeAssistant) -> set[str]:
     errors: set[str] = set()
     if not hass.config_entries.async_entries("tuya"):
         errors.add("tuya_required")
-    if not hass.config_entries.async_entries("localtuya"):
-        errors.add("localtuya_required")
-    elif not _localtuya_credential_entries(hass):
-        errors.add("localtuya_cloud_credentials_required")
     return errors
-
-
-def _localtuya_credential_entries(hass: HomeAssistant) -> list[ConfigEntry]:
-    return [
-        entry
-        for entry in hass.config_entries.async_entries("localtuya")
-        if entry.data.get("client_id") and entry.data.get("client_secret") and entry.data.get("user_id")
-    ]
 
 
 def _async_update_dependency_issues(hass: HomeAssistant, dependency_errors: set[str]) -> None:
@@ -156,32 +280,8 @@ def _async_update_dependency_issues(hass: HomeAssistant, dependency_errors: set[
 
 
 def _async_update_camera_repair_issues(hass: HomeAssistant) -> None:
-    entity_registry = er.async_get(hass)
-    device_registry = dr.async_get(hass)
-    tuya_cameras = _official_tuya_camera_device_ids(
-        er.async_entries_for_config_entry(entity_registry, _tuya_config_entry_id(hass)),
-        device_registry.devices.values(),
-    )
-    localtuya_ids = _localtuya_configured_device_ids(hass)
-    missing = sorted(name for device_id, name in tuya_cameras.items() if device_id not in localtuya_ids)
-    issue_id = "localtuya_camera_setup_incomplete"
-    if not missing:
-        ir.async_delete_issue(hass, DOMAIN, issue_id)
-        return
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        issue_id,
-        is_fixable=False,
-        severity=ir.IssueSeverity.WARNING,
-        translation_key=issue_id,
-        translation_placeholders={"cameras": ", ".join(missing)},
-    )
-
-
-def _tuya_config_entry_id(hass: HomeAssistant) -> str:
-    entries = hass.config_entries.async_entries("tuya")
-    return entries[0].entry_id if entries else ""
+    # Older releases incorrectly warned that cameras needed LocalTuya entries.
+    ir.async_delete_issue(hass, DOMAIN, "localtuya_camera_setup_incomplete")
 
 
 def _official_tuya_camera_device_ids(entity_entries, device_entries) -> dict[str, str]:
@@ -191,6 +291,7 @@ def _official_tuya_camera_device_ids(entity_entries, device_entries) -> dict[str
         if getattr(entry, "platform", "") == "tuya"
         and str(getattr(entry, "entity_id", "")).startswith("camera.")
         and getattr(entry, "device_id", None)
+        and getattr(entry, "disabled_by", None) is None
     }
     cameras: dict[str, str] = {}
     for device in device_entries:
@@ -202,28 +303,21 @@ def _official_tuya_camera_device_ids(entity_entries, device_entries) -> dict[str
     return cameras
 
 
-def _localtuya_configured_device_ids(hass: HomeAssistant) -> set[str]:
-    device_ids: set[str] = set()
-    for entry in hass.config_entries.async_entries("localtuya"):
-        devices = entry.data.get("devices") or {}
-        if isinstance(devices, dict):
-            device_ids.update(str(device_id) for device_id in devices)
-    return device_ids
-
-
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
         return
     client: TuyaRecordingsClient = entry_data["client"]
-    await hass.async_add_executor_job(client.update_options, {**entry.data, **entry.options})
+    await hass.async_add_executor_job(client.update_options, _entry_runtime_data(entry))
+    _async_schedule_media_sync(hass, entry)
+    _async_setup_recording_triggers(hass, entry)
     if client.cloud_activity_paused:
         await async_pause_camera_work(hass, entry.entry_id)
     async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry.entry_id)
 
 
 async def async_pause_camera_work(hass: HomeAssistant, entry_id: str) -> None:
-    """Clear queued Tuya camera work for an entry while cloud activity is paused."""
+    """Clear queued Tuya camera work for an entry while camera activity is paused."""
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if not isinstance(entry_data, dict):
         return
@@ -231,7 +325,24 @@ async def async_pause_camera_work(hass: HomeAssistant, entry_id: str) -> None:
     entry_data[DATA_THUMBNAIL_SYNC_PENDING] = False
     entry_data.pop(DATA_THUMBNAIL_SYNC_LIMIT, None)
     entry_data.pop(DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA, None)
+    entry_data.pop(DATA_THUMBNAIL_SYNC_REFRESH_CATALOG, None)
+    entry_data[DATA_THUMBNAIL_SYNC_RETRY_AFTER] = _thumbnail_background_cooldown_until(hass)
+    if timer := entry_data.pop(DATA_CAMERA_RESUME_TIMER, None):
+        timer()
     if timer := entry_data.pop(DATA_RECORDING_TRIGGER_TIMER, None):
+        timer()
+
+
+async def async_resume_camera_work(hass: HomeAssistant, entry_id: str) -> None:
+    """Clear camera backoff when explicitly enabled cache work resumes."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not isinstance(entry_data, dict):
+        return
+    client = entry_data.get("client")
+    if not isinstance(client, TuyaRecordingsClient) or client.cloud_activity_paused:
+        return
+    await hass.async_add_executor_job(client.reset_camera_work_backoff)
+    if timer := entry_data.pop(DATA_CAMERA_RESUME_TIMER, None):
         timer()
 
 
@@ -239,6 +350,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unload_ok:
         return False
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if isinstance(entry_data, dict) and isinstance(entry_data.get("client"), TuyaRecordingsClient):
+        _async_cancel_media_sync_schedule(entry_data)
+        if unsubscribe := entry_data.pop(DATA_RECORDING_TRIGGER_UNSUB, None):
+            unsubscribe()
+        await hass.async_add_executor_job(entry_data["client"].close)
+        await async_pause_camera_work(hass, entry.entry_id)
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if not _configured_entries(hass):
         hass.services.async_remove(DOMAIN, SERVICE_REFRESH)
@@ -246,9 +364,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_remove(DOMAIN, SERVICE_CLEAR_VIDEO_CACHE)
         hass.services.async_remove(DOMAIN, SERVICE_SYNC_MEDIA)
         hass.services.async_remove(DOMAIN, SERVICE_POPULATE_THUMBNAILS)
-        frontend.async_remove_panel(hass, FRONTEND_URL_PATH, warn_if_unknown=False)
+        ha_frontend.async_remove_panel(hass, FRONTEND_URL_PATH, warn_if_unknown=False)
         hass.data.get(DOMAIN, {}).pop("_panel_registered", None)
     return True
+
+
+async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Reload Tuya Recordings."""
+    if not await async_unload_entry(hass, entry):
+        return False
+    return await async_setup_entry(hass, entry)
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
@@ -258,11 +383,20 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def refresh_recordings(call) -> None:
         entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
         for entry_data in entries:
+            if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE):
+                _LOGGER.info("Skipping Tuya Recordings refresh during interactive playback")
+                continue
             if _entry_cloud_paused(entry_data):
-                _LOGGER.info("Skipping Tuya Recordings refresh because cloud activity is paused")
+                _LOGGER.info("Skipping Tuya Recordings refresh because camera activity is paused")
                 continue
             try:
-                await hass.async_add_executor_job(entry_data["client"].camera_index, True)
+                client = entry_data["client"]
+                if client.media_sync_enabled:
+                    await hass.async_add_executor_job(client.refresh_recent_recordings)
+                else:
+                    await _async_request_catalog_refresh(
+                        hass, entry_data["entry"].entry_id, "service", wait=True
+                    )
             except TuyaRecordingsAuthError as exc:
                 entry_data["entry"].async_start_reauth(hass)
                 raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
@@ -290,7 +424,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
         for entry_data in entries:
             if _entry_cloud_paused(entry_data):
-                _LOGGER.info("Skipping Tuya Recordings media sync because cloud activity is paused")
+                _LOGGER.info("Skipping Tuya Recordings media sync because camera activity is paused")
                 continue
             await _async_request_camera_work(hass, entry_data["entry"].entry_id, "service", media=True, thumbnails=True, wait=True)
 
@@ -299,7 +433,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         limit = int(call.data.get(CONF_LIMIT) or THUMBNAIL_SYNC_LIMIT)
         for entry_data in entries:
             if _entry_cloud_paused(entry_data):
-                _LOGGER.info("Skipping Tuya Recordings thumbnail sync because cloud activity is paused")
+                _LOGGER.info("Skipping Tuya Recordings thumbnail sync because camera activity is paused")
                 continue
             await _async_request_camera_work(
                 hass,
@@ -307,7 +441,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 "service",
                 thumbnails=True,
                 thumbnail_limit=limit,
-                require_media_sync=False,
+                require_media_sync=True,
+                refresh_catalog=False,
                 wait=True,
             )
 
@@ -329,117 +464,73 @@ def _async_register_views(hass: HomeAssistant) -> None:
     if hass.data.setdefault(DOMAIN, {}).get("_playback_view_registered"):
         return
     hass.http.register_view(TuyaRecordingsPanelDataView(hass))
-    hass.http.register_view(TuyaRecordingsPlaybackView(hass))
+    hass.http.register_view(TuyaRecordingsDebugView(hass))
+    hass.http.register_view(TuyaRecordingsTimelineView(hass))
     hass.http.register_view(TuyaRecordingsThumbnailView(hass))
     hass.data[DOMAIN]["_playback_view_registered"] = True
 
 
 def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    async def _run_thumbnail_interval(now) -> None:
-        if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
-            return
-        await _async_request_camera_work(
-            hass,
-            entry.entry_id,
-            "interval",
-            thumbnails=True,
-            thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
-            require_media_sync=False,
-        )
-
-    async def _run_media_interval(now) -> None:
-        if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
-            return
-        await _async_request_camera_work(hass, entry.entry_id, "interval", media=True)
-
-    async def _run_thumbnail_startup(now) -> None:
-        if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
-            return
-        await _async_request_camera_work(
-            hass,
-            entry.entry_id,
-            "startup",
-            thumbnails=True,
-            thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
-            require_media_sync=False,
-        )
-
-    async def _run_media_startup(now) -> None:
-        if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
-            return
-        await _async_request_camera_work(hass, entry.entry_id, "startup", media=True)
-
-    entry.async_on_unload(async_track_time_interval(hass, _run_thumbnail_interval, THUMBNAIL_SYNC_INTERVAL))
-    entry.async_on_unload(async_track_time_interval(hass, _run_media_interval, MEDIA_SYNC_INTERVAL))
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if isinstance(entry_data, dict) and entry_data.get("client") and (
-        not entry_data["client"].cloud_activity_paused and (entry_data["client"].media_sync_enabled or entry_data["client"].thumbnail_sync_enabled)
+    if not isinstance(entry_data, dict):
+        return
+    _async_cancel_media_sync_schedule(entry_data)
+    client = entry_data.get("client")
+    if (
+        not isinstance(client, TuyaRecordingsClient)
+        or client.cloud_activity_paused
+        or not _client_recording_backend_available(client)
     ):
-        entry.async_on_unload(async_call_later(hass, THUMBNAIL_SYNC_STARTUP_DELAY, _run_thumbnail_startup))
-    if isinstance(entry_data, dict) and entry_data.get("client") and not entry_data["client"].cloud_activity_paused and entry_data["client"].media_sync_enabled:
-        entry.async_on_unload(async_call_later(hass, MEDIA_SYNC_STARTUP_DELAY, _run_media_startup))
+        return
+
+    if not client.media_sync_enabled:
+        async def _run_catalog_cycle(now) -> None:
+            del now
+            if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
+                return
+            await _async_request_catalog_refresh(hass, entry.entry_id, "catalog_cycle")
+
+        entry_data[DATA_MEDIA_SYNC_SCHEDULE] = [
+            async_track_time_interval(hass, _run_catalog_cycle, CATALOG_SYNC_INTERVAL),
+            async_call_later(hass, CATALOG_SYNC_STARTUP_DELAY, _run_catalog_cycle),
+        ]
+        return
+
+    async def _run_cache_cycle(now) -> None:
+        if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
+            return
+        await _async_request_camera_work(
+            hass,
+            entry.entry_id,
+            "cache_cycle",
+            media=True,
+            thumbnails=True,
+            thumbnail_limit=THUMBNAIL_BACKGROUND_LIMIT,
+            require_media_sync=True,
+            refresh_catalog=False,
+        )
+
+    entry_data[DATA_MEDIA_SYNC_SCHEDULE] = [
+        async_track_time_interval(hass, _run_cache_cycle, MEDIA_SYNC_INTERVAL),
+        async_call_later(hass, MEDIA_SYNC_STARTUP_DELAY, _run_cache_cycle),
+    ]
+
+
+def _async_cancel_media_sync_schedule(entry_data: dict) -> None:
+    """Cancel every timer owned by optional local media caching."""
+    for cancel in entry_data.pop(DATA_MEDIA_SYNC_SCHEDULE, []):
+        cancel()
 
 
 def _async_setup_recording_triggers(hass: HomeAssistant, entry: ConfigEntry) -> None:
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    client = entry_data.get("client") if isinstance(entry_data, dict) else None
-    camera_tokens = _client_camera_tokens(client) if isinstance(client, TuyaRecordingsClient) else set()
-    entity_ids = _recording_trigger_entity_ids(hass, camera_tokens)
-    if not entity_ids:
-        _LOGGER.debug("Tuya Recordings found no HA camera trigger entities for %s", entry.entry_id)
+    if not isinstance(entry_data, dict):
         return
-
-    _LOGGER.info("Tuya Recordings will watch %s HA camera trigger entities for %s", len(entity_ids), entry.entry_id)
-
-    async def _handle_trigger(event: Event) -> None:
-        old_state = event.data.get("old_state")
-        new_state = event.data.get("new_state")
-        if not _state_change_suggests_recording(old_state, new_state):
-            return
-
-        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-        if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
-            return
-        client: TuyaRecordingsClient = entry_data["client"]
-        if client.cloud_activity_paused:
-            return
-        if not client.media_sync_enabled and not client.thumbnail_sync_enabled:
-            return
-
-        now = hass.loop.time()
-        last_trigger = float(entry_data.get(DATA_RECORDING_TRIGGER_LAST) or 0)
-        if now - last_trigger < RECORDING_TRIGGER_COOLDOWN:
-            return
-        entry_data[DATA_RECORDING_TRIGGER_LAST] = now
-
-        if entry_data.get(DATA_RECORDING_TRIGGER_TIMER):
-            return
-
-        async def _run_after_settle(now) -> None:
-            entry_data.pop(DATA_RECORDING_TRIGGER_TIMER, None)
-            await _async_request_camera_work(
-                hass,
-                entry.entry_id,
-                "ha_recording_trigger",
-                media=True,
-                thumbnails=True,
-                thumbnail_limit=THUMBNAIL_SYNC_LIMIT,
-                require_media_sync=False,
-            )
-
-        entry_data[DATA_RECORDING_TRIGGER_TIMER] = async_call_later(
-            hass,
-            RECORDING_TRIGGER_SETTLE_DELAY,
-            _run_after_settle,
-        )
-        _LOGGER.debug(
-            "Tuya Recordings queued sync for %s after HA camera trigger %s changed to %s",
-            entry.entry_id,
-            new_state.entity_id if isinstance(new_state, State) else event.data.get("entity_id"),
-            new_state.state if isinstance(new_state, State) else None,
-        )
-
-    entry.async_on_unload(async_track_state_change_event(hass, entity_ids, _handle_trigger))
+    if unsubscribe := entry_data.pop(DATA_RECORDING_TRIGGER_UNSUB, None):
+        unsubscribe()
+    # HA entity changes are noisy and not reliable proof that a new SD clip
+    # exists. Cache mode uses one bounded timer-driven command path instead.
+    return
 
 
 def _recording_trigger_entity_ids(hass: HomeAssistant, camera_tokens: set[str] | None = None) -> list[str]:
@@ -536,6 +627,63 @@ async def _async_run_sync_cycle(hass: HomeAssistant, entry_id: str, reason: str)
     await _async_request_camera_work(hass, entry_id, reason, media=True, thumbnails=True, wait=True)
 
 
+async def _async_request_catalog_refresh(
+    hass: HomeAssistant,
+    entry_id: str,
+    reason: str,
+    *,
+    wait: bool = False,
+) -> None:
+    """Queue one lightweight, newest-first recording catalog pass.
+
+    This is deliberately separate from optional local media caching. The
+    native backend's shared command queue keeps it behind active playback and
+    other camera commands.
+    """
+    entry_data = _entry_data(hass, entry_id)
+    if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
+        return
+    client: TuyaRecordingsClient = entry_data["client"]
+    if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE):
+        _LOGGER.debug("Skipping Tuya Recordings catalog refresh during interactive playback")
+        return
+    if client.cloud_activity_paused or not _client_recording_backend_available(client):
+        return
+
+    task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
+    if task is None or task.done():
+        task = hass.async_create_task(_async_run_catalog_refresh(hass, entry_id, reason))
+        entry_data[DATA_CATALOG_REFRESH_TASK] = task
+    if wait:
+        await task
+
+
+async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason: str) -> None:
+    """Run one bounded metadata-only catalog pass without media transfer."""
+    entry_data = _entry_data(hass, entry_id)
+    if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
+        return
+    client: TuyaRecordingsClient = entry_data["client"]
+    try:
+        if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:
+            return
+        result = await hass.async_add_executor_job(
+            client.refresh_background_catalog, CATALOG_SYNC_DAYS_PER_PASS
+        )
+        _LOGGER.info("Tuya Recordings catalog refresh result for %s via %s: %s", entry_id, reason, result)
+        if not client.cloud_activity_paused:
+            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)
+    except (CameraWorkBusy, CameraWorkCancelled):
+        _LOGGER.debug("Tuya Recordings catalog refresh deferred for %s", entry_id)
+    except TuyaRecordingsAuthError as exc:
+        if not client.cloud_activity_paused:
+            entry_data["entry"].async_start_reauth(hass)
+        raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
+    finally:
+        if entry_data.get(DATA_CATALOG_REFRESH_TASK) is not None:
+            entry_data.pop(DATA_CATALOG_REFRESH_TASK, None)
+
+
 async def _async_request_camera_work(
     hass: HomeAssistant,
     entry_id: str,
@@ -545,28 +693,52 @@ async def _async_request_camera_work(
     thumbnails: bool = False,
     thumbnail_limit: int = THUMBNAIL_SYNC_LIMIT,
     require_media_sync: bool = True,
+    refresh_catalog: bool = True,
     wait: bool = False,
 ) -> None:
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
         return
     client: TuyaRecordingsClient = entry_data["client"]
+    if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE):
+        _LOGGER.debug("Skipping Tuya Recordings %s work during interactive playback", reason)
+        return
     if client.cloud_activity_paused:
         entry_data[DATA_MEDIA_SYNC_PENDING] = False
         entry_data[DATA_THUMBNAIL_SYNC_PENDING] = False
+        return
+    if not _client_recording_backend_available(client):
+        entry_data.pop(DATA_MEDIA_SYNC_PENDING, None)
+        entry_data.pop(DATA_THUMBNAIL_SYNC_PENDING, None)
+        entry_data.pop(DATA_THUMBNAIL_SYNC_LIMIT, None)
+        entry_data.pop(DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA, None)
+        entry_data.pop(DATA_THUMBNAIL_SYNC_REFRESH_CATALOG, None)
+        _LOGGER.debug("Skipping Tuya Recordings %s work because APK-native playback backend is not available", reason)
         return
     queued = False
     if media and client.media_sync_enabled:
         if not entry_data.get(DATA_MEDIA_SYNC_RUNNING):
             entry_data[DATA_MEDIA_SYNC_PENDING] = True
         queued = True
-    thumbnail_enabled = bool(getattr(client, "thumbnail_sync_enabled", False))
-    if thumbnails and (client.media_sync_enabled or thumbnail_enabled or not require_media_sync):
+    if thumbnails and client.media_sync_enabled:
+        retry_after = float(entry_data.get(DATA_THUMBNAIL_SYNC_RETRY_AFTER) or 0)
+        if refresh_catalog and retry_after > _monotonic(hass):
+            return
+        if refresh_catalog:
+            entry_data.pop(DATA_THUMBNAIL_SYNC_RETRY_AFTER, None)
         if not entry_data.get(DATA_THUMBNAIL_SYNC_RUNNING):
             entry_data[DATA_THUMBNAIL_SYNC_PENDING] = True
-            entry_data[DATA_THUMBNAIL_SYNC_LIMIT] = max(int(entry_data.get(DATA_THUMBNAIL_SYNC_LIMIT) or 0), thumbnail_limit)
+            previous_limit = entry_data.get(DATA_THUMBNAIL_SYNC_LIMIT)
+            thumbnail_limit = max(1, int(thumbnail_limit or THUMBNAIL_BACKGROUND_LIMIT))
+            entry_data[DATA_THUMBNAIL_SYNC_LIMIT] = (
+                thumbnail_limit if previous_limit is None else
+                min(int(previous_limit), thumbnail_limit)
+            )
             entry_data[DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA] = bool(
                 entry_data.get(DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA, True) and require_media_sync
+            )
+            entry_data[DATA_THUMBNAIL_SYNC_REFRESH_CATALOG] = bool(
+                entry_data.get(DATA_THUMBNAIL_SYNC_REFRESH_CATALOG, False) or refresh_catalog
             )
         queued = True
     if not queued:
@@ -580,21 +752,39 @@ async def _async_request_camera_work(
         await task
 
 
+def _client_recording_backend_available(client: TuyaRecordingsClient) -> bool:
+    backend = getattr(client, "_recordings_backend", None)
+    if backend is None:
+        return True
+    if getattr(backend, "name", "") == "apk-native-not-configured":
+        return False
+    return bool(getattr(backend, "clip_playback_available", True))
+
+
 async def _async_run_camera_work(hass: HomeAssistant, entry_id: str, reason: str) -> None:
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
         return
     client: TuyaRecordingsClient = entry_data["client"]
     while True:
+        if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE):
+            entry_data[DATA_MEDIA_SYNC_PENDING] = False
+            entry_data[DATA_THUMBNAIL_SYNC_PENDING] = False
+            return
         if client.cloud_activity_paused:
             await async_pause_camera_work(hass, entry_id)
             return
         if entry_data.pop(DATA_MEDIA_SYNC_PENDING, False):
-            if client.media_sync_enabled and not client.cloud_activity_paused:
+            if (client.media_sync_enabled and not client.cloud_activity_paused
+                    and not entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE)):
                 entry_data[DATA_MEDIA_SYNC_RUNNING] = True
                 try:
-                    result = await hass.async_add_executor_job(client.sync_recordings)
+                    cancellation = client.media_work_cancellation()
+                    result = await hass.async_add_executor_job(client.sync_recordings, cancellation)
                     _LOGGER.info("Tuya Recordings media sync result for %s via %s: %s", entry_id, reason, result)
+                except (CameraWorkBusy, CameraWorkCancelled):
+                    _LOGGER.debug("Tuya Recordings media work stopped for %s", entry_id)
+                    return
                 except TuyaRecordingsAuthError as exc:
                     entry_data["entry"].async_start_reauth(hass)
                     raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
@@ -604,21 +794,42 @@ async def _async_run_camera_work(hass: HomeAssistant, entry_id: str, reason: str
             continue
 
         if entry_data.pop(DATA_THUMBNAIL_SYNC_PENDING, False):
-            limit = int(entry_data.pop(DATA_THUMBNAIL_SYNC_LIMIT, THUMBNAIL_SYNC_LIMIT) or THUMBNAIL_SYNC_LIMIT)
+            limit = max(1, int(entry_data.pop(DATA_THUMBNAIL_SYNC_LIMIT, THUMBNAIL_SYNC_LIMIT) or THUMBNAIL_BACKGROUND_LIMIT))
             require_media_sync = bool(entry_data.pop(DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA, True))
-            if client.cloud_activity_paused:
+            refresh_catalog = bool(entry_data.pop(DATA_THUMBNAIL_SYNC_REFRESH_CATALOG, True))
+            if client.cloud_activity_paused or entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE):
                 continue
             if require_media_sync and not client.media_sync_enabled:
                 continue
-            if not require_media_sync and not client.media_sync_enabled and not client.thumbnail_sync_enabled:
+            if not client.media_sync_enabled:
                 continue
             entry_data[DATA_THUMBNAIL_SYNC_RUNNING] = True
             try:
-                result = await hass.async_add_executor_job(client.populate_thumbnails, limit)
+                cancellation = client.thumbnail_work_cancellation(require_media_sync)
+                result = await hass.async_add_executor_job(
+                    client.sync_thumbnails,
+                    limit,
+                    cancellation,
+                    refresh_catalog,
+                )
+                if client.cloud_activity_paused:
+                    return
+                if result.get("checked") or result.get("failed"):
+                    entry_data[DATA_THUMBNAIL_SYNC_RETRY_AFTER] = _thumbnail_background_cooldown_until(hass)
+                else:
+                    entry_data.pop(DATA_THUMBNAIL_SYNC_RETRY_AFTER, None)
                 _LOGGER.info("Tuya Recordings thumbnail sync result for %s via %s: %s", entry_id, reason, result)
+            except (CameraWorkBusy, CameraWorkCancelled):
+                _LOGGER.debug("Tuya Recordings thumbnail work stopped for %s", entry_id)
+                return
+            except TuyaRecordingsAuthError as exc:
+                if not client.cloud_activity_paused:
+                    entry_data["entry"].async_start_reauth(hass)
+                raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
             finally:
                 entry_data[DATA_THUMBNAIL_SYNC_RUNNING] = False
-            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)
+            if not client.cloud_activity_paused:
+                async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)
             continue
 
         return

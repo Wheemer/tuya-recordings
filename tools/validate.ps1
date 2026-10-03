@@ -1,5 +1,6 @@
 param(
-    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [switch]$Browser
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,11 +24,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "Translation validation failed."
 }
 
+& python -m ruff check custom_components tests
+if ($LASTEXITCODE -ne 0) {
+    throw "Ruff validation failed."
+}
+
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1"
 $env:PYTHONPATH = $Root
 Push-Location $Root
 try {
-    & python -m pytest -p no:cacheprovider
+    & python -m pytest -p no:cacheprovider -p pytest_asyncio.plugin tests
     if ($LASTEXITCODE -ne 0) {
         throw "Pytest failed."
     }
@@ -36,30 +42,21 @@ finally {
     Pop-Location
 }
 
-$oldNames = rg "tuya_protect_recordings|Tuya Protect Recordings|ProtectRecordings|ProtectAuth|ProtectApi|TuyaProtect|Camera Bridge|protect_recordings|tuya-protect|tuya_protect|aiortc" $Root -g "!**/__pycache__/**" -g "!**/validate.ps1" -g "!**/build_helpers.ps1" 2>$null
-if ($LASTEXITCODE -eq 0) {
-    $oldNames
-    throw "Old integration naming or stale WebRTC references remain."
-}
-if ($LASTEXITCODE -ne 1) {
-    throw "Name scan failed."
-}
-
-$helpers = @(
-    "pion_offer_linux_amd64",
-    "pion_offer_linux_arm64",
-    "pion_offer_linux_armv7"
-) | ForEach-Object { Join-Path $component $_ }
-
-foreach ($helper in $helpers) {
-    if (-not (Test-Path -LiteralPath $helper)) {
-        throw "Missing bundled Pion helper: $helper"
+if ($Browser) {
+    Push-Location $Root
+    try {
+        & python tests/native_player.browser.py
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native player browser validation failed."
+        }
+        & python tests/panel_style.browser.py
+        if ($LASTEXITCODE -ne 0) {
+            throw "Panel browser validation failed."
+        }
+    }
+    finally {
+        Pop-Location
     }
 }
-
-Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -Filter "__pycache__" |
-    Remove-Item -Recurse -Force
-Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -Filter ".pytest_cache" |
-    Remove-Item -Recurse -Force
 
 Write-Host "Tuya Recordings validation passed."

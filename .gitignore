@@ -6,9 +6,23 @@ __pycache__/
 
 notes/
 third_party_research/
+docs/
+outputs/
+
+# Host-specific reverse-engineering and one-shot probe tooling.
+tools/dev_host/
+tools/ghidra/
+tools/controlled_relay_probe.py
+tools/disassemble_elf_symbol.py
+tools/inspect_camera_native.py
+tools/inspect_upstream_sdk.py
 
 tools/pion_offer_probe.exe
 tools/pion_offer_probe/pion_offer*
 
 *.tmp
 *.log
+
+# Home Assistant 2026.3+ loads local integration branding from brand/.
+/custom_components/tuya_recordings/icon.png
+/custom_components/tuya_recordings/logo.png

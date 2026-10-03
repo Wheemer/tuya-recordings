@@ -1,25 +1,40 @@
 # Third-Party Notices
 
-Tuya Recordings bundles small Linux helper binaries used to establish Tuya IPC
-WebRTC sessions and remux SD-card playback into cached MP4 files.
+## tuya-ipc-p2p-sdk
 
-## Pion
+Tuya Recordings includes a modified copy of `tuya-ipc-p2p-sdk` for the
+clean-room Smart Life native P2P signaling, relay, AES record, and KCP
+transport implementation.
 
-The helper is built with the Pion WebRTC stack.
-
-- Project: https://github.com/pion/webrtc
+- Copyright Rodrigo Roque and contributors
 - License: MIT
+- Source: https://github.com/roquerodrigo/tuya-ipc-p2p-sdk
+- Included license: `custom_components/tuya_recordings/vendor/tuya_ipc_p2p_sdk/LICENSE.txt`
 
-The source used to build the helper is in `tools/pion_offer_probe`.
+# Plyr
 
-## Patched Pion ICE Source
+The recordings frontend bundles Plyr 3.8.4 (MIT), by Sam Potts and contributors.
+Source: https://github.com/sampotts/plyr
+Distribution: https://registry.npmjs.org/plyr/-/plyr-3.8.4.tgz
+The unmodified JavaScript, CSS, SVG sprite and license are included under
+`custom_components/tuya_recordings/frontend/vendor/plyr/`.
+Plyr provides playback controls; the integration retains camera-session handling.
 
-`tools/pion_ice_patch` contains the patched Pion ICE source used by the helper
-build. It is included so the bundled helper can be rebuilt and audited from
-source.
+## vis-timeline
 
-- Upstream project: https://github.com/pion/ice
+The recordings frontend bundles vis-timeline 8.5.4 for the uncached SD-card
+wall-clock timeline.
+
+- Copyright vis.js contributors
+- License: Apache-2.0 OR MIT
+- Source: https://github.com/visjs/vis-timeline
+- Included licenses: `custom_components/tuya_recordings/frontend/vendor/vis-timeline/`
+
+## TinyTuya
+
+Tuya Recordings uses TinyTuya 1.20.0 for Tuya LAN discovery, protocol 3.1-3.5
+socket negotiation, and frame-32 signaling transport.
+
+- Copyright Jason Cox and contributors
 - License: MIT
-
-See `tools/pion_ice_patch/LICENSE` and
-`tools/pion_ice_patch/LICENSES/MIT.txt` for the upstream license text.
+- Source: https://github.com/jasonacox/tinytuya

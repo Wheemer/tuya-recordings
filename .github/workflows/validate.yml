@@ -1,0 +1,59 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+          python -m playwright install --with-deps chromium
+      - name: Validate Python, JSON, and tests
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m compileall -q custom_components tests
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          component = Path("custom_components/tuya_recordings")
+          for path in [component / "manifest.json", component / "strings.json", *sorted((component / "translations").glob("*.json"))]:
+              json.loads(path.read_text(encoding="utf-8"))
+          PY
+          python -m ruff check custom_components tests
+          python -m pytest -q
+      - name: Validate browser playback and layout
+        run: |
+          python tests/native_player.browser.py
+          python tests/panel_style.browser.py
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@22.5.0
+        with:
+          category: integration

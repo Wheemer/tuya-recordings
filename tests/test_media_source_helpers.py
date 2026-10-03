@@ -150,30 +150,9 @@ def test_require_cached_clip_playback_url_rejects_storage_outside_media(monkeypa
         source._require_cached_clip_playback_url(client, "cam", 10, 20)
 
 
-def test_resolve_clip_playback_url_downloads_uncached_when_lazy(monkeypatch):
+def test_media_browser_rejects_uncached_recording(monkeypatch):
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
-
-    assert source._resolve_clip_playback_url(client, "cam", 10, 20) == f"/media/local/{DOMAIN}/videos/cam_10_20.mp4"
-    assert client.downloaded == [("cam", 10, 20, client.path)]
-
-
-def test_resolve_clip_playback_url_rejects_uncached_when_cloud_paused(monkeypatch):
-    source = TuyaRecordingsMediaSource(hass=None)
-    client = DownloadingClipClient()
-    client.cloud_activity_paused = True
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
-
-    with pytest.raises(RuntimeError, match="paused"):
-        source._resolve_clip_playback_url(client, "cam", 10, 20)
-    assert client.downloaded == []
-
-
-def test_resolve_clip_playback_url_rejects_uncached_when_precache_enabled(monkeypatch):
-    source = TuyaRecordingsMediaSource(hass=None)
-    client = DownloadingClipClient()
-    client.media_sync_enabled = True
     monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
 
     with pytest.raises(RuntimeError, match="not cached"):
@@ -181,12 +160,12 @@ def test_resolve_clip_playback_url_rejects_uncached_when_precache_enabled(monkey
     assert client.downloaded == []
 
 
-def test_visible_clips_lazy_mode_includes_uncached():
+def test_visible_clips_hides_uncached_recording():
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
     camera = {"devId": "cam", "clips": [{"start": 10, "end": 20, "date": "2026-06-29"}]}
 
-    assert source._visible_clips(client, camera) == camera["clips"]
+    assert source._visible_clips(client, camera) == []
 
 
 def test_visible_clips_precache_mode_requires_cached_video_and_thumbnail():

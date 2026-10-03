@@ -3,13 +3,13 @@
   "name": "Tuya Recordings",
   "codeowners": ["@Wheemer"],
   "config_flow": true,
-  "dependencies": ["frontend", "http", "media_source", "panel_custom", "tuya", "localtuya"],
-  "integration_type": "hub",
+  "dependencies": ["ffmpeg", "frontend", "http", "media_source", "panel_custom", "tuya"],
   "documentation": "https://github.com/Wheemer/tuya-recordings",
-  "issue_tracker": "https://github.com/Wheemer/tuya-recordings/issues",
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "requirements": ["paho-mqtt>=2.0.0", "requests>=2.31.0"],
-  "version": "0.3.0-beta.6"
+  "issue_tracker": "https://github.com/Wheemer/tuya-recordings/issues",
+  "requirements": ["aiomqtt>=2.0.0", "cryptography>=44.0.0", "paho-mqtt==2.1.0", "requests>=2.31.0", "tinytuya==1.20.0"],
+  "version": "0.4.0"
 }
 
 

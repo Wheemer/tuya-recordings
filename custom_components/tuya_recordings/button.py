@@ -46,7 +46,7 @@ class TuyaRecordingsRefreshButton(ButtonEntity):
         if not isinstance(entry_data, dict) or not entry_data.get("client"):
             return
         if getattr(entry_data["client"], "cloud_activity_paused", False):
-            LOGGER.info("Skipping Tuya Recordings manual refresh because cloud activity is paused")
+            LOGGER.info("Skipping Tuya Recordings manual refresh because camera activity is paused")
             return
 
         try:

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 
-def normalize_clip(clip: Any) -> dict[str, Any] | None:
+def normalize_clip(
+    clip: Any, *, catalog_day: date | None = None
+) -> dict[str, Any] | None:
     if not isinstance(clip, dict):
         return None
 
-    start = as_epoch_seconds(clip.get("st") or clip.get("startTime"))
-    end = as_epoch_seconds(clip.get("ed") or clip.get("endTime"))
+    start = as_epoch_seconds(
+        clip.get("st") or clip.get("startTime") or clip.get("start_time")
+    )
+    end = as_epoch_seconds(
+        clip.get("ed") or clip.get("endTime") or clip.get("end_time")
+    )
     if not start or not end:
         return None
 
@@ -20,12 +26,40 @@ def normalize_clip(clip: Any) -> dict[str, Any] | None:
     normalized = {
         "start": start,
         "end": end,
-        "date": start_dt.date().isoformat(),
+        # The camera's day-catalog request is authoritative. Converting the
+        # epoch in HA's host timezone can otherwise move recordings around
+        # midnight onto the previous or following date.
+        "date": (catalog_day or start_dt.date()).isoformat(),
         "title": f"{start_dt:%H:%M:%S} - {end_dt:%H:%M:%S}",
         "raw": {
             key: value
             for key, value in clip.items()
-            if key in {"st", "ed", "startTime", "endTime", "type", "eventType"}
+            if key
+            in {
+                "st",
+                "ed",
+                "startTime",
+                "endTime",
+                "start_time",
+                "end_time",
+                "type",
+                "eventType",
+                "event_type",
+            }
+            or key in {
+                "event",
+                "eventTypeArr",
+                "event_types",
+                "videoType",
+                "video_type",
+                "uuid",
+                "encrypt",
+                "encryptMD5",
+                "encrypt_md5",
+                "cameraChannel",
+                "aiDetectList",
+                "fragments",
+            }
             or looks_like_thumbnail_key(key)
         },
     }

@@ -6,28 +6,45 @@ from homeassistant.const import Platform
 DOMAIN = "tuya_recordings"
 NAME = "Tuya Recordings"
 LOGGER = logging.getLogger(__package__)
-PLATFORMS = [Platform.BUTTON, Platform.SENSOR, Platform.SWITCH]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.EVENT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 MANUFACTURER = "Tuya"
 SIGNAL_RECORDINGS_UPDATED = f"{DOMAIN}_recordings_updated"
-MEDIA_SYNC_INTERVAL = timedelta(minutes=2)
-MEDIA_SYNC_STARTUP_DELAY = 30
+MEDIA_SYNC_INTERVAL = timedelta(minutes=15)
+MEDIA_SYNC_STARTUP_DELAY = 5 * 60
+# Catalog refreshes only request the recording index. They never open clip
+# playback, download media, or render thumbnails. Keep them regular enough for
+# the timeline to remain current while the shared camera queue stays serial.
+CATALOG_SYNC_INTERVAL = timedelta(minutes=2)
+CATALOG_SYNC_STARTUP_DELAY = 30
+CATALOG_SYNC_DAYS_PER_PASS = 2
 THUMBNAIL_SYNC_LIMIT = 10
-THUMBNAIL_SYNC_INTERVAL = timedelta(minutes=1)
-THUMBNAIL_SYNC_STARTUP_DELAY = 90
+THUMBNAIL_BACKGROUND_LIMIT = 10
+# Thumbnails are rendered only from locally cached MP4 files. They do not own
+# a timer or a camera session; cache cycles perform this local follow-up work.
+THUMBNAIL_SYNC_INTERVAL = MEDIA_SYNC_INTERVAL
+THUMBNAIL_SYNC_STARTUP_DELAY = MEDIA_SYNC_STARTUP_DELAY
+THUMBNAIL_BACKGROUND_COOLDOWN = 60
 RECORDING_TRIGGER_SETTLE_DELAY = 45
 RECORDING_TRIGGER_COOLDOWN = 90
 
-CONF_CLIENT_ID = "client_id"
-CONF_CLIENT_SECRET = "client_secret"
 CONF_LOOKBACK_DAYS = "lookback_days"
 CONF_MEDIA_SYNC_ENABLED = "media_sync_enabled"
 CONF_MEDIA_SYNC_HOURS = "media_sync_hours"
 CONF_MEDIA_STORAGE_PATH = "media_storage_path"
 CONF_MEDIA_VIEW_RECORDINGS_ORDER = "media_view_recordings_order"
 CONF_THUMBNAIL_SYNC_ENABLED = "thumbnail_sync_enabled"
+DATA_INTERACTIVE_PLAYBACK_ACTIVE = "interactive_playback_active"
 CONF_CLOUD_ACTIVITY_PAUSED = "cloud_activity_paused"
 CONF_REGION = "region"
-CONF_USER_ID = "user_id"
+CONF_NATIVE_APP_SESSION = "native_app_session"
+CONF_DEVICE_LOCAL_KEYS = "device_local_keys"
+CONF_DEVICE_PROTOCOL_VERSIONS = "device_protocol_versions"
 
 DEFAULT_REGION = "us"
 DEFAULT_LOOKBACK_DAYS = 0

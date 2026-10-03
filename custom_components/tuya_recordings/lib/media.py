@@ -92,7 +92,6 @@ def cleanup_cached_media(
 ) -> dict[str, int]:
     deleted_videos = _cleanup_cached_folder(media_storage_path / "videos", ".mp4", desired_clips, cutoff, logger)
     deleted_videos += _cleanup_temp_files(media_storage_path / "videos", "*.tmp.mp4", logger)
-    deleted_videos += _cleanup_temp_files(media_storage_path / "videos", "*.mp4.h264.pipe", logger)
     deleted_thumbnails = _cleanup_cached_folder(media_storage_path / "thumbs", ".jpg", desired_clips, cutoff, logger)
     deleted_thumbnails += _cleanup_temp_files(media_storage_path / "thumbs", "*.tmp.jpg", logger)
     return {"deleted_videos": deleted_videos, "deleted_thumbnails": deleted_thumbnails}

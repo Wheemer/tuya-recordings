@@ -115,8 +115,6 @@ class TuyaRecordingsMediaSource(MediaSource):
                 )
                 for clip in clips
             ]
-            if not getattr(client, "cloud_activity_paused", False):
-                self._schedule_thumbnail_autofill(client, dev_id, clips)
             return self._directory_node(identifier=identifier, title=clip_date, children=children)
 
         if dev_id and start and end:
@@ -125,9 +123,9 @@ class TuyaRecordingsMediaSource(MediaSource):
                 domain=DOMAIN,
                 identifier=identifier,
                 media_class=MediaClass.VIDEO,
-                media_content_type="video/mp4",
+                media_content_type="",
                 title=self._clip_title(int(start), int(end), use_12h=use_12h),
-                can_play=True,
+                can_play=False,
                 can_expand=False,
                 children=[],
                 thumbnail=None,
@@ -151,16 +149,16 @@ class TuyaRecordingsMediaSource(MediaSource):
 
         client = self._client()
         try:
-            playback_url = await self.hass.async_add_executor_job(
+            url = await self.hass.async_add_executor_job(
                 self._resolve_clip_playback_url,
                 client,
                 dev_id,
                 start,
                 end,
             )
-        except Exception as exc:
-            raise Unresolvable(f"Tuya recording is not playable yet: {exc}") from exc
-        return PlayMedia(playback_url, "video/mp4")
+        except RuntimeError as exc:
+            raise Unresolvable(str(exc)) from exc
+        return PlayMedia(url, "video/mp4")
 
     async def _async_load_index(self) -> dict[str, Any]:
         entries = self.hass.data.get(DOMAIN, {})
@@ -175,12 +173,6 @@ class TuyaRecordingsMediaSource(MediaSource):
             if isinstance(entry_data, dict) and (client := entry_data.get("client")):
                 return client
         raise Unresolvable(f"{NAME} is not configured.")
-
-    def _schedule_thumbnail_autofill(self, client: Any, dev_id: str, clips: list[dict[str, Any]]) -> None:
-        async def _run() -> None:
-            await self.hass.async_add_executor_job(client.populate_thumbnails_for_clips, dev_id, clips)
-
-        self.hass.async_create_task(_run())
 
     async def _async_use_12h_time(self) -> bool:
         return await self.hass.async_add_executor_job(self._use_12h_time)
@@ -256,32 +248,23 @@ class TuyaRecordingsMediaSource(MediaSource):
         return f"/media/local/{DOMAIN}/videos/{quote(name)}"
 
     def _cached_clip_playback_url(self, client: Any, dev_id: str, start: int, end: int) -> str | None:
-        clip_path = client.clip_path(dev_id, start, end)
-        if hasattr(client, "clip_cached") and not client.clip_cached(dev_id, start, end):
+        path = client.clip_path(dev_id, start, end)
+        if not self._clip_ready(client, dev_id, start, end, path):
             return None
-        if not hasattr(client, "clip_cached") and not self._path_ready(clip_path):
-            return None
-        return self._local_media_url(clip_path)
+        return self._local_media_url(path)
 
     def _require_cached_clip_playback_url(self, client: Any, dev_id: str, start: int, end: int) -> str:
-        clip_path = client.clip_path(dev_id, start, end)
-        clip_cached = client.clip_cached(dev_id, start, end) if hasattr(client, "clip_cached") else self._path_ready(clip_path)
-        if not clip_cached:
-            raise RuntimeError("clip is not cached")
-        playback_url = self._local_media_url(clip_path)
-        if not playback_url:
-            raise RuntimeError("clip storage path must be under /media for Home Assistant Media Browser playback")
-        return playback_url
+        cached = self._cached_clip_playback_url(client, dev_id, start, end)
+        if cached:
+            return cached
+        path = client.clip_path(dev_id, start, end)
+        if self._path_ready(path) and self._local_media_url(path) is None:
+            raise RuntimeError("Cached Tuya recording must be stored under /media to play in Home Assistant.")
+        if self._path_ready(path):
+            raise RuntimeError("Cached Tuya recording is not browser-ready yet.")
+        raise RuntimeError("Tuya recording is not cached yet.")
 
     def _resolve_clip_playback_url(self, client: Any, dev_id: str, start: int, end: int) -> str:
-        clip_path = client.clip_path(dev_id, start, end)
-        clip_cached = client.clip_cached(dev_id, start, end) if hasattr(client, "clip_cached") else self._path_ready(clip_path)
-        if not clip_cached:
-            if getattr(client, "cloud_activity_paused", False):
-                raise RuntimeError("Tuya Recordings cloud activity is paused")
-            if self._requires_ready_cache(client):
-                raise RuntimeError("clip is not cached")
-            client.download_clip(dev_id, start, end, clip_path)
         return self._require_cached_clip_playback_url(client, dev_id, start, end)
 
     def _visible_clips(self, client: Any, camera: dict[str, Any]) -> list[dict[str, Any]]:
@@ -289,20 +272,15 @@ class TuyaRecordingsMediaSource(MediaSource):
         dev_id = str(camera.get("devId") or "")
         if not dev_id:
             return visible
-        cache_only = self._requires_ready_cache(client)
         for clip in camera.get("clips", []):
             start = int(clip.get("start") or 0)
             end = int(clip.get("end") or 0)
             if not start or not end:
                 continue
-            if cache_only:
-                clip_cached = client.clip_cached(dev_id, start, end) if hasattr(client, "clip_cached") else self._path_ready(client.clip_path(dev_id, start, end))
-                thumbnail_cached = self._path_ready(client.thumbnail_path(dev_id, start, end))
-                if not clip_cached or not thumbnail_cached:
-                    continue
-            elif self._requires_thumbnail_cache(client):
-                if not self._path_ready(client.thumbnail_path(dev_id, start, end)):
-                    continue
+            clip_cached = self._clip_ready(client, dev_id, start, end, client.clip_path(dev_id, start, end))
+            thumbnail_cached = self._path_ready(client.thumbnail_path(dev_id, start, end))
+            if not clip_cached or not thumbnail_cached:
+                continue
             visible.append(clip)
         return visible
 
@@ -310,19 +288,21 @@ class TuyaRecordingsMediaSource(MediaSource):
         return bool(self._visible_clips(client, camera))
 
     @staticmethod
-    def _requires_ready_cache(client: Any) -> bool:
-        return bool(getattr(client, "media_sync_enabled", False) or getattr(client, "cloud_activity_paused", False))
-
-    @staticmethod
-    def _requires_thumbnail_cache(client: Any) -> bool:
-        return bool(getattr(client, "thumbnail_sync_enabled", False))
-
-    @staticmethod
     def _path_ready(path: Path) -> bool:
         try:
             return path.exists() and path.stat().st_size > 0
         except OSError:
             return False
+
+    @staticmethod
+    def _clip_ready(client: Any, dev_id: str, start: int, end: int, path: Path) -> bool:
+        ready = getattr(client, "clip_ready", None)
+        if callable(ready):
+            return bool(ready(dev_id, start, end))
+        cached = getattr(client, "clip_cached", None)
+        if callable(cached):
+            return bool(cached(dev_id, start, end))
+        return TuyaRecordingsMediaSource._path_ready(path)
 
     @staticmethod
     def _thumbnail_url_name(name: str) -> str:
@@ -403,7 +383,7 @@ class TuyaRecordingsMediaSource(MediaSource):
                 }
             ),
             media_class=MediaClass.VIDEO,
-            media_content_type="video/mp4",
+            media_content_type="",
             title=title,
             can_play=True,
             can_expand=False,

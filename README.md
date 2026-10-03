@@ -2,9 +2,9 @@
 
 # Tuya Recordings
 
-### SD-card recording browser and cache for Tuya / Smart Life cameras in Home Assistant
+### Browse SD-card recordings from Tuya / Smart Life cameras in Home Assistant
 
-  <img src="custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings logo" width="520">
+<img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="520">
 
 [![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
 [![Home Assistant Custom Integration](https://img.shields.io/badge/HOME%20ASSISTANT-CUSTOM%20INTEGRATION-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://www.home-assistant.io/)
@@ -13,327 +13,199 @@
 
 </div>
 
-## Overview
+## What It Does
 
-Tuya Recordings is a Home Assistant custom integration for viewing and caching
-Tuya / Smart Life camera SD-card recordings.
+Tuya Recordings adds SD-card recording playback to Home Assistant for cameras
+already set up in the official Home Assistant **Tuya** integration. It follows
+the Smart Life mobile app's native recording path instead of relying on Tuya
+Cloud video storage or a separate camera bridge.
 
-It is built for cameras that already belong to a working Home Assistant Tuya
-setup. The official Home Assistant `tuya` integration remains the camera
-inventory because that is where most users already have live video working.
-Tuya Recordings then reuses Tuya Cloud credentials saved by `localtuya` and
-talks to Tuya's IPC recording path to discover, cache, thumbnail, and play
-SD-card clips from Home Assistant.
+By default, choose a camera and day, then use one wall-clock timeline to play
+the SD-card recording at the selected time. Video and audio are remuxed for the
+browser without re-encoding, and the integration does not retain a full local
+copy.
 
-This is an early public beta. Tuya camera firmware and cloud APIs vary by model
-and region, so bug reports should include the camera model, integration version,
-diagnostics, relevant Home Assistant logs, and whether the recording is playable
-in the Tuya or Smart Life app.
+Optional local caching is available for people who want a private MP4 library
+and fast repeat playback. It is off by default.
+
+> [!IMPORTANT]
+> This integration is for SD-card recordings. It does not replace the official
+> Tuya camera entity, camera setup, live view, firmware management, or Tuya
+> Cloud video storage.
 
 ## Features
 
-- Tuya / Smart Life SD-card recording discovery through Tuya IPC/OpenAPI.
-- Cached MP4 playback through Home Assistant Media Browser.
-- Custom Tuya Recordings panel with camera/date browsing, thumbnails, cache
-  statistics, storage usage, and sync status.
-- Optional background pre-cache mode for instant playback of cached clips.
-- Optional thumbnail sync mode for backup browsing without keeping full videos.
-- Tapo-style on-demand playback when pre-cache is disabled.
-- Generated thumbnails from cached MP4 recordings or short thumbnail samples.
-- Private storage path under `/media`, avoiding public `/config/www` files.
-- Home Assistant services for refresh, media sync, thumbnail population, and
-  cache clearing.
-- Status sensors plus pre-cache and thumbnail sync switches.
-- Repair issues when official Tuya or LocalTuya prerequisites are missing.
-- Event-assisted sync hints from matching Tuya/LocalTuya entities, with normal
-  polling as the fallback.
-- Bundled Linux helper binaries for `amd64`, `arm64`, and `armv7`.
+- SD-card day and recording discovery through the Smart Life native playback
+  protocol.
+- Video and audio playback from one serialized camera session.
+- A compact custom panel with camera picker, date picker, wall-clock timeline,
+  recording ranges, keyboard seeking, and fullscreen controls.
+- Optional local MP4 caching under a private `/media` folder.
+- Cached recordings in Home Assistant Media Browser.
+- One **Camera events** entity per supported camera, preserving the original
+  Tuya notification code and metadata in Home Assistant history.
+- Separate **Motion detected** and **Person detected** binary sensors for each
+  camera, classified from the same Tuya IPC notifications.
+- A bounded, one-camera-at-a-time work queue for catalog refresh, thumbnail
+  work, and optional caching.
+- Smart Life QR authorization during setup. No Tuya Developer project or
+  LocalTuya camera entry is required.
+- No helper process or bundled executable.
 
 ## Requirements
 
-- A functional Home Assistant installation.
-- HACS, or manual access to `/config/custom_components`.
-- Official Home Assistant `tuya` integration configured for the same Tuya /
-  Smart Life account.
-- `localtuya` configured with Tuya Cloud credentials saved in its config entry.
-- A Tuya Developer project linked to the same account.
-- Tuya Developer API services needed for Tuya account/device lookup and
-  IPC/WebRTC camera access.
-- `ffmpeg` available on the Home Assistant system.
-- Tuya / Smart Life cameras with SD cards and local recordings.
+- Home Assistant with the official **Tuya** integration configured for the
+  same Smart Life / Tuya account.
+- A Tuya / Smart Life camera with an SD card and recordings.
+- The Smart Life mobile app, used once during setup to approve the QR code.
+- Home Assistant's `ffmpeg` integration. It remuxes the camera's existing
+  encoded streams for browser playback; it does not transcode them.
 
-The integration will not set up unless both `tuya` and `localtuya` are present.
-LocalTuya must have `client_id`, `client_secret`, and `user_id` saved. Tuya
-Recordings uses those credentials instead of asking users to enter the same Tuya
-Developer values again.
+LocalTuya may coexist for other local controls, but it is not a Tuya Recordings
+requirement. Tuya Developer OpenAPI services and Tuya Cloud video storage are
+also not required.
 
-Bundled playback helpers are included for Linux `amd64`, `arm64`, and `armv7`.
-Other platforms need a compatible helper binary built from
-`tools/pion_offer_probe`.
+## Installation
 
-### Tuya Developer API Service
-
-If LocalTuya already works and can find your devices, Tuya Recordings should
-only need one extra Tuya Cloud API service:
-
-| Add this Tuya service | Why Tuya Recordings needs it |
-| --- | --- |
-| `IoT Video Live Stream` | Provides the WebRTC IPC configuration and video resource pack used by Tuya's camera playback signaling path. |
-
-That is the main Tuya Developer service to add/check for this integration.
-
-If you are setting up LocalTuya from scratch, follow LocalTuya's own Tuya Cloud
-setup first. LocalTuya commonly needs these baseline services before Tuya
-Recordings is involved:
-
-| LocalTuya baseline service | Why LocalTuya needs it |
-| --- | --- |
-| `Industry Basic Service` | Basic Tuya device/project access used by LocalTuya. |
-| `Smart Home Basic Service` | Lists the devices linked to the Smart Life / Tuya account. |
-| `Device Status Notification` | Tuya device status/event support used by LocalTuya setups. |
-
-`Video Cloud Storage` is not required for normal Tuya Recordings use. This
-integration caches SD-card recordings from the camera playback path; it does not
-play Tuya's paid cloud-storage recordings.
-
-Depending on the Tuya project age and region, Tuya may also show already
-authorized default services such as `Device Status Notification`, `Data
-Dashboard Service`, `Industry Basic Service`, or `[Deprecate]Smart Home Scene
-Linkage`. Those are common on Tuya / LocalTuya projects, but they are not the
-camera recording playback path.
-
-The important endpoint coverage is:
-
-- `GET /v1.0/users/{uid}/devices/{device_id}/webrtc-configs`
-- `POST /v2.0/open-iot-hub/access/config`
-
-If setup or playback reports `permission deny`, `No permissions`, or a Tuya API
-permission error, first confirm that `IoT Video Live Stream` is subscribed and
-authorized on the same Tuya project LocalTuya is using. Then make sure the
-project is linked to the same Smart Life / Tuya app account and the correct data
-center. If the `open-iot-hub` endpoint is denied, also confirm the project's
-normal LocalTuya/Tuya cloud services and IoT Core subscription are still active.
-
-____________________________________________________________
-
-## Installation via HACS
+### HACS
 
 [![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Wheemer&repository=tuya-recordings&category=integration)
 
-1. **Open HACS in Home Assistant**
+1. Open **HACS** in Home Assistant.
+2. Add `https://github.com/Wheemer/tuya-recordings` as a custom repository in
+   the **Integration** category.
+3. Download **Tuya Recordings** and restart Home Assistant when HACS asks.
+4. Go to **Settings > Devices & services > Add integration** and select
+   **Tuya Recordings**.
 
-   HACS is the easiest way to install and update custom integrations.
+### Manual
 
-2. **Add this repository as a custom integration repository**
-
-   Repository URL:
-
-   ```text
-   https://github.com/Wheemer/tuya-recordings
-   ```
-
-   Category:
-
-   ```text
-   Integration
-   ```
-
-3. **Download Tuya Recordings**
-
-   Find **Tuya Recordings** in HACS, download it, and follow the HACS restart
-   prompt.
-
-4. **Add the integration**
-
-   In Home Assistant, go to:
-
-   ```text
-   Settings > Devices & services > Add integration > Tuya Recordings
-   ```
-
-____________________________________________________________
-
-## Manual Installation
-
-Copy the integration folder into Home Assistant:
+Copy this repository's `custom_components/tuya_recordings` directory to:
 
 ```text
 /config/custom_components/tuya_recordings
 ```
 
-Restart Home Assistant, then add **Tuya Recordings** from:
+Restart Home Assistant, then add **Tuya Recordings** from **Settings > Devices
+& services > Add integration**.
 
-```text
-Settings > Devices & services > Add integration
-```
+## Setup
 
-____________________________________________________________
+The setup flow asks for:
 
-## Configuration
+- **Smart Life account region**
+- **Private video storage path**, normally `/media/tuya_recordings`
+- **Recording order**
+- **Pre-cache recordings**
+- **Sync window in hours** when pre-caching is enabled
 
-During setup, choose:
+It then shows one QR code. Scan it with the Smart Life app, approve the login,
+and submit the Home Assistant step. The QR code is intentionally not polled or
+refreshed in the background. If it expires, restart setup to make a new code.
 
-- **Tuya OpenAPI region**: The region used by your Tuya Developer project.
-- **Private video storage path**: Use a private path under `/media`, such as
-  `/media/tuya_recordings`.
-- **Recording order**: Newest-first or oldest-first browsing.
-- **Pre-cache recordings**: Download recordings in the background.
-- **Preload thumbnails**: Create thumbnail previews in the background without
-  keeping full video files.
-- **Sync window in hours**: Use `0` to sync every discovered SD-card recording.
+Use a private `/media` location for cached files. Do not use `/config/www`.
 
-Do not use `/config/www`. Cached recordings should not be public web files.
+## Playback And Caching
 
-### Playback Modes
+### Default: SD-card timeline playback
 
-**On-demand mode**
+With **Pre-cache recordings** off, the panel reads the recording catalog and
+plays the selected time directly from the camera's SD card. There is one active
+camera session at a time: selecting another point stops the prior session
+before the next one begins. The background catalog pass is metadata-only; it
+does not download or retain video files.
 
-Recordings are listed and downloaded only when selected. This is closest to the
-Tapo-style model.
+### Optional: local MP4 cache
 
-**Thumbnail backup mode**
+With **Pre-cache recordings** on, Tuya Recordings downloads selected SD-card
+recordings into the configured private storage path. Cached clips appear in the
+panel and Home Assistant Media Browser, and their thumbnails are generated
+locally from the cached files. Set the sync window to `0` only when the storage
+location has enough free space for every discovered recording.
 
-Leave **Pre-cache recordings** off and turn **Preload thumbnails** on. Tuya
-Recordings keeps the SD-card index and thumbnail previews, while full video
-clips are downloaded only when opened. This is the best mode when Frigate is the
-primary recorder and Tuya Recordings is only a backup SD-card browser.
+Changing the storage path does not move existing files. Move the existing
+`videos` and `thumbs` folders before confirming the new path if you want to
+retain prior cached clips.
 
-**Pre-cache mode**
+## Camera Detection Entities
 
-Recordings are downloaded in the background. The custom panel and Media Browser
-show only clips that are cached and thumbnailed, so playback should start
-quickly.
+For each supported Tuya camera notification source, Tuya Recordings creates:
 
-### Pause Cloud Activity
+- **Camera events**: a point-in-time event entity. It records `detected` or
+  `cleared`, the original `tuya_event_code`, and camera-supplied metadata.
+- **Motion detected**: turns on for supported IPC motion notifications.
+- **Person detected**: turns on for supported IPC person notifications.
 
-Tuya Recordings adds a **Pause Tuya camera cloud activity** switch.
+The binary sensors are notification-driven. They only change when the camera
+reports a matching detection or an explicit clear; they do not guess an `off`
+state with a timer. A person notification can correctly turn on both sensors,
+because a person is also motion.
 
-Turn it on when cameras are unstable or recovering. While enabled, Tuya
-Recordings keeps serving already-cached media and thumbnails, but stops work
-that can touch Tuya camera, video, or recording resources:
-
-- manual recording refreshes
-- scheduled recording polling
-- media/video sync
-- thumbnail sync and thumbnail sampling
-- Home Assistant camera-triggered background sync
-- uncached on-demand clip downloads
-- missing thumbnail or live thumbnail URL refresh paths
-
-### Storage Changes
-
-Default storage path:
-
-```text
-/media/tuya_recordings
-```
-
-Changing the storage path does not move existing cached files. Move the existing
-`videos` and `thumbs` folders first if you want old clips to remain available
-from the new path.
-
-____________________________________________________________
-
-## How It Works
-
-Tuya cameras do not expose SD-card recordings as simple local files. Tuya
-Recordings uses Tuya IPC/WebRTC signaling to ask the camera for each clip, then
-remuxes the incoming H264 media into an MP4 that Home Assistant can play.
-
-Normal flow:
-
-1. Discover Tuya IPC cameras from the Tuya account.
-2. Query SD-card recording days and clips.
-3. Download a clip through Tuya IPC playback when needed.
-4. Save the MP4 under the private storage path when full pre-cache or playback
-   is requested.
-5. Generate thumbnails from cached MP4 files or from short temporary H264
-   samples.
-6. Serve cached or on-demand media through the custom panel and Home Assistant
-   Media Browser.
-
-### Automatic Sync Hints
-
-When matching Home Assistant camera entities already exist, Tuya Recordings uses
-them as hints that a new SD-card clip may be available.
-
-For configured Tuya recording cameras, it watches:
-
-- camera display status sensors
-- LocalTuya SD storage sensors
-- matching Tuya camera event entities
-
-When one changes, the integration waits briefly for the camera to finish writing
-the clip, then queues media and thumbnail sync. A cooldown prevents motion bursts
-from hammering the camera or Tuya API. Regular polling remains the fallback.
-
-____________________________________________________________
+Use the event entity when an automation needs the original camera event and
+metadata. Use the binary sensors for Home Assistant history, dashboard state,
+and ordinary motion/person automations.
 
 ## Services
 
-Available Home Assistant services:
+| Service | Purpose |
+| --- | --- |
+| `tuya_recordings.refresh_recordings` | Refresh the SD-card recording catalog. |
+| `tuya_recordings.sync_media` | Download recordings when pre-cache is enabled. |
+| `tuya_recordings.populate_thumbnails` | Populate missing thumbnails for cached recordings. |
+| `tuya_recordings.clear_cache` | Clear the recording index. |
+| `tuya_recordings.clear_video_cache` | Delete cached video files while keeping the index and thumbnails. |
 
-- `tuya_recordings.refresh_recordings`
-- `tuya_recordings.sync_media`
-- `tuya_recordings.populate_thumbnails`
-- `tuya_recordings.clear_cache`
+## Safety And Camera Activity
+
+Camera work is serialized per integration and interactive playback takes
+priority over background work. The integration does not fan out parallel
+recording sessions across cameras.
+
+When local caching is enabled, **Pause camera activity** stops camera-facing
+refresh, caching, thumbnail work, and uncached playback while continuing to
+serve complete files already saved locally. Turn it on while a camera is
+recovering or when you want Tuya Recordings completely quiet.
 
 ## Troubleshooting
 
-If setup fails, check:
+**No cameras or setup cannot continue**
 
-- The official Tuya integration is installed and configured.
-- LocalTuya is installed and configured with Tuya Cloud credentials.
-- The Tuya Developer project is linked to the same account.
-- Required Tuya video/IPC APIs are authorized.
-- The selected storage path has enough free space.
-- The camera is online and has an SD card with recordings.
+- Confirm that the official Home Assistant Tuya integration is configured for
+  the same account and exposes the camera.
+- Confirm that the camera has an SD card with recordings in Smart Life.
 
-If clips list but playback is slow, enable pre-cache.
+**Smart Life authorization failed or expired**
 
-If clips do not appear quickly after motion, confirm matching Tuya or LocalTuya
-camera entities exist in Home Assistant. Event-assisted sync is optional and
-falls back to polling.
+- Reconfigure Tuya Recordings and complete a fresh QR authorization.
 
-If setup reports missing LocalTuya credentials, open LocalTuya options and make
-sure Tuya Cloud credentials are saved for the same Tuya account used by the
-official Tuya integration.
+**Playback is unavailable**
 
-____________________________________________________________
+- Confirm the same time is playable in the Smart Life app.
+- Confirm Home Assistant's `ffmpeg` integration is available.
+- Check that **Pause camera activity** is off when using cached mode.
 
-## We Need Your Help
+**Cached clips do not appear**
 
-Tuya camera behavior varies across models, regions, firmware, and account
-features. Good beta feedback makes the integration better for everyone.
+- Enable **Pre-cache recordings** and confirm the selected storage path has
+  sufficient free space.
+- Use `tuya_recordings.sync_media` to request a cache pass.
 
-Helpful reports include:
+## Support
 
-1. Camera model and firmware version.
-2. Tuya Recordings version.
-3. Home Assistant version and install type.
-4. Tuya OpenAPI region.
-5. Whether the same clip plays in the Tuya or Smart Life app.
-6. Diagnostics and relevant Home Assistant log lines.
+Camera firmware, region, and account behavior vary. Please open an issue on
+GitHub rather than relying on a forum reply, so it is visible and I can respond
+quickly:
 
-Use GitHub Issues for bug reports and compatibility notes:
+<https://github.com/Wheemer/tuya-recordings/issues>
 
-https://github.com/Wheemer/tuya-recordings/issues
+Include the integration version, Home Assistant version, camera model and
+firmware, account region, whether the same time plays in Smart Life, and
+diagnostics plus relevant Home Assistant log lines. Never include QR data,
+session tokens, local keys, or full diagnostics publicly.
 
-## Complete Reference
+## Scope
 
-### Integration boundaries
-
-- Official `tuya` provides the account/camera graph and is the source of truth
-  for which cameras should be handled.
-- `localtuya` provides Tuya Cloud credentials and optional local camera entities.
-- Tuya Recordings handles SD-card discovery, caching, thumbnails, and playback.
-- Pairing, removing, sharing, firmware updates, SD-card formatting, cloud
-  subscription management, and account management remain in the Tuya / Smart
-  Life app.
-
-### LocalTuya notes
-
-Tuya Recordings can create repair issues when prerequisites are missing or when
-official Tuya camera entities are not represented in LocalTuya. These issues are
-there to help explain why faster local recording-sync hints may not be available
-for every camera.
+Tuya Recordings handles SD-card cataloging, playback, optional caching, and
+detection entities. Camera pairing, sharing, firmware updates, SD-card
+formatting, privacy mode, cloud subscriptions, and account management remain
+in the Tuya / Smart Life app.

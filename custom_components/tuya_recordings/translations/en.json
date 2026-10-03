@@ -3,47 +3,52 @@
     "step": {
       "user": {
         "title": "Tuya Recordings",
-        "description": "Set up SD-card recording access for cameras already available through the official Tuya integration. Tuya Recordings reuses Tuya Cloud credentials saved by LocalTuya.",
+        "description": "Set up SD-card recording access for cameras already available through the official Tuya integration. Smart Life authorization supplies the native camera credentials.",
         "data": {
-          "region": "Tuya OpenAPI region",
+          "region": "Smart Life account region",
           "media_storage_path": "Private video storage path",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
-          "thumbnail_sync_enabled": "Preload thumbnails",
           "media_sync_hours": "Sync window in hours"
         },
         "data_description": {
-          "region": "Choose the region used by the Tuya Developer project linked to this account.",
+          "region": "Choose the region used by this Smart Life account.",
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "Download recordings in the background so only cached, thumbnailed clips are shown.",
-          "thumbnail_sync_enabled": "Create preview thumbnails in the background without keeping full video files.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space."
+          }
+      },
+      "native_authorize": {
+        "title": "Authorize Smart Life camera playback",
+        "description": "Scan this code with the Smart Life app, approve the login, then submit this step. The code is created once and is not refreshed or polled automatically. If it expires, restart setup.",
+        "data": {
+          "qr_code": "Smart Life authorization"
         }
       }
     },
     "error": {
       "cannot_connect": "Could not connect to the selected Tuya region.",
       "tuya_required": "Install and configure the official Tuya integration first.",
-      "localtuya_required": "Install and configure LocalTuya first.",
-      "localtuya_cloud_credentials_required": "LocalTuya must be configured with Tuya Cloud credentials.",
       "path_not_absolute": "Use an absolute Home Assistant path, such as /media/tuya_recordings.",
       "path_not_allowed": "Use a private storage folder under /media. Do not use /media itself, /config, or /config/www."
+      ,"native_authorization_start_failed": "Could not start Smart Life camera authorization. No retry was made."
     },
     "abort": {
-      "already_configured": "This Tuya account is already configured."
+      "already_configured": "This Tuya account is already configured.",
+      "native_authorization_missing": "Smart Life camera authorization was not started. Restart setup.",
+      "native_authorization_failed": "Smart Life camera authorization was not approved or expired. Restart setup to create one new code."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Tuya Recordings options",
-        "description": "Tune how recordings are listed, cached, and stored.",
+        "description": "Catalogs and thumbnails update automatically. Event clips use the camera's native JPEG; other clips use the first frame of a brief playback stream. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
         "data": {
           "lookback_days": "Days to check (0 = all)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
-          "thumbnail_sync_enabled": "Preload thumbnails",
           "media_sync_hours": "Sync window in hours",
           "media_storage_path": "Private video storage path"
         },
@@ -51,7 +56,6 @@
           "lookback_days": "Use 0 to scan until the camera reports no older recordings for several days.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
-          "thumbnail_sync_enabled": "When enabled, the integration samples each recording briefly to create a thumbnail, but does not keep the full video unless pre-cache is also enabled.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",
           "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media."
         }
@@ -60,24 +64,13 @@
         "title": "Move cached recordings",
         "description": "The storage path is changing from `{old_path}` to `{new_path}`. Existing cached videos and thumbnails are not moved automatically. To keep instant playback for existing clips, move the old folder contents into the new folder before submitting this step. The integration will use the new path immediately after you submit; no restart is required."
       }
-    }
+    },
+    "error": {}
   },
   "issues": {
     "tuya_required": {
       "title": "Official Tuya integration required",
       "description": "Tuya Recordings requires the official Tuya integration to be installed and configured for the same Tuya account."
-    },
-    "localtuya_required": {
-      "title": "LocalTuya required",
-      "description": "Tuya Recordings requires LocalTuya to be installed and configured. LocalTuya supplies the Tuya Cloud credentials used by Tuya Recordings."
-    },
-    "localtuya_cloud_credentials_required": {
-      "title": "LocalTuya cloud credentials required",
-      "description": "Tuya Recordings found LocalTuya, but LocalTuya does not have Tuya Cloud credentials saved. Reconfigure LocalTuya with cloud credentials, then reload Tuya Recordings."
-    },
-    "localtuya_camera_setup_incomplete": {
-      "title": "LocalTuya camera setup incomplete",
-      "description": "Tuya Recordings found these cameras in the official Tuya integration, but not in LocalTuya: {cameras}. Add or repair those cameras in LocalTuya to enable faster local recording-sync hints."
     }
   }
 }
