@@ -8,7 +8,7 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Wheemer/tuya-recordings/issues",
-  "requirements": ["aiomqtt>=2.0.0", "cryptography>=44.0.0", "paho-mqtt==2.1.0", "requests>=2.31.0", "tinytuya==1.20.0"],
+  "requirements": ["aiomqtt>=2.0.0", "tinytuya==1.20.0"],
   "version": "0.4.0"
 }
 
