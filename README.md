@@ -2,8 +2,6 @@
 
 # Tuya Recordings
 
-### Browse SD-card recordings from Tuya / Smart Life cameras in Home Assistant
-
 <img src="https://raw.githubusercontent.com/Wheemer/tuya-recordings/main/custom_components/tuya_recordings/brand/forum-logo.png" alt="Tuya Recordings" width="520">
 
 [![HACS Custom](https://img.shields.io/badge/HACS-CUSTOM-41BDF5?style=for-the-badge&logo=home-assistant&logoColor=white&labelColor=555555)](https://github.com/hacs/integration)
