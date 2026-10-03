@@ -186,22 +186,6 @@ recovering or when you want Tuya Recordings completely quiet.
   sufficient free space.
 - Use `tuya_recordings.sync_media` to request a cache pass.
 
-## Support
+## Changelog
 
-Camera firmware, region, and account behavior vary. Please open an issue on
-GitHub rather than relying on a forum reply, so it is visible and I can respond
-quickly:
-
-<https://github.com/Wheemer/tuya-recordings/issues>
-
-Include the integration version, Home Assistant version, camera model and
-firmware, account region, whether the same time plays in Smart Life, and
-diagnostics plus relevant Home Assistant log lines. Never include QR data,
-session tokens, local keys, or full diagnostics publicly.
-
-## Scope
-
-Tuya Recordings handles SD-card cataloging, playback, optional caching, and
-detection entities. Camera pairing, sharing, firmware updates, SD-card
-formatting, privacy mode, cloud subscriptions, and account management remain
-in the Tuya / Smart Life app.
+Release history is maintained in [CHANGELOG.md](CHANGELOG.md).
