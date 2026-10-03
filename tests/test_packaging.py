@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from PIL import Image
@@ -57,7 +58,12 @@ def test_manifest_version_matches_current_changelog_release():
     manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert f"## Tuya Recordings v{manifest['version']} (unreleased)" in changelog
+    assert re.search(
+        rf"^## Tuya Recordings v{re.escape(manifest['version'])} "
+        r"\((?:unreleased|\d{4}-\d{2}-\d{2})\)$",
+        changelog,
+        re.MULTILINE,
+    )
 
 
 def test_home_assistant_local_brand_assets_are_packaged():
