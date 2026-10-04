@@ -10,7 +10,7 @@ import threading
 from typing import Any
 from urllib.parse import urlsplit
 
-from .native_gateway import CH_KEY, CLIENT_ID, COMPOSITE_KEY, PACKAGE_NAME
+from .native_gateway import NativeAppProfile, native_app_profile
 
 MQTT_PORT = 8883
 MQTT_KEEPALIVE = 60
@@ -37,6 +37,7 @@ class NativeAppMqttConfig:
         cls,
         saved: Mapping[str, Any],
         region: str = "us",
+        app_profile_id: str | None = None,
     ) -> "NativeAppMqttConfig":
         """Reproduce the consumer-app MQTT identity built by the Android SDK."""
         sid = _required(saved, "sid")
@@ -48,14 +49,15 @@ class NativeAppMqttConfig:
         if region not in SUPPORTED_REGIONS:
             raise NativeAppMqttError("Smart Life MQTT region is invalid")
 
-        app_key_hash = _md5(CLIENT_ID)
+        profile: NativeAppProfile = native_app_profile(app_profile_id)
+        app_key_hash = _md5(profile.client_id)
         user_tail = _md5(app_key_hash + ecode)[-16:]
         username = (
-            f"{partner_identity}_v1_{CLIENT_ID}_{CH_KEY}_mb_{sid}{user_tail}"
+            f"{partner_identity}_v1_{profile.client_id}_{profile.ch_key}_mb_{sid}{user_tail}"
         )
-        password = _md5(_md5(COMPOSITE_KEY) + ecode)[8:24]
+        password = _md5(_md5(profile.composite_key) + ecode)[8:24]
         uid_hash = _md5(uid + "sdkfasodifca")
-        client_id = f"{PACKAGE_NAME}_mb_{device_id}_{uid_hash}_DEFAULT"
+        client_id = f"{profile.package_name}_mb_{device_id}_{uid_hash}_DEFAULT"
         return cls(
             host=host,
             username=username,

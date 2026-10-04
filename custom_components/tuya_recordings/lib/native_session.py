@@ -100,6 +100,7 @@ class NativeCameraSessionConfig:
     app_ecode: str = field(default="", repr=False)
     app_uid: str = field(default="", repr=False)
     app_region: str = "us"
+    app_profile_id: str = "smart_life"
     app_device_fingerprint: str = field(default="", repr=False)
     mqtt_protocol_version: str = "2.2"
 
@@ -394,6 +395,7 @@ def normalize_camera_info(
     local_id: str = "",
     app_session: dict[str, Any] | None = None,
     app_region: str = "us",
+    app_profile_id: str = "smart_life",
     app_device_fingerprint: str = "",
     mqtt_protocol_version: str = "2.2",
 ) -> NativeCameraSessionConfig:
@@ -436,6 +438,7 @@ def normalize_camera_info(
         app_ecode=_optional_session_text(app_session, "ecode"),
         app_uid=_optional_session_text(app_session, "uid"),
         app_region=app_region or "us",
+        app_profile_id=app_profile_id or "smart_life",
         app_device_fingerprint=app_device_fingerprint,
         mqtt_protocol_version=mqtt_protocol_version,
     ).validate()

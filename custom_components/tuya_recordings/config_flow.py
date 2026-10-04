@@ -12,6 +12,8 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    APP_PROFILE_LABELS,
+    CONF_APP_PROFILE,
     CONF_ALERT_RESET_SECONDS,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
@@ -23,6 +25,7 @@ from .const import (
     CONF_NATIVE_APP_SESSION,
     CONF_REGION,
     CONF_THUMBNAIL_SYNC_ENABLED,
+    DEFAULT_APP_PROFILE,
     DEFAULT_ALERT_RESET_SECONDS,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_STORAGE_PATH,
@@ -42,7 +45,7 @@ from .lib.native_gateway import (
 
 
 class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
-    VERSION = 5
+    VERSION = 6
 
     def __init__(self) -> None:
         self._pending_entry_data: dict[str, Any] | None = None
@@ -65,9 +68,9 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                     data_schema=_user_schema(user_input),
                     errors=errors,
                 )
-
             self._pending_entry_data = {
                 CONF_REGION: user_input[CONF_REGION],
+                CONF_APP_PROFILE: user_input[CONF_APP_PROFILE],
                 CONF_MEDIA_STORAGE_PATH: user_input[CONF_MEDIA_STORAGE_PATH],
                 CONF_MEDIA_SYNC_ENABLED: user_input[CONF_MEDIA_SYNC_ENABLED],
                 CONF_MEDIA_SYNC_HOURS: user_input[CONF_MEDIA_SYNC_HOURS],
@@ -78,7 +81,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_THUMBNAIL_SYNC_ENABLED: True,
             }
             if not await self._async_begin_native_authorization(
-                user_input[CONF_REGION]
+                user_input[CONF_REGION], user_input[CONF_APP_PROFILE]
             ):
                 return self.async_show_form(
                     step_id="user",
@@ -101,7 +104,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Complete one explicit Smart Life app-session QR authorization."""
+        """Complete one explicit Tuya mobile app-session QR authorization."""
         if self._native_authorization is None or self._pending_entry_data is None:
             return self.async_abort(reason="native_authorization_missing")
         if user_input is None:
@@ -164,7 +167,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
         self,
         entry_data: dict[str, Any],
     ) -> ConfigFlowResult:
-        """Renew only the explicit Smart Life app session."""
+        """Renew only the explicit Tuya mobile app session."""
         self._reauth_entry = self._get_reauth_entry()
         self._pending_entry_data = dict(self._reauth_entry.data)
         region = str(self._pending_entry_data.get(CONF_REGION) or DEFAULT_REGION)
@@ -174,8 +177,9 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
             if isinstance(saved_session, dict)
             else None
         )
+        app_profile = str(self._pending_entry_data.get(CONF_APP_PROFILE) or DEFAULT_APP_PROFILE)
         if not await self._async_begin_native_authorization(
-            region, device_fingerprint=device_fingerprint
+            region, app_profile, device_fingerprint=device_fingerprint
         ):
             return self.async_abort(reason="native_authorization_failed")
         return await self.async_step_native_authorize()
@@ -183,6 +187,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _async_begin_native_authorization(
         self,
         region: str,
+        app_profile: str,
         *,
         device_fingerprint: str | None = None,
     ) -> bool:
@@ -190,6 +195,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
         gateway = NativeAppGatewayClient(
             region=region,
             device_fingerprint=device_fingerprint,
+            app_profile_id=app_profile,
         )
         self._native_gateway = gateway
 
@@ -204,6 +210,9 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
         self._native_authorization = NativeQrAuthorization(
             call,
             device_fingerprint=device_fingerprint,
+            qr_create_api=gateway.app_profile.qr_create_api,
+            qr_finish_api=gateway.app_profile.qr_finish_api,
+            qr_scheme=gateway.app_profile.qr_scheme,
         )
         try:
             self._native_qr_payload = await self._native_authorization.begin()
@@ -276,6 +285,8 @@ def _validate_media_storage_path(value: str) -> str:
 
 
 def _validate_form_input(user_input: dict[str, Any]) -> dict[str, str]:
+    if user_input.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE) not in APP_PROFILE_LABELS:
+        return {CONF_APP_PROFILE: "invalid_app_profile"}
     try:
         user_input[CONF_MEDIA_STORAGE_PATH] = _validate_media_storage_path(
             user_input.get(CONF_MEDIA_STORAGE_PATH, "")
@@ -403,52 +414,45 @@ def _user_schema(user_input: dict[str, Any]) -> vol.Schema:
                 )
             ),
             vol.Required(
+                CONF_APP_PROFILE,
+                default=user_input.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(value=app, label=label)
+                        for app, label in APP_PROFILE_LABELS.items()
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required(
                 CONF_MEDIA_STORAGE_PATH,
-                default=user_input.get(
-                    CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH
-                ),
+                default=user_input.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH),
             ): selector.TextSelector(),
             vol.Required(
                 CONF_MEDIA_VIEW_RECORDINGS_ORDER,
                 default=user_input.get(CONF_MEDIA_VIEW_RECORDINGS_ORDER, "Descending"),
             ): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS
-                )
+                selector.SelectSelectorConfig(options=MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS)
             ),
             vol.Required(
                 CONF_MEDIA_SYNC_ENABLED,
-                default=user_input.get(
-                    CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED
-                ),
+                default=user_input.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED),
             ): selector.BooleanSelector(),
             vol.Required(
                 CONF_MEDIA_SYNC_HOURS,
                 default=user_input.get(CONF_MEDIA_SYNC_HOURS, DEFAULT_MEDIA_SYNC_HOURS),
             ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0,
-                    max=744,
-                    step=1,
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+                selector.NumberSelectorConfig(min=0, max=744, step=1, mode=selector.NumberSelectorMode.BOX)
             ),
             vol.Required(
                 CONF_ALERT_RESET_SECONDS,
-                default=user_input.get(
-                    CONF_ALERT_RESET_SECONDS, DEFAULT_ALERT_RESET_SECONDS
-                ),
+                default=user_input.get(CONF_ALERT_RESET_SECONDS, DEFAULT_ALERT_RESET_SECONDS),
             ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=5,
-                    max=3600,
-                    step=1,
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+                selector.NumberSelectorConfig(min=5, max=3600, step=1, mode=selector.NumberSelectorMode.BOX)
             ),
         }
     )
-
 
 def _native_authorize_schema(payload: str) -> vol.Schema:
     return vol.Schema(

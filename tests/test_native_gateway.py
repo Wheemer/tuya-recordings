@@ -12,7 +12,17 @@ from custom_components.tuya_recordings.lib.native_gateway import (
     _encrypt_post_data,
     _wire_api_name,
     generate_device_fingerprint,
+    native_app_profile,
 )
+
+
+def test_tuya_smart_profile_uses_its_own_current_mobile_identity():
+    profile = native_app_profile("tuya_smart")
+
+    assert profile.package_name == "com.tuya.smart"
+    assert profile.app_version == "7.11.0"
+    assert profile.qr_scheme == "thingSmart"
+    assert profile.composite_key != COMPOSITE_KEY
 
 
 def test_device_fingerprint_is_unique_urlsafe_and_sdk_sized():

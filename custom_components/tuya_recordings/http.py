@@ -626,7 +626,7 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         except TuyaRecordingsAuthError as err:
             self._start_reauth(client)
             raise web.HTTPUnauthorized(
-                reason="Smart Life camera playback authorization expired"
+                reason="Tuya mobile app camera playback authorization expired"
             ) from err
         except Exception:
             _LOGGER.exception(

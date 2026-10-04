@@ -45,6 +45,7 @@ class NativeAppCameraConfigProvider:
     )
     app_session: dict[str, Any] | None = field(default=None, repr=False)
     app_region: str = "us"
+    app_profile_id: str = "smart_life"
     app_device_fingerprint: str = ""
     # The APK's connectV3 trace belongs to one short-lived camera transport.
     # Runtime workers disconnect after eight idle seconds, so this cache must
@@ -86,6 +87,7 @@ class NativeAppCameraConfigProvider:
                 trace_id=trace_id,
                 app_session=self.app_session,
                 app_region=self.app_region,
+                app_profile_id=self.app_profile_id,
                 app_device_fingerprint=self.app_device_fingerprint,
                 mqtt_protocol_version=self.protocol_version_lookup(dev_id),
             )

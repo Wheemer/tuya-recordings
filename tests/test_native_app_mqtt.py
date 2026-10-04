@@ -15,6 +15,7 @@ from custom_components.tuya_recordings.lib.native_gateway import (
     CLIENT_ID,
     COMPOSITE_KEY,
     PACKAGE_NAME,
+    native_app_profile,
 )
 
 
@@ -47,6 +48,15 @@ def test_config_reproduces_smart_life_consumer_mqtt_identity():
         f"{md5('user-idsdkfasodifca')}_DEFAULT"
     )
     assert "ecode-value" not in repr(config)
+
+
+def test_config_uses_the_selected_tuya_smart_identity():
+    profile = native_app_profile("tuya_smart")
+    config = NativeAppMqttConfig.from_saved_session(SESSION, app_profile_id="tuya_smart")
+
+    assert f"_v1_{profile.client_id}_{profile.ch_key}_mb_" in config.username
+    assert config.client_id.startswith(f"{profile.package_name}_mb_")
+    assert config.password == md5(md5(profile.composite_key) + SESSION["ecode"])[8:24]
 
 
 def test_config_uses_authenticated_qr_broker_and_partner():

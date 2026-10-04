@@ -53,13 +53,31 @@ class NativeAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.device_fingerprint, "fingerprint")
         self.assertNotIn("private", repr(result))
         self.assertEqual(self.calls, [
-            ("smartlife.m.user.qr.token.create", "1.0", {}),
-            ("smartlife.m.user.qr.token.user.get", "1.0", {"token": "test-token"}),
+            ("thing.m.user.qr.token.create", "1.0", {}),
+            ("thing.m.user.qr.token.user.get", "1.0", {"token": "test-token"}),
         ])
         for operation in (flow.begin, flow.finish):
             with self.assertRaises(auth.NativeAuthorizationError):
                 await operation()
         self.assertEqual(len(self.calls), 2)
+
+    async def test_tuya_smart_flow_uses_its_own_qr_payload_and_endpoints(self):
+        flow = self.flow(
+            ["test-token", self.session()],
+            qr_scheme="thingSmart",
+            qr_create_api="thing.m.user.qr.token.create",
+            qr_finish_api="thing.m.user.qr.token.user.get",
+        )
+
+        self.assertEqual(await flow.begin(), "thingSmart--qrLogin?token=test-token")
+        await flow.finish()
+        self.assertEqual(
+            self.calls,
+            [
+                ("thing.m.user.qr.token.create", "1.0", {}),
+                ("thing.m.user.qr.token.user.get", "1.0", {"token": "test-token"}),
+            ],
+        )
 
     async def test_failure_has_no_retry_or_sensitive_error(self):
         flow = self.flow([RuntimeError("secret-server-response")])

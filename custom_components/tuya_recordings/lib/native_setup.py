@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..const import (
+    CONF_APP_PROFILE,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_NATIVE_APP_SESSION,
@@ -50,6 +51,7 @@ def build_recordings_backend(
         protocol_version_lookup=lambda dev_id: protocol_versions.get(dev_id, "2.2"),
         app_session=app_session,
         app_region=str(entry_data.get(CONF_REGION) or "us"),
+        app_profile_id=str(entry_data.get(CONF_APP_PROFILE) or "smart_life"),
         app_device_fingerprint=str((entry_data.get(CONF_NATIVE_APP_SESSION) or {}).get("device_fingerprint") or ""),
     )
     media_secrets = NativeMediaSecretStore(app_call)
@@ -69,10 +71,10 @@ def build_recordings_backend(
 def native_app_call(
     entry_data: Mapping[str, Any],
 ) -> Callable[[str, str, dict[str, Any], dict[str, str]], Any]:
-    """Return the Smart Life app-session gateway caller.
+    """Return the selected Tuya mobile app-session gateway caller.
 
     Tests may inject `_native_app_call`. A serialized app session from the
-    native Smart Life QR flow is enough for the built-in mobile gateway caller.
+    native Tuya mobile app QR flow is enough for the built-in mobile gateway caller.
     """
     call = entry_data.get(CONF_NATIVE_APP_CALL)
     if callable(call):
@@ -81,12 +83,13 @@ def native_app_call(
     if session:
         gateway = NativeAppGatewayClient(
             region=str(entry_data.get(CONF_REGION) or "us"),
+            app_profile_id=str(entry_data.get(CONF_APP_PROFILE) or "smart_life"),
             device_fingerprint=session["device_fingerprint"],
         )
         return lambda api, version, body, extra_params: gateway.call_with_saved_session(
             api, version, body, session, extra_params
         )
-    raise NativeBackendSetupError("Smart Life app-session authorization is not configured")
+    raise NativeBackendSetupError("Tuya mobile app-session authorization is not configured")
 
 
 def native_app_session(entry_data: Mapping[str, Any]) -> dict[str, Any]:
@@ -105,7 +108,7 @@ def native_app_session(entry_data: Mapping[str, Any]) -> dict[str, Any]:
         for key in required
     ):
         raise NativeBackendSetupError(
-            "Smart Life app-session authorization is incomplete; reauthenticate Tuya Recordings"
+            "Tuya mobile app-session authorization is incomplete; reauthenticate Tuya Recordings"
         )
     return dict(session)
 
@@ -145,7 +148,7 @@ def resolved_protocol_versions(entry_data: Mapping[str, Any]) -> dict[str, str]:
 
 
 def resolved_local_keys(entry_data: Mapping[str, Any]) -> dict[str, str]:
-    """Return keys captured from the current Smart Life QR account session."""
+    """Return keys captured from the current Tuya mobile app QR account session."""
     found: dict[str, str] = {}
     current = entry_data.get(CONF_DEVICE_LOCAL_KEYS)
     if not isinstance(current, Mapping):

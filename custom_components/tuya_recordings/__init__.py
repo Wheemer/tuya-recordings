@@ -25,6 +25,7 @@ from .const import (
     CATALOG_SYNC_DAYS_PER_PASS,
     CATALOG_SYNC_INTERVAL,
     CATALOG_SYNC_STARTUP_DELAY,
+    CONF_APP_PROFILE,
     CONF_CLOUD_ACTIVITY_PAUSED,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
@@ -113,7 +114,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate older Tuya Recordings config entries."""
     stale_keys = STALE_ENTRY_KEYS
     data = dict(entry.data)
-    changed = entry.version < 5 or bool(stale_keys.intersection(data))
+    changed = entry.version < 6 or bool(stale_keys.intersection(data))
+    if CONF_APP_PROFILE not in data:
+        data[CONF_APP_PROFILE] = "smart_life"
+        changed = True
     if changed:
         for key in stale_keys:
             data.pop(key, None)
@@ -130,20 +134,20 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _read_native_session_import, import_path
             )
         except (OSError, ValueError) as err:
-            _LOGGER.error("Could not import the saved Smart Life session: %s", err)
+            _LOGGER.error("Could not import the saved Tuya mobile app session: %s", err)
             return False
         if imported is not None:
             data.update(imported)
             try:
                 native_app_session(data)
             except NativeBackendSetupError as err:
-                _LOGGER.error("Saved Smart Life session import is incomplete: %s", err)
+                _LOGGER.error("Saved Tuya mobile app session import is incomplete: %s", err)
                 return False
             await hass.async_add_executor_job(import_path.unlink)
             changed = True
 
     if changed:
-        hass.config_entries.async_update_entry(entry, data=data, version=5)
+        hass.config_entries.async_update_entry(entry, data=data, version=6)
     return True
 
 
@@ -192,7 +196,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         native_app_session(entry_data)
     except NativeBackendSetupError:
-        raise ConfigEntryAuthFailed("Smart Life camera playback authorization is required")
+        raise ConfigEntryAuthFailed("Tuya mobile app camera playback authorization is required")
     client = TuyaRecordingsClient(
         entry_data,
         cache_path=cache_path,

@@ -127,7 +127,9 @@ class NativeRelayPlaybackSession:
                 "Native relay playback currently supports P2P type 4 cameras"
             )
         self._stream_config = _stream_config(config)
-        self._mqtt_identity = _mqtt_identity(app_session, config.app_region)
+        self._mqtt_identity = _mqtt_identity(
+            app_session, config.app_region, config.app_profile_id
+        )
         self._uid = config.app_uid
         if not self._uid:
             raise NativeRelayPlaybackError("Smart Life account UID is unavailable")
@@ -954,9 +956,13 @@ def _stream_config(config: NativeCameraSessionConfig) -> StreamConfig:
         ) from err
 
 
-def _mqtt_identity(app_session: dict[str, Any], region: str) -> MqttIdentity:
-    """Build the short-lived Smart Life signaling identity."""
-    config = NativeAppMqttConfig.from_saved_session(app_session, region)
+def _mqtt_identity(
+    app_session: dict[str, Any], region: str, app_profile_id: str
+) -> MqttIdentity:
+    """Build the selected Tuya consumer app signaling identity."""
+    config = NativeAppMqttConfig.from_saved_session(
+        app_session, region, app_profile_id
+    )
     return MqttIdentity(
         host=config.host,
         port=config.port,

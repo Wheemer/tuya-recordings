@@ -41,10 +41,16 @@ class NativeQrAuthorization:
         *,
         device_fingerprint: str,
         clock=time.monotonic,
+        qr_create_api: str = "thing.m.user.qr.token.create",
+        qr_finish_api: str = "thing.m.user.qr.token.user.get",
+        qr_scheme: str = "tuyaSmart",
     ):
         self._loop = asyncio.get_running_loop()
         self._call = call
         self._device_fingerprint = device_fingerprint
+        self._qr_create_api = qr_create_api
+        self._qr_finish_api = qr_finish_api
+        self._qr_scheme = qr_scheme
         self._clock = clock
         self._state = "new"
         self._token: str | None = None
@@ -93,7 +99,7 @@ class NativeQrAuthorization:
         self._state = "creating"
         self._expires = self._clock() + 300
         # ThingApiParams.checkAPIName rewrites the APK's thing prefix on wire.
-        result = await self._request("smartlife.m.user.qr.token.create", {}, 20)
+        result = await self._request(self._qr_create_api, {}, 20)
         if not isinstance(result, str) or not result or len(result) > 2048 or any(
             char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in result
         ):
@@ -101,7 +107,7 @@ class NativeQrAuthorization:
             raise NativeAuthorizationError("Invalid native QR token")
         self._token = result
         self._state = "awaiting_approval"
-        return f"tuyaSmart--qrLogin?token={result}"
+        return f"{self._qr_scheme}--qrLogin?token={result}"
 
     async def finish(self) -> NativeAppSession:
         """Check once after explicit approval; do not poll pending/error states."""
@@ -114,7 +120,9 @@ class NativeQrAuthorization:
             raise NativeAuthorizationError("Native authorization expired locally")
         self._state = "completing"
         token, self._token = self._token, None
-        result = await self._request("smartlife.m.user.qr.token.user.get", {"token": token}, min(20, remaining))
+        result = await self._request(
+            self._qr_finish_api, {"token": token}, min(20, remaining)
+        )
         self._state = "closed"
         domain = result.get("domain") if isinstance(result, dict) else None
         mobile_mqtts_url = (

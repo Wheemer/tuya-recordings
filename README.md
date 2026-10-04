@@ -13,7 +13,7 @@
 
 Tuya Recordings adds SD-card recording playback to Home Assistant for cameras
 already set up in the official Home Assistant **Tuya** integration. It follows
-the Smart Life mobile app's native recording path instead of relying on Tuya
+the selected Tuya mobile app's native recording path instead of relying on Tuya
 Cloud video storage or a separate camera bridge.
 
 By default, choose a camera and day, then use one wall-clock timeline to play
@@ -31,7 +31,7 @@ and fast repeat playback. It is off by default.
 
 ## Features
 
-- SD-card day and recording discovery through the Smart Life native playback
+- SD-card day and recording discovery through the Smart Life or Tuya Smart native playback
   protocol.
 - Video and audio playback from one serialized camera session.
 - A compact custom panel with camera picker, date picker, wall-clock timeline,
@@ -44,7 +44,7 @@ and fast repeat playback. It is off by default.
   camera, classified from the same Tuya IPC notifications.
 - A bounded, one-camera-at-a-time work queue for catalog refresh, thumbnail
   work, and optional caching.
-- Smart Life QR authorization during setup. No Tuya Developer project or
+- Smart Life or Tuya Smart QR authorization during setup. No Tuya Developer project or
   LocalTuya camera entry is required.
 - No helper process or bundled executable.
 
@@ -53,7 +53,7 @@ and fast repeat playback. It is off by default.
 - Home Assistant with the official **Tuya** integration configured for the
   same Smart Life / Tuya account.
 - A Tuya / Smart Life camera with an SD card and recordings.
-- The Smart Life mobile app, used once during setup to approve the QR code.
+- The app that contains the cameras, used once during setup to approve the QR code.
 - Home Assistant's `ffmpeg` integration. It remuxes the camera's existing
   encoded streams for browser playback; it does not transcode them.
 
@@ -89,13 +89,14 @@ Restart Home Assistant, then add **Tuya Recordings** from **Settings > Devices
 
 The setup flow asks for:
 
-- **Smart Life account region**
+- **Account region**
+- **Account app**: Smart Life or Tuya Smart
 - **Private video storage path**, normally `/media/tuya_recordings`
 - **Recording order**
 - **Pre-cache recordings**
 - **Sync window in hours** when pre-caching is enabled
 
-It then shows one QR code. Scan it with the Smart Life app, approve the login,
+It then shows one QR code. Scan it with the account app selected during setup, approve the login,
 and submit the Home Assistant step. The QR code is intentionally not polled or
 refreshed in the background. If it expires, restart setup to make a new code.
 
@@ -170,13 +171,13 @@ recovering or when you want Tuya Recordings completely quiet.
   the same account and exposes the camera.
 - Confirm that the camera has an SD card with recordings in Smart Life.
 
-**Smart Life authorization failed or expired**
+**Camera authorization failed or expired**
 
 - Reconfigure Tuya Recordings and complete a fresh QR authorization.
 
 **Playback is unavailable**
 
-- Confirm the same time is playable in the Smart Life app.
+- Confirm the same time is playable in the selected account app.
 - Confirm Home Assistant's `ffmpeg` integration is available.
 - Check that **Pause camera activity** is off when using cached mode.
 

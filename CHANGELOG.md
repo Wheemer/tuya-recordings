@@ -1,5 +1,26 @@
 # Changelog
 
+## Tuya Recordings v0.4.1.1 (2026-10-04)
+
+Tuya Smart account authorization pre-release.
+
+### Highlights
+
+- Adds an **Account app** choice during setup: **Smart Life** or **Tuya Smart**.
+- Uses the selected app's APK-derived QR authorization, encrypted gateway
+  identity, device-key discovery, and MQTT signaling identity.
+- Preserves existing installations by retaining **Smart Life** as their saved
+  account-app default.
+- Updates setup text, reauthentication errors, and documentation to describe
+  the selected account app accurately.
+
+### Validation
+
+- 485 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
+- The current Tuya Smart QR-token request was verified against the Tuya mobile
+  gateway. This pre-release needs a real Tuya Smart-account discovery and
+  playback check before a stable release.
+
 ## Tuya Recordings v0.4.1 (2026-10-03)
 
 Detection-sensor reliability and release validation fix.

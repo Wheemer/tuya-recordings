@@ -41,6 +41,7 @@ CONF_MEDIA_VIEW_RECORDINGS_ORDER = "media_view_recordings_order"
 CONF_ALERT_RESET_SECONDS = "alert_reset_seconds"
 CONF_THUMBNAIL_SYNC_ENABLED = "thumbnail_sync_enabled"
 DATA_INTERACTIVE_PLAYBACK_ACTIVE = "interactive_playback_active"
+CONF_APP_PROFILE = "app_profile"
 CONF_CLOUD_ACTIVITY_PAUSED = "cloud_activity_paused"
 CONF_REGION = "region"
 CONF_NATIVE_APP_SESSION = "native_app_session"
@@ -48,6 +49,7 @@ CONF_DEVICE_LOCAL_KEYS = "device_local_keys"
 CONF_DEVICE_PROTOCOL_VERSIONS = "device_protocol_versions"
 
 DEFAULT_REGION = "us"
+DEFAULT_APP_PROFILE = "smart_life"
 DEFAULT_LOOKBACK_DAYS = 0
 DEFAULT_MEDIA_SYNC_ENABLED = False
 DEFAULT_MEDIA_SYNC_HOURS = 0
@@ -65,4 +67,9 @@ REGION_LABELS = {
     "cn": "China",
     "in": "India",
     "sg": "Singapore",
+}
+
+APP_PROFILE_LABELS = {
+    "smart_life": "Smart Life",
+    "tuya_smart": "Tuya Smart",
 }

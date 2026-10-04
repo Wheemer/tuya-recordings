@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "Tuya Recordings",
-        "description": "Set up SD-card recording access for cameras already available through the official Tuya integration. Smart Life authorization supplies the native camera credentials.",
+        "description": "Set up SD-card recording access for cameras already available through the official Tuya integration. The selected account app supplies the native camera credentials.",
         "data": {
-          "region": "Smart Life account region",
+          "region": "Account region",
+          "app_profile": "Account app",
           "media_storage_path": "Private video storage path",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
@@ -13,19 +14,20 @@
           "alert_reset_seconds": "Detection reset time"
         },
         "data_description": {
-          "region": "Choose the region used by this Smart Life account.",
+          "region": "Choose the region used by this account.",
+          "app_profile": "Choose the app that contains the cameras. Scan the QR code using this same app.",
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "Download recordings in the background so only cached, thumbnailed clips are shown.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space.",
           "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
-          }
+        }
       },
       "native_authorize": {
-        "title": "Authorize Smart Life camera playback",
-        "description": "Scan this code with the Smart Life app, approve the login, then submit this step. The code is created once and is not refreshed or polled automatically. If it expires, restart setup.",
+        "title": "Authorize camera playback",
+        "description": "Scan this code with the account app selected in setup, approve the login, then submit this step. The code is created once and is not refreshed or polled automatically. If it expires, restart setup.",
         "data": {
-          "qr_code": "Smart Life authorization"
+          "qr_code": "Camera authorization"
         }
       }
     },
@@ -33,13 +35,13 @@
       "cannot_connect": "Could not connect to the selected Tuya region.",
       "tuya_required": "Install and configure the official Tuya integration first.",
       "path_not_absolute": "Use an absolute Home Assistant path, such as /media/tuya_recordings.",
-      "path_not_allowed": "Use a private storage folder under /media. Do not use /media itself, /config, or /config/www."
-      ,"native_authorization_start_failed": "Could not start Smart Life camera authorization. No retry was made."
+      "path_not_allowed": "Use a private storage folder under /media. Do not use /media itself, /config, or /config/www.",
+      "native_authorization_start_failed": "Could not start camera authorization. No retry was made."
     },
     "abort": {
       "already_configured": "This Tuya account is already configured.",
-      "native_authorization_missing": "Smart Life camera authorization was not started. Restart setup.",
-      "native_authorization_failed": "Smart Life camera authorization was not approved or expired. Restart setup to create one new code."
+      "native_authorization_missing": "Camera authorization was not started. Restart setup.",
+      "native_authorization_failed": "Camera authorization was not approved or expired. Restart setup to create one new code."
     }
   },
   "options": {

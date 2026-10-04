@@ -16,13 +16,21 @@ from custom_components.tuya_recordings.config_flow import (
     _user_schema,
     _validate_form_input,
 )
-from custom_components.tuya_recordings.const import CONF_MEDIA_STORAGE_PATH
+from custom_components.tuya_recordings.const import CONF_APP_PROFILE, CONF_MEDIA_STORAGE_PATH
 
 
 def test_user_schema_is_frontend_serializable():
     converted = convert(_user_schema({}), custom_serializer=cv.custom_serializer)
 
     assert any(field["name"] == CONF_MEDIA_STORAGE_PATH for field in converted)
+
+
+def test_user_schema_offers_smart_life_and_tuya_smart():
+    converted = convert(_user_schema({}), custom_serializer=cv.custom_serializer)
+
+    account_app = next(field for field in converted if field["name"] == CONF_APP_PROFILE)
+    options = account_app["selector"]["select"]["options"]
+    assert {option["value"] for option in options} == {"smart_life", "tuya_smart"}
 
 
 def test_native_authorization_qr_is_frontend_serializable():

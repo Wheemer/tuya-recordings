@@ -1,7 +1,7 @@
-"""Smart Life mobile gateway caller for APK-native camera bootstrap.
+"""Tuya consumer-app mobile gateway caller for APK-native camera bootstrap.
 
 This is the missing app-session side of the native path. It implements the
-signed, encrypted `et=3` mobile gateway request shape used by Smart Life SDK
+signed, encrypted `et=3` mobile gateway request shape used by Tuya consumer app SDKs
 calls such as `m.ipc.v4.rtc.config.get`.
 """
 
@@ -23,21 +23,86 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .native_auth import NativeAppSession
 
-PACKAGE_NAME = "com.tuya.smartlife"
-CERT_SHA256 = (
-    "0F:C3:61:99:9C:C0:C3:5B:A8:AC:A5:7D:AA:55:93:A2"
-    ":0C:F5:57:27:70:2E:A8:5A:D7:B3:22:89:49:F8:88:FE"
-)
-DERIVED_KEY = "jfg5rs5kkmrj5mxahugvucrsvw43t48x"
-APP_SECRET = "r3me7ghmxjevrvnpemwmhw3fxtacphyg"  # noqa: S105
-COMPOSITE_KEY = f"{PACKAGE_NAME}_{CERT_SHA256}_{DERIVED_KEY}_{APP_SECRET}"
+@dataclass(frozen=True, slots=True)
+class NativeAppProfile:
+    """APK-derived mobile gateway identity for one Tuya consumer app."""
 
-CLIENT_ID = "ekmnwp9f5pnh3trdtpgy"
-CH_KEY = "ec9709a4"
-APP_VERSION = "7.11.0"
-SDK_VERSION = "7.11.0"
+    id: str
+    package_name: str
+    certificate_sha256: str
+    security_key: str = field(repr=False)
+    app_secret: str = field(repr=False)
+    client_id: str
+    ch_key: str
+    app_version: str
+    sdk_version: str
+    ttid: str
+    qr_scheme: str
+    qr_create_api: str = "thing.m.user.qr.token.create"
+    qr_finish_api: str = "thing.m.user.qr.token.user.get"
+
+    @property
+    def composite_key(self) -> str:
+        return "_".join(
+            (self.package_name, self.certificate_sha256, self.security_key, self.app_secret)
+        )
+
+
+SMART_LIFE_PROFILE = NativeAppProfile(
+    id="smart_life",
+    package_name="com.tuya.smartlife",
+    certificate_sha256=(
+        "0F:C3:61:99:9C:C0:C3:5B:A8:AC:A5:7D:AA:55:93:A2"
+        ":0C:F5:57:27:70:2E:A8:5A:D7:B3:22:89:49:F8:88:FE"
+    ),
+    security_key="jfg5rs5kkmrj5mxahugvucrsvw43t48x",
+    app_secret="r3me7ghmxjevrvnpemwmhw3fxtacphyg",  # noqa: S105
+    client_id="ekmnwp9f5pnh3trdtpgy",
+    ch_key="ec9709a4",
+    app_version="7.11.6",
+    sdk_version="7.11.0",
+    ttid="smartlife",
+    qr_scheme="tuyaSmart",
+)
+
+TUYA_SMART_PROFILE = NativeAppProfile(
+    id="tuya_smart",
+    package_name="com.tuya.smart",
+    certificate_sha256=(
+        "93:21:9F:C2:73:E2:20:0F:4A:DE:E5:F7:19:1D:C6:56"
+        ":BA:2A:2D:7B:2F:F5:D2:4C:D5:5C:4B:61:55:00:1E:40"
+    ),
+    security_key="f3hd7pet4p83kemjdf5wqsa5tavrv579",
+    app_secret="5gdtanjtf38vyxkqh87cjwfcqjhvjjqa",  # noqa: S105
+    client_id="3cxxt3au9x33ytvq3h9j",
+    ch_key="3f7060ea",
+    app_version="7.11.0",
+    sdk_version="7.11.0",
+    ttid="tuyaSmart",
+    qr_scheme="thingSmart",
+)
+
+NATIVE_APP_PROFILES = {
+    SMART_LIFE_PROFILE.id: SMART_LIFE_PROFILE,
+    TUYA_SMART_PROFILE.id: TUYA_SMART_PROFILE,
+}
+DEFAULT_APP_PROFILE_ID = SMART_LIFE_PROFILE.id
+COMPOSITE_KEY = SMART_LIFE_PROFILE.composite_key
+PACKAGE_NAME = SMART_LIFE_PROFILE.package_name
+CLIENT_ID = SMART_LIFE_PROFILE.client_id
+CH_KEY = SMART_LIFE_PROFILE.ch_key
+APP_VERSION = SMART_LIFE_PROFILE.app_version
+SDK_VERSION = SMART_LIFE_PROFILE.sdk_version
+TTID = SMART_LIFE_PROFILE.ttid
 LANGUAGE = "en_US"
-TTID = "smartlife"
+
+
+def native_app_profile(profile_id: str | None) -> NativeAppProfile:
+    """Return an APK-derived profile, defaulting old entries to Smart Life."""
+    try:
+        return NATIVE_APP_PROFILES[profile_id or DEFAULT_APP_PROFILE_ID]
+    except KeyError as err:
+        raise NativeGatewayError("Unknown Tuya mobile app profile") from err
 _NONCE_LENGTH = 12
 _TAG_LENGTH = 16
 _BODY_KEY_LENGTH = 16
@@ -70,15 +135,15 @@ _SIGN_WHITELIST = frozenset(
 
 
 class NativeGatewayError(RuntimeError):
-    """Smart Life mobile gateway request failed."""
+    """Tuya consumer-app mobile gateway request failed."""
 
 
 class NativeGatewayAuthError(NativeGatewayError):
-    """Smart Life app session is invalid or expired."""
+    """Tuya mobile app session is invalid or expired."""
 
 
 class NativeGatewayProtocolError(NativeGatewayError):
-    """Smart Life mobile gateway response was malformed."""
+    """Tuya consumer-app mobile gateway response was malformed."""
 
 
 def generate_device_fingerprint() -> str:
@@ -88,7 +153,7 @@ def generate_device_fingerprint() -> str:
 
 @dataclass(slots=True)
 class NativeAppGatewayClient:
-    """Synchronous Smart Life mobile gateway client.
+    """Synchronous Tuya consumer-app mobile gateway client.
 
     Home Assistant calls this from executor jobs, so it deliberately uses the
     existing synchronous `requests` stack rather than owning an event loop.
@@ -96,8 +161,16 @@ class NativeAppGatewayClient:
 
     region: str = "us"
     device_fingerprint: str = field(default_factory=generate_device_fingerprint)
+    app_profile_id: str = DEFAULT_APP_PROFILE_ID
     session: requests.Session = field(default_factory=requests.Session, repr=False)
-    composite_key: str = field(default=COMPOSITE_KEY, repr=False)
+
+    @property
+    def app_profile(self) -> NativeAppProfile:
+        return native_app_profile(self.app_profile_id)
+
+    @property
+    def composite_key(self) -> str:
+        return self.app_profile.composite_key
 
     def call(
         self,
@@ -144,7 +217,7 @@ class NativeAppGatewayClient:
     def device_connection_data(
         self, saved: Any
     ) -> tuple[dict[str, str], dict[str, str]]:
-        """Return local keys and MQTT protocol versions from Smart Life.
+        """Return local keys and MQTT protocol versions from the selected Tuya app.
 
         Only an explicit device ``pv`` is accepted. ``moduleMap.wifi.pv`` is
         module/OTA metadata and is not the communication-mode value copied
@@ -153,7 +226,7 @@ class NativeAppGatewayClient:
         app_session = _saved_session(saved)
         homes = self.call("tuya.m.location.list", "2.1", {}, app_session)
         if not isinstance(homes, list):
-            raise NativeGatewayProtocolError("Smart Life home list was malformed")
+            raise NativeGatewayProtocolError("Tuya mobile app home list was malformed")
         found: dict[str, str] = {}
         protocol_versions: dict[str, str] = {}
         seen: set[int] = set()
@@ -173,7 +246,7 @@ class NativeAppGatewayClient:
             )
             if not isinstance(devices, list):
                 raise NativeGatewayProtocolError(
-                    "Smart Life device list was malformed"
+                    "Tuya mobile app device list was malformed"
                 )
             for device in devices:
                 if not isinstance(device, dict):
@@ -205,16 +278,16 @@ class NativeAppGatewayClient:
         params = {
             "a": api,
             "v": version,
-            "clientId": CLIENT_ID,
+            "clientId": self.app_profile.client_id,
             "time": str(int(time.time())),
             "requestId": request_id,
             "lang": LANGUAGE,
             "deviceId": self.device_fingerprint,
-            "appVersion": APP_VERSION,
-            "ttid": TTID,
+            "appVersion": self.app_profile.app_version,
+            "ttid": self.app_profile.ttid,
             "os": "Android",
-            "sdkVersion": SDK_VERSION,
-            "chKey": CH_KEY,
+            "sdkVersion": self.app_profile.sdk_version,
+            "chKey": self.app_profile.ch_key,
             "et": "3",
             "postData": encrypted,
         }
@@ -234,7 +307,7 @@ class NativeAppGatewayClient:
                 data=params,
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": f"TY/{APP_VERSION}",
+                    "User-Agent": f"Thing-UA=APP/Android/{self.app_profile.app_version}/SDK/{self.app_profile.sdk_version}",
                 },
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
@@ -278,7 +351,7 @@ def _saved_session(value: Any) -> NativeAppSession:
     if isinstance(value, NativeAppSession):
         return value
     if not isinstance(value, dict):
-        raise NativeGatewayAuthError("Smart Life app-session authorization is not configured")
+        raise NativeGatewayAuthError("Tuya mobile app-session authorization is not configured")
     try:
         return NativeAppSession(
             sid=_required_text(value, "sid"),
@@ -289,7 +362,7 @@ def _saved_session(value: Any) -> NativeAppSession:
             device_fingerprint=_required_text(value, "device_fingerprint"),
         )
     except ValueError as err:
-        raise NativeGatewayAuthError("Smart Life app-session authorization is incomplete") from err
+        raise NativeGatewayAuthError("Tuya mobile app-session authorization is incomplete") from err
 
 
 def _wire_api_name(api: str) -> str:
