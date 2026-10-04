@@ -1,4 +1,6 @@
 {
   "name": "Tuya Recordings",
-  "render_readme": true
+  "render_readme": true,
+  "zip_release": true,
+  "filename": "tuya_recordings.zip"
 }
