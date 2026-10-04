@@ -21,7 +21,7 @@ def test_tuya_smart_profile_uses_its_own_current_mobile_identity():
 
     assert profile.package_name == "com.tuya.smart"
     assert profile.app_version == "7.11.0"
-    assert profile.qr_scheme == "thingSmart"
+    assert profile.qr_scheme == "tuyaSmart"
     assert profile.composite_key != COMPOSITE_KEY
 
 

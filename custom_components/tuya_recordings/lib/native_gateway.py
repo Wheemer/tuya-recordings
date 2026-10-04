@@ -79,7 +79,7 @@ TUYA_SMART_PROFILE = NativeAppProfile(
     app_version="7.11.0",
     sdk_version="7.11.0",
     ttid="tuyaSmart",
-    qr_scheme="thingSmart",
+    qr_scheme="tuyaSmart",
 )
 
 NATIVE_APP_PROFILES = {

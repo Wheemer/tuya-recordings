@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.1.2 (2026-10-04)
+
+Corrective Tuya Smart setup and HACS package release.
+
+### Fixes
+
+- Uses the tuyaSmart QR payload accepted by the Tuya Smart app.
+- Packages the HACS release ZIP with the integration files at archive root,
+  preventing a nested custom_components/tuya_recordings install path.
+
+### Validation
+
+- 485 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
+- The Tuya Smart QR payload was confirmed by the first Tuya Smart account tester.
+
 ## Tuya Recordings v0.4.1.1 (2026-10-04)
 
 Tuya Smart account authorization pre-release.

@@ -64,12 +64,12 @@ class NativeAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_tuya_smart_flow_uses_its_own_qr_payload_and_endpoints(self):
         flow = self.flow(
             ["test-token", self.session()],
-            qr_scheme="thingSmart",
+            qr_scheme="tuyaSmart",
             qr_create_api="thing.m.user.qr.token.create",
             qr_finish_api="thing.m.user.qr.token.user.get",
         )
 
-        self.assertEqual(await flow.begin(), "thingSmart--qrLogin?token=test-token")
+        self.assertEqual(await flow.begin(), "tuyaSmart--qrLogin?token=test-token")
         await flow.finish()
         self.assertEqual(
             self.calls,
