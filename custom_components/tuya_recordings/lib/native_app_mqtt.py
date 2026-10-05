@@ -17,7 +17,7 @@ MQTT_KEEPALIVE = 60
 MQTT_CONNECT_TIMEOUT = 10.0
 MQTT_SUBSCRIBE_TIMEOUT = 10.0
 SUPPORTED_REGIONS = frozenset({"us", "eu", "cn", "in", "we"})
-_ALLOWED_BROKER_SUFFIXES = (".lifeaiot.com", ".tuyaus.com")
+_ALLOWED_BROKER_SUFFIXES = (".lifeaiot.com", ".tuyaus.com", ".tuyaeu.com")
 
 
 class NativeAppMqttError(RuntimeError):
