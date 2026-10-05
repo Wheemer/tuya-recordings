@@ -10,6 +10,9 @@ updates:
         patterns:
           - "*"
     ignore:
+      - dependency-name: homeassistant
+        update-types:
+          - version-update:semver-patch
       - dependency-name: ruff
         update-types:
           - version-update:semver-minor

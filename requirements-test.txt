@@ -1,4 +1,4 @@
-homeassistant==2026.9.4
+homeassistant==2026.9.3
 pytest==9.1.1
 pytest-asyncio==1.4.0
 playwright==1.63.0
