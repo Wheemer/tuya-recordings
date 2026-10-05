@@ -1,10 +1,10 @@
 """One bounded queue for camera work, with waiting playback taking priority."""
 
+import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-import threading
-import time
 
 
 class CameraWorkCancelled(RuntimeError):
@@ -50,6 +50,8 @@ class CameraCommandQueue:
         self._condition = threading.Condition()
         self._waiting = deque()
         self._owner = None
+        self._owner_cancel: threading.Event | None = None
+        self._owner_playback = False
         self.capacity = capacity
         self.wait_timeout = wait_timeout
 
@@ -59,7 +61,8 @@ class CameraCommandQueue:
 
     @contextmanager
     def slot(self, cancel_event=None, *, allow_reentry=True, playback=False):
-        cancel_event = Cancellation(_WORK_CANCEL.get(), cancel_event)
+        interrupt = threading.Event()
+        cancel_event = Cancellation(_WORK_CANCEL.get(), cancel_event, interrupt)
         identity = threading.get_ident()
         ticket = object()
         nested = False
@@ -74,11 +77,22 @@ class CameraCommandQueue:
             else:
                 if len(self._waiting) >= self.capacity:
                     raise CameraWorkBusy("Camera command queue is full")
-                # FIFO within each class; never interrupt the active operation.
+                # Playback owns the camera. Interrupt an active background
+                # operation so its native request closes before playback starts.
+                if (
+                    playback
+                    and not self._owner_playback
+                    and self._owner_cancel is not None
+                ):
+                    self._owner_cancel.set()
                 position = len(self._waiting)
                 if playback:
                     position = next(
-                        (index for index, (_, urgent) in enumerate(self._waiting) if not urgent),
+                        (
+                            index
+                            for index, (_, urgent) in enumerate(self._waiting)
+                            if not urgent
+                        ),
                         position,
                     )
                 item = (ticket, playback)
@@ -89,6 +103,8 @@ class CameraCommandQueue:
                             raise CameraWorkCancelled("Camera operation cancelled")
                         if self._owner is None and self._waiting[0][0] is ticket:
                             self._owner = identity
+                            self._owner_cancel = interrupt
+                            self._owner_playback = playback
                             self._waiting.popleft()
                             break
                         remaining = deadline - time.monotonic()
@@ -105,6 +121,8 @@ class CameraCommandQueue:
             if not nested:
                 with self._condition:
                     self._owner = None
+                    self._owner_cancel = None
+                    self._owner_playback = False
                     self._condition.notify_all()
 
 

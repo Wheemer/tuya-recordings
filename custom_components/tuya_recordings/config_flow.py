@@ -13,8 +13,9 @@ from homeassistant.helpers import selector
 
 from .const import (
     APP_PROFILE_LABELS,
-    CONF_APP_PROFILE,
     CONF_ALERT_RESET_SECONDS,
+    CONF_APP_PROFILE,
+    CONF_CATALOG_SYNC_MINUTES,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_LOOKBACK_DAYS,
@@ -25,8 +26,9 @@ from .const import (
     CONF_NATIVE_APP_SESSION,
     CONF_REGION,
     CONF_THUMBNAIL_SYNC_ENABLED,
-    DEFAULT_APP_PROFILE,
     DEFAULT_ALERT_RESET_SECONDS,
+    DEFAULT_APP_PROFILE,
+    DEFAULT_CATALOG_SYNC_MINUTES,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_STORAGE_PATH,
     DEFAULT_MEDIA_SYNC_ENABLED,
@@ -78,6 +80,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_MEDIA_VIEW_RECORDINGS_ORDER
                 ],
                 CONF_ALERT_RESET_SECONDS: user_input[CONF_ALERT_RESET_SECONDS],
+                CONF_CATALOG_SYNC_MINUTES: DEFAULT_CATALOG_SYNC_MINUTES,
                 CONF_THUMBNAIL_SYNC_ENABLED: True,
             }
             if not await self._async_begin_native_authorization(
@@ -350,6 +353,13 @@ def _options_schema(
             data.get(CONF_ALERT_RESET_SECONDS, DEFAULT_ALERT_RESET_SECONDS),
         ),
     )
+    catalog_sync_minutes = user_input.get(
+        CONF_CATALOG_SYNC_MINUTES,
+        options.get(
+            CONF_CATALOG_SYNC_MINUTES,
+            data.get(CONF_CATALOG_SYNC_MINUTES, DEFAULT_CATALOG_SYNC_MINUTES),
+        ),
+    )
     return vol.Schema(
         {
             vol.Required(
@@ -358,6 +368,16 @@ def _options_schema(
                 selector.NumberSelectorConfig(
                     min=0,
                     max=31,
+                    step=1,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_CATALOG_SYNC_MINUTES, default=catalog_sync_minutes
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=15,
+                    max=1440,
                     step=1,
                     mode=selector.NumberSelectorMode.BOX,
                 )

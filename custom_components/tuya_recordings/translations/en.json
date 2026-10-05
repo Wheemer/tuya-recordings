@@ -51,6 +51,7 @@
         "description": "Catalogs and thumbnails update automatically. Event clips use the camera's native JPEG; other clips use the first frame of a brief playback stream. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
         "data": {
           "lookback_days": "Days to check (0 = all)",
+          "catalog_sync_minutes": "Background catalog interval (minutes)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
           "media_sync_hours": "Sync window in hours",
@@ -59,6 +60,7 @@
         },
         "data_description": {
           "lookback_days": "Use 0 to scan until the camera reports no older recordings for several days.",
+          "catalog_sync_minutes": "How often to refresh SD-card recording lists while local video caching is off. Playback pauses this work automatically. Use a longer interval for cameras that permit only one P2P session.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",

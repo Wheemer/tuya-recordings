@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .const import (
+    CONF_CATALOG_SYNC_MINUTES,
     CONF_CLOUD_ACTIVITY_PAUSED,
     CONF_LOOKBACK_DAYS,
     CONF_MEDIA_STORAGE_PATH,
@@ -18,6 +19,7 @@ from .const import (
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_REGION,
     CONF_THUMBNAIL_SYNC_ENABLED,
+    DEFAULT_CATALOG_SYNC_MINUTES,
     DEFAULT_CLOUD_ACTIVITY_PAUSED,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MEDIA_STORAGE_PATH,
@@ -215,6 +217,18 @@ class TuyaRecordingsClient:
 
     def update_options(self, entry_data: dict[str, Any]) -> None:
         self.lookback_days = int(entry_data.get(CONF_LOOKBACK_DAYS, DEFAULT_LOOKBACK_DAYS) or 0)
+        self.catalog_sync_minutes = max(
+            15,
+            min(
+                1440,
+                int(
+                    entry_data.get(
+                        CONF_CATALOG_SYNC_MINUTES, DEFAULT_CATALOG_SYNC_MINUTES
+                    )
+                    or DEFAULT_CATALOG_SYNC_MINUTES
+                ),
+            ),
+        )
         self.cloud_activity_paused = bool(entry_data.get(CONF_CLOUD_ACTIVITY_PAUSED, DEFAULT_CLOUD_ACTIVITY_PAUSED))
         self.media_sync_enabled = bool(entry_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
         self.thumbnail_sync_enabled = bool(entry_data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED))

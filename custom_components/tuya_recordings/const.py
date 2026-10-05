@@ -20,7 +20,7 @@ MEDIA_SYNC_STARTUP_DELAY = 5 * 60
 # Catalog refreshes only request the recording index. They never open clip
 # playback, download media, or render thumbnails. Keep them regular enough for
 # the timeline to remain current while the shared camera queue stays serial.
-CATALOG_SYNC_INTERVAL = timedelta(minutes=2)
+DEFAULT_CATALOG_SYNC_MINUTES = 15
 CATALOG_SYNC_STARTUP_DELAY = 30
 CATALOG_SYNC_DAYS_PER_PASS = 2
 THUMBNAIL_SYNC_LIMIT = 10
@@ -34,6 +34,7 @@ RECORDING_TRIGGER_SETTLE_DELAY = 45
 RECORDING_TRIGGER_COOLDOWN = 90
 
 CONF_LOOKBACK_DAYS = "lookback_days"
+CONF_CATALOG_SYNC_MINUTES = "catalog_sync_minutes"
 CONF_MEDIA_SYNC_ENABLED = "media_sync_enabled"
 CONF_MEDIA_SYNC_HOURS = "media_sync_hours"
 CONF_MEDIA_STORAGE_PATH = "media_storage_path"

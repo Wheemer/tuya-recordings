@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 try:
     from probatio import to_field_list as convert
 except ImportError:
@@ -16,7 +17,12 @@ from custom_components.tuya_recordings.config_flow import (
     _user_schema,
     _validate_form_input,
 )
-from custom_components.tuya_recordings.const import CONF_APP_PROFILE, CONF_MEDIA_STORAGE_PATH
+from custom_components.tuya_recordings.const import (
+    CONF_APP_PROFILE,
+    CONF_CATALOG_SYNC_MINUTES,
+    CONF_MEDIA_STORAGE_PATH,
+    DEFAULT_CATALOG_SYNC_MINUTES,
+)
 
 
 def test_user_schema_is_frontend_serializable():
@@ -102,3 +108,18 @@ def test_setup_requires_official_tuya_but_not_localtuya():
 
     hass = SimpleNamespace(config_entries=Entries({"tuya": [object()]}))
     assert _required_dependency_errors(hass) == set()
+
+
+def test_options_default_to_safe_catalog_interval():
+    entry = SimpleNamespace(data={}, options={})
+
+    assert (
+        _options_schema(entry)({})[CONF_CATALOG_SYNC_MINUTES]
+        == DEFAULT_CATALOG_SYNC_MINUTES
+    )
+
+
+def test_options_preserve_catalog_interval():
+    entry = SimpleNamespace(data={CONF_CATALOG_SYNC_MINUTES: 30}, options={})
+
+    assert _options_schema(entry)({})[CONF_CATALOG_SYNC_MINUTES] == 30

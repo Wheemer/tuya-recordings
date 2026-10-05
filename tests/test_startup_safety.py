@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -6,7 +7,9 @@ import pytest
 
 from custom_components import tuya_recordings as integration
 from custom_components.tuya_recordings.client import TuyaRecordingsClient
-from custom_components.tuya_recordings.lib.native_backend import NativeBackendNotConfigured
+from custom_components.tuya_recordings.lib.native_backend import (
+    NativeBackendNotConfigured,
+)
 
 
 class FakeAvailableBackend:
@@ -169,3 +172,22 @@ def test_sensor_dispatch_schedules_state_write_on_event_loop():
     sensor._handle_recordings_updated("entry")
     schedule.assert_called_once_with(sensor.async_write_ha_state)
     sensor.async_write_ha_state.assert_not_called()
+
+
+def test_catalog_schedule_uses_configured_safe_interval(monkeypatch):
+    client = TuyaRecordingsClient(
+        {"catalog_sync_minutes": 30}, recordings_backend=FakeAvailableBackend()
+    )
+    intervals = []
+    monkeypatch.setattr(integration, "async_call_later", lambda *args: Mock())
+    monkeypatch.setattr(
+        integration,
+        "async_track_time_interval",
+        lambda hass, callback, interval: intervals.append(interval) or Mock(),
+    )
+    hass = SimpleNamespace(data={integration.DOMAIN: {"entry": {"client": client}}})
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=Mock())
+
+    integration._async_schedule_media_sync(hass, entry)
+
+    assert intervals == [timedelta(minutes=30)]

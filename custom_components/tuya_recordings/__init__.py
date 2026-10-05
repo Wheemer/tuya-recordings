@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import voluptuous as vol
@@ -23,7 +24,6 @@ from homeassistant.helpers.event import (
 from .client import TuyaRecordingsAuthError, TuyaRecordingsClient
 from .const import (
     CATALOG_SYNC_DAYS_PER_PASS,
-    CATALOG_SYNC_INTERVAL,
     CATALOG_SYNC_STARTUP_DELAY,
     CONF_APP_PROFILE,
     CONF_CLOUD_ACTIVITY_PAUSED,
@@ -33,8 +33,8 @@ from .const import (
     CONF_NATIVE_APP_SESSION,
     CONF_THUMBNAIL_SYNC_ENABLED,
     DATA_INTERACTIVE_PLAYBACK_ACTIVE,
-    DOMAIN,
     DEFAULT_MEDIA_SYNC_ENABLED,
+    DOMAIN,
     MEDIA_SYNC_INTERVAL,
     MEDIA_SYNC_STARTUP_DELAY,
     PLATFORMS,
@@ -47,8 +47,8 @@ from .frontend import FRONTEND_URL_PATH, async_register_frontend
 from .http import (
     TuyaRecordingsDebugView,
     TuyaRecordingsPanelDataView,
-    TuyaRecordingsTimelineView,
     TuyaRecordingsThumbnailView,
+    TuyaRecordingsTimelineView,
 )
 from .lib.commands import CameraWorkBusy, CameraWorkCancelled
 from .lib.native_setup import NativeBackendSetupError, native_app_session
@@ -495,7 +495,11 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
             await _async_request_catalog_refresh(hass, entry.entry_id, "catalog_cycle")
 
         entry_data[DATA_MEDIA_SYNC_SCHEDULE] = [
-            async_track_time_interval(hass, _run_catalog_cycle, CATALOG_SYNC_INTERVAL),
+            async_track_time_interval(
+                hass,
+                _run_catalog_cycle,
+                timedelta(minutes=client.catalog_sync_minutes),
+            ),
             async_call_later(hass, CATALOG_SYNC_STARTUP_DELAY, _run_catalog_cycle),
         ]
         return

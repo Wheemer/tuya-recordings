@@ -1,5 +1,15 @@
 # Changelog
 
+## Tuya Recordings v0.4.1.3 (2026-10-05)
+
+Corrective catalog and playback scheduling release.
+
+### Fixes
+
+- Changes uncached catalog refreshes from every 2 minutes to every 15 minutes by default.
+- Adds a configurable **Background catalog interval** (15 minutes to 24 hours).
+- Lets an interactive playback request cancel an in-flight background catalog command before it opens its own camera session.
+
 ## Tuya Recordings v0.4.1.2 (2026-10-04)
 
 Corrective Tuya Smart setup and HACS package release.

@@ -95,6 +95,7 @@ The setup flow asks for:
 - **Recording order**
 - **Pre-cache recordings**
 - **Sync window in hours** when pre-caching is enabled
+- **Background catalog interval** in integration options, for uncached SD-card playback
 
 It then shows one QR code. Scan it with the account app selected during setup, approve the login,
 and submit the Home Assistant step. The QR code is intentionally not polled or
@@ -110,7 +111,9 @@ With **Pre-cache recordings** off, the panel reads the recording catalog and
 plays the selected time directly from the camera's SD card. There is one active
 camera session at a time: selecting another point stops the prior session
 before the next one begins. The background catalog pass is metadata-only; it
-does not download or retain video files.
+does not download or retain video files. It defaults to every 15 minutes and
+can be made less frequent in integration options. A requested playback cancels
+an active background catalog command before opening its camera session.
 
 ### Optional: local MP4 cache
 
