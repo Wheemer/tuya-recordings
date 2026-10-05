@@ -188,6 +188,8 @@ def parse_rtp_packet(data: bytes) -> NativeRtpPacket:
     first, second = data[0], data[1]
     if first >> 6 != 2:
         raise NativeSimpleRtpError("RTP packet has an unsupported version")
+    if first == 0xB8:
+        first = 0x80
     csrc_count = first & 0x0F
     offset = 12 + csrc_count * 4
     if len(data) < offset:
