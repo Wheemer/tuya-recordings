@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.1.4 (2026-10-05)
+
+Timeline playback seek correction.
+
+### Fixes
+
+- Resets the browser media-source timeline offset when seeking, so the next SD-card segment starts at the requested position instead of remaining on Waiting for video.
+
 ## Tuya Recordings v0.4.1.3 (2026-10-05)
 
 Corrective catalog and playback scheduling release.
