@@ -44,7 +44,7 @@ sync_media:
 
 populate_thumbnails:
   name: Populate thumbnails
-  description: Populate missing recording thumbnails using native event JPEGs or the first frame of a bounded playback stream.
+  description: Populate missing recording thumbnails from already cached recordings.
   fields:
     entry_id:
       name: Config entry ID

@@ -74,6 +74,10 @@ also not required.
 4. Go to **Settings > Devices & services > Add integration** and select
    **Tuya Recordings**.
 
+### Pre-releases
+
+When a prerelease is available, open **Settings > Devices & services > Entities**, find the disabled diagnostic **Pre-release** switch for the HACS Tuya Recordings repository, enable it, then turn it on. HACS will then offer the prerelease.
+
 ### Manual
 
 Copy this repository's `custom_components/tuya_recordings` directory to:
@@ -95,13 +99,14 @@ The setup flow asks for:
 - **Recording order**
 - **Pre-cache recordings**
 - **Sync window in hours** when pre-caching is enabled
-- **Background catalog interval** in integration options, for uncached SD-card playback
+- **Detection reset time** (default: 60 seconds)
 
 It then shows one QR code. Scan it with the account app selected during setup, approve the login,
 and submit the Home Assistant step. The QR code is intentionally not polled or
 refreshed in the background. If it expires, restart setup to make a new code.
 
 Use a private `/media` location for cached files. Do not use `/config/www`.
+Integration options also include **Background catalog interval** for uncached SD-card playback.
 
 ## Playback And Caching
 
@@ -136,10 +141,11 @@ For each supported Tuya camera notification source, Tuya Recordings creates:
 - **Motion detected**: turns on for supported IPC motion notifications.
 - **Person detected**: turns on for supported IPC person notifications.
 
-The binary sensors are notification-driven. They only change when the camera
-reports a matching detection or an explicit clear; they do not guess an `off`
-state with a timer. A person notification can correctly turn on both sensors,
-because a person is also motion.
+The binary sensors are notification-driven and do not poll the camera. A
+matching detection turns the sensor on and restarts its configurable detection
+reset timer. An explicit camera clear turns it off immediately; otherwise it
+turns off after the configured reset time. A person notification can correctly
+turn on both sensors, because a person is also motion.
 
 Use the event entity when an automation needs the original camera event and
 metadata. Use the binary sensors for Home Assistant history, dashboard state,
@@ -157,7 +163,7 @@ and ordinary motion/person automations.
 
 ## Safety And Camera Activity
 
-Camera work is serialized per integration and interactive playback takes
+Camera work is serialized across Tuya Recordings and interactive playback takes
 priority over background work. The integration does not fan out parallel
 recording sessions across cameras.
 

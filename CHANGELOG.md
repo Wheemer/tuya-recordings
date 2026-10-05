@@ -25,11 +25,6 @@ Corrective Tuya Smart setup and HACS package release.
 - Packages the HACS release ZIP with the integration files at archive root,
   preventing a nested custom_components/tuya_recordings install path.
 
-### Validation
-
-- 485 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
-- The Tuya Smart QR payload was confirmed by the first Tuya Smart account tester.
-
 ## Tuya Recordings v0.4.1.1 (2026-10-04)
 
 Tuya Smart account authorization pre-release.
@@ -44,13 +39,6 @@ Tuya Smart account authorization pre-release.
 - Updates setup text, reauthentication errors, and documentation to describe
   the selected account app accurately.
 
-### Validation
-
-- 485 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
-- The current Tuya Smart QR-token request was verified against the Tuya mobile
-  gateway. This pre-release needs a real Tuya Smart-account discovery and
-  playback check before a stable release.
-
 ## Tuya Recordings v0.4.1 (2026-10-03)
 
 Detection-sensor reliability and release validation fix.
@@ -64,10 +52,6 @@ Detection-sensor reliability and release validation fix.
 - Keeps the existing motion and person entity names unchanged.
 - Restores the offline Smart Life native-library inspector required by its test
   and stops `.gitignore` from excluding that tracked source file.
-
-### Validation
-
-- 481 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
 
 ## Tuya Recordings v0.4.0 (2026-10-03)
 
@@ -121,16 +105,6 @@ Native Smart Life SD-card playback redesign.
 - Aligns the integration manifest with the non-beta `0.4.0` release and adds
   deterministic pytest discovery, Ruff CI, and local brand-asset validation.
 
-### Validation
-
-- 475 automated tests pass on Linux with Home Assistant's Python 3.14 runtime.
-- Synthetic Chromium tests verify native H.264 plus PCM audio playback and the
-  cached panel at desktop, 390 px, and 320 px widths, plus the uncached
-  wall-clock timeline and continuous playback past a catalog boundary, without
-  contacting a camera.
-- Python compilation, JSON parsing, JavaScript syntax, packaging, secret, and
-  obsolete-transport checks pass.
-
 ## Tuya Recordings v0.3.0-beta.6
 
 Discovery and API compatibility hardening after additional report triage.
@@ -146,11 +120,6 @@ Discovery and API compatibility hardening after additional report triage.
   `{"list": [...]}`, or `{"devices": [...]}`) are supported.
 - Keep the cached clip sensor thread-safe while preserving paused-state panel and
   media-browser behavior.
-
-### Validation
-
-- Full validation passed through `tools/validate.ps1`.
-- Test suite passed: 119 tests.
 
 ## Tuya Recordings v0.3.0-beta.4
 
@@ -168,11 +137,6 @@ Compatibility and safety cleanup after the first public install reports.
 - Adds regression tests for Home Assistant frontend schema serialization and
   paused cached-only browsing behavior.
 
-### Validation
-
-- Full validation passed through `tools/validate.ps1`.
-- Test suite passed: 119 tests.
-
 ## Tuya Recordings v0.3.0-beta.3
 
 Safety update for unstable Tuya cameras.
@@ -187,11 +151,6 @@ Safety update for unstable Tuya cameras.
   panel stats.
 - Fixes a Home Assistant 2026 thread-safety issue where the cached clip sensor
   could call `async_write_ha_state` from a worker thread.
-
-### Validation
-
-- Full validation passed through `tools/validate.ps1`.
-- Test suite passed: 112 tests.
 
 ## Tuya Recordings v0.3.0-beta.2
 
@@ -210,11 +169,6 @@ while Frigate or another NVR handles primary detection.
   on-demand.
 - Improves the storage cleanup path so cached videos can be removed by Home
   Assistant Core from the same private media folder the integration uses.
-
-### Validation
-
-- Full validation passed through `tools/validate.ps1`.
-- Test suite passed: 106 tests.
 
 ## Tuya Recordings v0.3.0-beta.1
 
@@ -257,9 +211,4 @@ First public beta of Tuya Recordings for Home Assistant.
 - On-demand mode lists discovered clips and caches them when selected.
 - Cached media should be stored under a private `/media` path, not
   `/config/www`.
-
-### Validation
-
-- Full validation passed through `tools/validate.ps1`.
-- Test suite passed: 104 tests.
 
