@@ -9,6 +9,10 @@ updates:
       test-dependencies:
         patterns:
           - "*"
+    ignore:
+      - dependency-name: ruff
+        update-types:
+          - version-update:semver-minor
 
   - package-ecosystem: github-actions
     directory: "/"
