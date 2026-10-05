@@ -1,0 +1,43 @@
+name-template: "Tuya Recordings v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+change-template: "- $TITLE (#$NUMBER) by @$AUTHOR"
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
+
+categories:
+  - title: "Features"
+    labels:
+      - "enhancement"
+      - "feature"
+  - title: "Fixes"
+    labels:
+      - "bug"
+      - "fix"
+  - title: "Documentation"
+    labels:
+      - "documentation"
+  - title: "Maintenance"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+change-title-escapes: "\\<*_&"
+exclude-labels:
+  - "skip-changelog"
+version-resolver:
+  major:
+    labels:
+      - "major"
+  minor:
+    labels:
+      - "minor"
+  patch:
+    labels:
+      - "patch"
+      - "bug"
+      - "fix"
+  default: patch
