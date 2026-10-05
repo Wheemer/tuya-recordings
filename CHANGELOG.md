@@ -9,6 +9,11 @@ Corrective catalog and playback scheduling release.
 - Changes uncached catalog refreshes from every 2 minutes to every 15 minutes by default.
 - Adds a configurable **Background catalog interval** (15 minutes to 24 hours).
 - Lets an interactive playback request cancel an in-flight background catalog command before it opens its own camera session.
+- Handles malformed RTP flag bits emitted by affected Tuya cameras so video does not freeze between keyframes.
+- Releases the timeline playback lock when a browser disconnects or cancels playback.
+- Waits for the first H.264 SPS before sending a stream to ffmpeg.
+- Uses `ManagedMediaSource` when iOS does not expose `MediaSource`.
+- Allows the `m1.tuyaeu.com` broker used by EU Tuya Smart accounts.
 
 ## Tuya Recordings v0.4.1.2 (2026-10-04)
 
