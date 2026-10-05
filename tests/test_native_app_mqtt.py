@@ -74,6 +74,14 @@ def test_config_uses_authenticated_qr_broker_and_partner():
     assert config.username.startswith("p2000027_v1_")
 
 
+def test_config_accepts_eu_tuya_smart_broker():
+    config = NativeAppMqttConfig.from_saved_session(
+        {**SESSION, "mobile_mqtts_url": "ssl://m1.tuyaeu.com:8883"}, "eu"
+    )
+
+    assert config.host == "m1.tuyaeu.com"
+
+
 @pytest.mark.parametrize(
     "updates",
     [
