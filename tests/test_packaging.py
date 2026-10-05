@@ -134,7 +134,7 @@ def test_panel_uses_inline_native_player_and_always_renders_pause_control():
     assert "stream_transport === \"native\"" in panel
     assert "new window.Plyr(video" in player
     assert "'mute', 'volume', 'fullscreen'" in player
-    assert "new MediaSource()" in player
+    assert "new MediaSourceType()" in player
     assert "audioSampleRate = format.getUint32(0)" in player
     assert "audioChannels = format.getUint8(4)" in player
     assert "audioContext = new AudioContextClass()" in player

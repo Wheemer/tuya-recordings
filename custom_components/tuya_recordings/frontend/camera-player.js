@@ -268,7 +268,8 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   };
   const consumeNativeStream = async (response, request) => {
     const signal = streamController?.signal || controller.signal;
-    const mediaSource = new MediaSource();
+    const MediaSourceType = window.MediaSource || window.ManagedMediaSource;
+    const mediaSource = new MediaSourceType();
     streamObjectUrl = URL.createObjectURL(mediaSource);
     video.src = streamObjectUrl;
     video.load();
@@ -278,7 +279,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       'video/mp4; codecs="avc1.64001f"',
       'video/mp4; codecs="avc1.4d401f"',
       'video/mp4; codecs="avc1.42e01e"',
-    ].find(candidate => MediaSource.isTypeSupported(candidate));
+    ].find(candidate => MediaSourceType.isTypeSupported(candidate));
     if (!mime) throw new Error('H.264 Media Source playback is unavailable');
     const sourceBuffer = mediaSource.addSourceBuffer(mime);
     sourceBuffer.mode = 'sequence';
