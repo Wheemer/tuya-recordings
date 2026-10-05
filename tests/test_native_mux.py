@@ -198,3 +198,9 @@ def test_interactive_browser_muxer_replaces_only_media_segment_on_seek():
     assert len(instances[0].events) == 2
     assert instances[0].events[0]["payload"]["type"] == "started"
     assert instances[1].opened and instances[1].finished
+
+
+def test_browser_stream_skips_video_until_first_sps():
+    muxer = NativePlaybackBrowserStreamMuxer(lambda chunk: None)
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"\x00\x00\x00\x01\x41abc", media_info("h264", 27)))
+    assert muxer._video_bytes == 0

@@ -643,6 +643,8 @@ class NativePlaybackBrowserStreamMuxer:
         codec = _codec_name(info)
         if codec in {"h264", "avc"}:
             if not self._video_bytes:
+                if not _has_h264_sps(data):
+                    return
                 self._first_video_timestamp = int(info.get("timestamp") or 0)
             self._write_video(data)
             return
@@ -830,6 +832,10 @@ class NativePlaybackInteractiveBrowserMuxer:
         muxer = self.muxer_factory(self.chunk_callback)
         muxer.open()
         self._muxer = muxer
+
+
+def _has_h264_sps(payload: bytes) -> bool:
+    return any(nal and nal[0] & 0x1F == 7 for nal in payload.split(b"\x00\x00\x01")[1:])
 
 
 def _decode_process_output(payload: Any) -> str:
