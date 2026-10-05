@@ -336,6 +336,10 @@ def main() -> None:
                     "window.timelineActions.some(item => item.action === 'seek' && item.position === 502) && window.audioStarts > 3",
                     timeout=15_000,
                 )
+                page.wait_for_function(
+                    "document.querySelector('video').buffered.length && document.querySelector('video').buffered.start(0) < 0.1",
+                    timeout=5_000,
+                )
                 timeline.update(page.evaluate(
                     """() => ({
                       socketCount: window.timelineSockets.length,

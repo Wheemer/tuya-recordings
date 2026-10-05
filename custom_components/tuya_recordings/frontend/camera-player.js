@@ -328,6 +328,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
             );
             await once(sourceBuffer, 'updateend', signal);
           }
+          sourceBuffer.timestampOffset = 0;
           video.currentTime = 0;
           videoStarted = false;
           videoRecords = 0;
