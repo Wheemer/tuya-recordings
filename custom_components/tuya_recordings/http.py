@@ -917,13 +917,18 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
         finally:
             stop_event.set()
             commands.put(("stop", None))
-            await asyncio.gather(producer, sender, return_exceptions=True)
-            if domain_data.get(_DATA_PLAYBACK_STOP) is stop_event:
-                domain_data.pop(_DATA_PLAYBACK_STOP, None)
-            if domain_data.get(_DATA_PLAYBACK_WS) is ws:
-                domain_data.pop(_DATA_PLAYBACK_WS, None)
-            lock.release()
-            _resume_background_camera_work(self.hass, client, generation)
+            cleanup = asyncio.gather(producer, sender, return_exceptions=True)
+
+            def _release_playback(_: asyncio.Future) -> None:
+                if domain_data.get(_DATA_PLAYBACK_STOP) is stop_event:
+                    domain_data.pop(_DATA_PLAYBACK_STOP, None)
+                if domain_data.get(_DATA_PLAYBACK_WS) is ws:
+                    domain_data.pop(_DATA_PLAYBACK_WS, None)
+                lock.release()
+                _resume_background_camera_work(self.hass, client, generation)
+
+            cleanup.add_done_callback(_release_playback)
+            await asyncio.shield(cleanup)
             if not ws.closed:
                 await ws.close()
         return ws

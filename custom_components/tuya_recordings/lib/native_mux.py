@@ -743,6 +743,9 @@ class NativePlaybackBrowserStreamMuxer:
                 )
         except Exception as err:  # pragma: no cover - defensive thread boundary
             self._reader_error = err
+            with _suppress_mux():
+                while _read_pipe_chunk(proc.stdout):
+                    pass
 
     def _emit_record(self, kind: int, timestamp: int, payload: bytes) -> None:
         self.chunk_callback(
