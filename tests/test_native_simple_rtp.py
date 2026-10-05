@@ -50,6 +50,12 @@ def test_parses_codec_info_and_rtp_extension():
     assert parsed.payload == b"payload"
 
 
+def test_reads_payload_after_fixed_header_when_first_byte_is_0xb8():
+    rtp = parse_rtp_packet(bytes.fromhex("b860450e28e65dc80000000a3c81e201"))
+    assert rtp.sequence == 0x450E
+    assert rtp.payload == bytes.fromhex("3c81e201")
+
+
 def test_rejects_invalid_rtp_version():
     with pytest.raises(NativeSimpleRtpError, match="version"):
         parse_rtp_packet(bytes(12))
