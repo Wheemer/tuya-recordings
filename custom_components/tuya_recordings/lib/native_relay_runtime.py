@@ -481,6 +481,7 @@ class NativeRelayPlaybackWorker:
                         playback.connect(media=wanted_mode == "media"),
                         work,
                         timeout=self._command_timeout + 60,
+                        cancellable=False,
                     )
                     connection_mode = wanted_mode
                 if isinstance(work, _InteractivePlaybackWork):
@@ -535,9 +536,10 @@ class NativeRelayPlaybackWorker:
                     results: list[tuple[date, list[dict[str, Any]]]] = []
                     for day in work.days:
                         if work.cancel_event is not None and work.cancel_event.is_set():
-                            raise NativeRelayRuntimeError(
+                            work.error = NativeRelayRuntimeError(
                                 "Native catalog was cancelled"
                             )
+                            break
                         query = (
                             playback.query_event_recordings
                             if work.events
@@ -607,6 +609,7 @@ class NativeRelayPlaybackWorker:
         work: _PlaybackWork | _InteractivePlaybackWork | _ThumbnailWork | _CatalogWork,
         *,
         timeout: float | None = None,
+        cancellable: bool = True,
     ) -> Any:
         """Await one operation while honoring worker close and request cancellation."""
         task = asyncio.create_task(operation)
@@ -614,7 +617,11 @@ class NativeRelayPlaybackWorker:
         deadline = None if timeout is None else loop.time() + timeout
         try:
             while True:
-                if self._work_cancelled(work):
+                if (
+                    self._work_cancelled(work)
+                    if cancellable
+                    else self._shutdown_event.is_set()
+                ):
                     raise NativeRelayRuntimeError("Native camera work was cancelled")
                 if deadline is not None:
                     remaining = deadline - loop.time()

@@ -246,6 +246,16 @@ class BlockingConnectPlayback(Playback):
         await asyncio.Event().wait()
 
 
+class CancelDuringConnectPlayback(Playback):
+    def __init__(self, cancel):
+        super().__init__()
+        self.cancel = cancel
+
+    async def connect(self, *, media=True):
+        self.cancel.set()
+        await asyncio.sleep(0.2)
+
+
 class EncryptedPlayback(Playback):
     uuid = "clip-uuid"
     secret = "0123456789abcdef-extra"
@@ -624,6 +634,25 @@ def test_worker_close_cancels_active_connect_and_drains_queued_work():
     assert all(isinstance(error, NativeRelayRuntimeError) for error in failures)
     assert playback.thumbnails == []
     assert playback.closed is True
+
+
+def test_worker_keeps_connected_transport_when_catalog_is_cancelled():
+    cancel = threading.Event()
+    playbacks = []
+    worker = NativeRelayPlaybackWorker(
+        camera_config(),
+        APP_SESSION,
+        playback_factory=lambda *args, **kwargs: (
+            playbacks.append(CancelDuringConnectPlayback(cancel)) or playbacks[-1]
+        ),
+    )
+
+    with pytest.raises(NativeRelayRuntimeError, match="cancelled"):
+        worker.catalog([date(2026, 9, 16)], cancel)
+    worker.catalog([date(2026, 9, 16)], None)
+
+    assert len(playbacks) == 1
+    worker.close()
 
 
 def test_pool_close_cancels_all_workers_before_waiting_for_threads():
