@@ -25,13 +25,11 @@ _CONNECT_TIMEOUT_SECONDS = 15
 _KEEPALIVE_SECONDS = 60
 _SOURCE_LENGTH = 4
 
-# The brokers present a certificate that does not match the regional hostname,
-# so a verifying context never completes the handshake. The payloads carried on
-# top are themselves encrypted under the device local key, which is what
-# actually keeps the signaling private.
-_UNVERIFIED_TLS = ssl.create_default_context()
-_UNVERIFIED_TLS.check_hostname = False
-_UNVERIFIED_TLS.verify_mode = ssl.CERT_NONE
+# Some Tuya brokers present a certificate for a different regional hostname.
+# Keep certificate-chain validation mandatory; only hostname matching is relaxed
+# for that documented interoperability constraint.
+_BROKER_TLS = ssl.create_default_context()
+_BROKER_TLS.check_hostname = False
 
 
 class MotoClient:
@@ -89,7 +87,7 @@ class MotoClient:
             password=self._identity.password,
             identifier=self._identity.client_id,
             keepalive=_KEEPALIVE_SECONDS,
-            tls_context=_UNVERIFIED_TLS,
+            tls_context=_BROKER_TLS,
             clean_session=True,
         )
         try:

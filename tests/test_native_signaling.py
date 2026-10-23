@@ -1,5 +1,8 @@
 import asyncio
 import json
+import ssl
+
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
 
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.models import (
     MqttIdentity,
@@ -51,3 +54,9 @@ def test_relay_frames_preserve_apk_signaling_header():
     assert offer["header"]["moto_id"] == ""
     assert offer["header"]["security_level"] == 3
     assert candidate["header"]["moto_id"] == ""
+
+
+def test_signaling_tls_validates_the_broker_certificate_chain():
+    """Regional hostname mismatch must not disable certificate validation."""
+    assert moto_client._BROKER_TLS.check_hostname is False
+    assert moto_client._BROKER_TLS.verify_mode is ssl.CERT_REQUIRED
