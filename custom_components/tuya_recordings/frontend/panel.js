@@ -763,7 +763,7 @@ class TuyaRecordingsPanel extends HTMLElement {
         hour: "numeric",
         hour12: this._hass?.locale?.time_format !== "24",
       }).format(new Date(2000, 0, 1, hour === 24 ? 0 : hour));
-      return `<span class="timeline-hour" style="left:${(hour / 24) * 100}%">${this.escape(hour === 24 ? label.replace(/12(?=\s)/, "12") : label)}</span>`;
+      return `<span class="timeline-hour" style="left:${(hour / 24) * 100}%">${this.escape(label)}</span>`;
     }).join("");
   }
 
@@ -887,7 +887,9 @@ class TuyaRecordingsPanel extends HTMLElement {
     } else {
       dateControl?.addEventListener("change", async (event) => {
         this.stopPlayback();
-        this.selectedDate = event.target.value;
+        const selectedDate = event.target.value;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) return;
+        this.selectedDate = selectedDate;
         this.selectedClip = null;
         await this.signVisibleClips();
         this.render();
