@@ -354,7 +354,9 @@ def derive_native_password(camera_password: str, local_key: str) -> str:
     """Match `MD5Utils.b(password + "||" + localKey)` from Smart Life."""
     _required("camera_password", camera_password)
     _required("local_key", local_key)
-    return hashlib.md5(f"{camera_password}||{local_key}".encode("utf-8")).hexdigest()
+    return hashlib.md5(  # noqa: S324 - exact Smart Life wire compatibility derivation
+        f"{camera_password}||{local_key}".encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
 
 
 def native_session_api_request(

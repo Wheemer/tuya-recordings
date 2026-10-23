@@ -20,7 +20,7 @@ from custom_components.tuya_recordings.lib.native_gateway import NativeAppGatewa
 def _fingerprint(value: str) -> str:
     if not value:
         return "missing"
-    return hashlib.sha256(value.encode()).hexdigest()[:10]
+    return hashlib.blake2s(value.encode(), digest_size=5).hexdigest()
 
 
 def _load_entry(config_dir: Path) -> dict[str, Any]:

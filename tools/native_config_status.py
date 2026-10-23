@@ -14,7 +14,7 @@ from custom_components.tuya_recordings.const import CONF_CLOUD_ACTIVITY_PAUSED
 
 def _fingerprint(value: str) -> str:
     """Return a comparison-safe identifier without exposing a credential."""
-    return hashlib.sha256(value.encode()).hexdigest()[:10] if value else "missing"
+    return hashlib.blake2s(value.encode(), digest_size=5).hexdigest() if value else "missing"
 
 
 def _json_keys(value: str) -> list[str]:
