@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 from custom_components.tuya_recordings.client import TuyaRecordingsClient
 from custom_components.tuya_recordings.const import CONF_CLOUD_ACTIVITY_PAUSED
-
-
-def _fingerprint(value: str) -> str:
-    """Return a comparison-safe identifier without exposing a credential."""
-    return hashlib.blake2s(value.encode(), digest_size=5).hexdigest() if value else "missing"
 
 
 def _json_keys(value: str) -> list[str]:
@@ -83,10 +77,9 @@ def main() -> int:
                         "config_keys": _json_keys(config.config_json),
                         "ext_keys": sorted(str(key) for key in config.ext_config),
                         "session_id_length": len(config.p2p_session_id),
-                        "moto_id_fingerprint": _fingerprint(config.p2p_moto_id),
-                        "auth_fingerprint": _fingerprint(config.p2p_auth),
-                        "local_key_fingerprint": _fingerprint(config.local_key),
-                        "camera_password_fingerprint": _fingerprint(config.camera_password),
+                        "has_p2p_auth": bool(config.p2p_auth),
+                        "has_local_key": bool(config.local_key),
+                        "has_camera_password": bool(config.camera_password),
                         "config_bytes": len(config.config_json),
                         "skill_bytes": len(config.skill),
                     },

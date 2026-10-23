@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -15,12 +14,6 @@ from custom_components.tuya_recordings.const import (
     DOMAIN,
 )
 from custom_components.tuya_recordings.lib.native_gateway import NativeAppGatewayClient
-
-
-def _fingerprint(value: str) -> str:
-    if not value:
-        return "missing"
-    return hashlib.blake2s(value.encode(), digest_size=5).hexdigest()
 
 
 def _load_entry(config_dir: Path) -> dict[str, Any]:
@@ -59,8 +52,8 @@ def main() -> int:
             json.dumps(
                 {
                     "device_id": device_id,
-                    "saved_key": _fingerprint(saved),
-                    "current_key": _fingerprint(current),
+                    "saved_key_present": bool(saved),
+                    "current_key_present": bool(current),
                     "keys_match": bool(saved and current and saved == current),
                 },
                 sort_keys=True,
