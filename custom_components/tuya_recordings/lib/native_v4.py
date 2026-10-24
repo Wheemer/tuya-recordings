@@ -58,6 +58,38 @@ class NativeV4RequestContext:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeV4AIDetection:
+    """One camera-supplied AI detection interval from an SD catalog item."""
+
+    start_time: int
+    end_time: int
+    ai_code: str
+    ai_code_icon: str = ""
+
+    def validate(self) -> NativeV4AIDetection:
+        _integer("ai_detection.start_time", self.start_time, 0x7FFFFFFFFFFFFFFF)
+        _integer("ai_detection.end_time", self.end_time, 0x7FFFFFFFFFFFFFFF)
+        if self.end_time <= self.start_time:
+            raise NativeV4Error("AI detection end_time must be after start_time")
+        _text("ai_detection.ai_code", self.ai_code)
+        if not self.ai_code:
+            raise NativeV4Error("AI detection ai_code is invalid")
+        _text("ai_detection.ai_code_icon", self.ai_code_icon)
+        return self
+
+    def as_catalog_item(self) -> dict[str, Any]:
+        self.validate()
+        item = {
+            "startTime": self.start_time,
+            "endTime": self.end_time,
+            "aiCode": self.ai_code,
+        }
+        if self.ai_code_icon:
+            item["aiCodeIcon"] = self.ai_code_icon
+        return item
+
+
+@dataclass(frozen=True, slots=True)
 class NativeV4Recording:
     """One ``Record`` item registered by the camera SDK."""
 
@@ -69,6 +101,7 @@ class NativeV4Recording:
     uuid: str = ""
     encrypt_md5: str = ""
     event_types: tuple[int, ...] = ()
+    ai_detections: tuple[NativeV4AIDetection, ...] = ()
 
     def validate(self) -> NativeV4Recording:
         _integer("start_time", self.start_time, 0x7FFFFFFFFFFFFFFF)
@@ -85,6 +118,12 @@ class NativeV4Recording:
             raise NativeV4Error("event_types is invalid")
         for event_type in self.event_types:
             _integer("event_types", event_type, 0x7FFFFFFF)
+        if not isinstance(self.ai_detections, tuple):
+            raise NativeV4Error("ai_detections is invalid")
+        for detection in self.ai_detections:
+            if not isinstance(detection, NativeV4AIDetection):
+                raise NativeV4Error("ai_detections is invalid")
+            detection.validate()
         for name, value in (("uuid", self.uuid), ("encrypt_md5", self.encrypt_md5)):
             if not isinstance(value, str) or "\0" in value:
                 raise NativeV4Error(f"{name} is invalid")
@@ -103,6 +142,10 @@ class NativeV4Recording:
         }
         if self.event_types:
             recording["event_types"] = list(self.event_types)
+        if self.ai_detections:
+            recording["aiDetectList"] = [
+                detection.as_catalog_item() for detection in self.ai_detections
+            ]
         return recording
 
 

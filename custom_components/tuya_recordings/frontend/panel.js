@@ -717,12 +717,12 @@ class TuyaRecordingsPanel extends HTMLElement {
           <div id="recording-timeline" class="time-ruler" role="slider" tabindex="0" aria-label="Recording timeline" aria-valuemin="0" aria-valuemax="86400">
             <div class="time-ruler-content">
               ${this.renderTimelineHours()}
-              <div class="recording-lane">${this.renderRecordingSegments(ranges)}${this.renderPersonDetectionMarkers(this.camera?.person_detections || [])}</div>
+              <div class="recording-lane">${this.renderRecordingSegments(ranges)}${this.renderAIDetectionMarkers(this.camera?.ai_detections || [])}</div>
             </div>
           </div>
           <div class="timeline-playhead" aria-hidden="true"></div>
         </div>
-        <div class="timeline-legend">${ranges.length ? '<i></i><span>Recorded video</span><b></b><span>Person detected</span><span>Drag to browse, tap a recording to play</span>' : '<span>No recorded video on this day</span>'}</div>
+        <div class="timeline-legend">${ranges.length ? '<i></i><span>Recorded video</span><b></b><span>AI detection</span><span>Drag to browse, tap a recording to play</span>' : '<span>No recorded video on this day</span>'}</div>
       </div>
     </section>`;
   }
@@ -779,15 +779,18 @@ class TuyaRecordingsPanel extends HTMLElement {
     }).join("");
   }
 
-  renderPersonDetectionMarkers(detections) {
+  renderAIDetectionMarkers(detections) {
     const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
     const dayEnd = dayStart + 86400;
-    return detections.map((timestamp) => {
-      const detectedAt = Number(timestamp);
-      if (!Number.isFinite(detectedAt) || detectedAt < dayStart || detectedAt >= dayEnd) return "";
+    return detections.map((detection) => {
+      const detectedAt = Number(detection?.start);
+      const detectedEnd = Number(detection?.end);
+      if (!Number.isFinite(detectedAt) || !Number.isFinite(detectedEnd) || detectedEnd <= detectedAt || detectedAt < dayStart || detectedAt >= dayEnd) return "";
       const left = ((detectedAt - dayStart) / 86400) * 100;
-      const label = this.escape(`Person detected at ${this.formatTime(detectedAt)}`);
-      return `<span class="person-detection-marker" style="left:${left}%" title="${label}" aria-label="${label}"></span>`;
+      const width = Math.max(0.14, ((Math.min(detectedEnd, dayEnd) - detectedAt) / 86400) * 100);
+      const code = typeof detection?.ai_code === "string" ? detection.ai_code : "AI";
+      const label = this.escape(`${code} detected at ${this.formatTime(detectedAt)}`);
+      return `<span class="person-detection-marker" style="left:${left}%;width:${width}%" title="${label}" aria-label="${label}"></span>`;
     }).join("");
   }
 

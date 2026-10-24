@@ -447,49 +447,20 @@ def test_timeline_range_resolution_uses_containing_then_next_range():
     assert _timeline_range_for_time(index, "camera-1", 250) == (200, 240)
     assert _timeline_range_for_time(index, "missing", 110) is None
 
-def test_person_detection_markers_use_explicit_camera_event_time():
-    """Timeline markers reject HA receipt time and use explicit camera time."""
-    from datetime import datetime, timezone
-    from types import SimpleNamespace
-
+def test_timeline_ai_markers_use_only_camera_catalog_intervals():
     from custom_components.tuya_recordings import http as recordings_http
 
-    day_start = datetime(2026, 10, 9, tzinfo=timezone.utc)
-    day_end = datetime(2026, 10, 10, tzinfo=timezone.utc)
-    states = [
-        SimpleNamespace(
-            last_changed=datetime(2026, 10, 9, 14, 20, tzinfo=timezone.utc),
-            attributes={"last_event_attributes": {"time": 1791535800000}},
-        ),
-        SimpleNamespace(
-            last_changed=datetime(2026, 10, 9, 14, 30, tzinfo=timezone.utc),
-            attributes={"last_event_attributes": {"timestamp": 1791536400}},
-        ),
-        SimpleNamespace(
-            last_changed=datetime(2026, 10, 9, 14, 40, tzinfo=timezone.utc),
-            attributes={"last_event_attributes": {"time": 12345}},
-        ),
-        SimpleNamespace(
-            last_changed=datetime(2026, 10, 9, 14, 50, tzinfo=timezone.utc),
-            attributes={"last_event_attributes": {"dp_timestamp": 1791537000}},
-        ),
-    ]
-
-    assert recordings_http._person_detection_timestamps(
-        states, day_start, day_end
-    ) == [1791535800, 1791536400]
-
-
-def test_person_detection_markers_require_a_matching_sd_catalog_range():
-    from custom_components.tuya_recordings import http as recordings_http
-
-    assert recordings_http._person_detections_in_recordings(
-        [100, 125, 199, 220],
-        [
-            {"start": 110, "end": 130},
-            {"start": 200, "end": 240},
-        ],
-    ) == [125, 220]
+    assert recordings_http._native_ai_detections(
+        {
+            "aiDetectList": [
+                {"startTime": 110, "endTime": 130, "aiCode": "person", "aiCodeIcon": "icon"},
+                {"startTime": 50, "endTime": 60, "aiCode": "outside"},
+                {"startTime": 180, "endTime": 170, "aiCode": "invalid"},
+            ]
+        },
+        100,
+        200,
+    ) == [{"start": 110, "end": 130, "ai_code": "person", "ai_code_icon": "icon"}]
 
 
 def test_panel_data_preserves_camera_event_catalog_metadata(tmp_path):
