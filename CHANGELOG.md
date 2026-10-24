@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.9 (unreleased)
+
+### Fixes
+
+- Uses the camera's ordinary SD-card day catalog as the timeline source, matching
+  the Smart Life and Tuya Smart playback implementations.
+- Preserves native `aiDetectList` detection intervals, codes, and icons through
+  the catalog pipeline so timeline markers use camera-supplied timing rather
+  than Home Assistant state history.
+- Removes the unused Home Assistant Recorder dependency from the integration.
+
 ## Tuya Recordings v0.4.8 (2026-10-20)
 
 ### Improvements
@@ -302,4 +313,3 @@ First public beta of Tuya Recordings for Home Assistant.
 - On-demand mode lists discovered clips and caches them when selected.
 - Cached media should be stored under a private `/media` path, not
   `/config/www`.
-

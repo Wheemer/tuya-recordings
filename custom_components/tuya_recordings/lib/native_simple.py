@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from .native_v4 import NativeV4CatalogPage, NativeV4Recording
+from .native_v4 import (
+    NativeV4AIDetection,
+    NativeV4CatalogPage,
+    NativeV4Error,
+    NativeV4Recording,
+)
 
 _MAGIC = 0x12345678
 _HEADER = struct.Struct("<IIIHHI")
@@ -670,6 +675,43 @@ def _recording(value: Any) -> NativeV4Recording:
     ):
         raise NativeSimpleError("Catalog field eventTypeArr is invalid")
 
+    raw_ai_detections = value.get("aiDetectList", [])
+    if not isinstance(raw_ai_detections, list):
+        raise NativeSimpleError("Catalog field aiDetectList is invalid")
+    ai_detections: list[NativeV4AIDetection] = []
+    for item in raw_ai_detections:
+        if not isinstance(item, dict):
+            raise NativeSimpleError("Catalog AI detection is not an object")
+        start = next(
+            (item[name] for name in ("startTime", "start_time") if name in item),
+            None,
+        )
+        end = next(
+            (item[name] for name in ("endTime", "end_time") if name in item),
+            None,
+        )
+        code = next(
+            (item[name] for name in ("aiCode", "ai_code") if name in item),
+            None,
+        )
+        icon = next(
+            (item[name] for name in ("aiCodeIcon", "ai_code_icon") if name in item),
+            "",
+        )
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not isinstance(code, str)
+            or not isinstance(icon, str)
+        ):
+            raise NativeSimpleError("Catalog AI detection fields are invalid")
+        try:
+            ai_detections.append(
+                NativeV4AIDetection(start, end, code, icon).validate()
+            )
+        except NativeV4Error as err:
+            raise NativeSimpleError("Catalog AI detection fields are invalid") from err
+
     return NativeV4Recording(
         start_time=integer("startTime", "start_time"),
         end_time=integer("endTime", "end_time"),
@@ -679,6 +721,7 @@ def _recording(value: Any) -> NativeV4Recording:
         encrypt=integer("encrypt", default=0),
         uuid=text("uuid"),
         encrypt_md5=text("encryptMD5", "encrypt_md5"),
+        ai_detections=tuple(ai_detections),
     ).validate()
 
 

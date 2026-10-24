@@ -301,6 +301,7 @@ def test_decodes_apk_camel_case_catalog_items():
                     "encrypt": 0,
                     "uuid": "clip",
                     "encryptMD5": "digest",
+                    "aiDetectList": [{"startTime": 102, "endTime": 105, "aiCode": "person", "aiCodeIcon": "icon"}],
                 }
             ]
         }
@@ -317,6 +318,7 @@ def test_decodes_apk_camel_case_catalog_items():
         "encrypt": 0,
         "uuid": "clip",
         "encrypt_md5": "digest",
+        "aiDetectList": [{"startTime": 102, "endTime": 105, "aiCode": "person", "aiCodeIcon": "icon"}],
     }
 
 

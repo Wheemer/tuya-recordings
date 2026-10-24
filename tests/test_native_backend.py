@@ -511,7 +511,7 @@ def test_native_backend_accepts_thumbnail_with_event_timeline_capability(tmp_pat
     assert output.read_bytes() == jpeg_bytes()
 
 
-def test_native_backend_uses_exact_event_catalog_bounds_for_thumbnail_rows():
+def test_native_backend_keeps_apk_ordinary_catalog_when_event_catalog_is_available():
     class EventCatalogSession(FakeNativeSession):
         def __init__(self):
             super().__init__()
@@ -526,10 +526,9 @@ def test_native_backend_uses_exact_event_catalog_bounds_for_thumbnail_rows():
         "camera", {}, {}, date(2026, 9, 16)
     )
 
-    assert [(clip["start"], clip["end"]) for clip in clips] == [(125, 140)]
-    assert clips[0]["raw"]["event_types"] == [1]
+    assert [(clip["start"], clip["end"]) for clip in clips] == [(100, 200)]
     assert session.catalog_days == [date(2026, 9, 16)]
-    assert session.event_catalog_days == [date(2026, 9, 16)]
+    assert session.event_catalog_days == []
 
 
 def test_native_backend_keeps_ordinary_catalog_when_event_catalog_is_empty():

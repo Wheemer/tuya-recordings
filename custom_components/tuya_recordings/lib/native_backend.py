@@ -259,23 +259,11 @@ class ApkNativeRecordingBackend:
         day: date,
     ) -> list[dict[str, Any]]:
         del config, auth
-        event_catalog = self.event_catalog_available(dev_id)
         with self._open_session(dev_id, None) as session:
-            ordinary = _normalize_recordings(
+            return _normalize_recordings(
                 self._call_required(session, "recordings_for_day", "getRecordFragmentsByDay")(day),
                 catalog_day=day,
             )
-            if not event_catalog:
-                return ordinary
-            events = _normalize_recordings(
-                self._call_required(
-                    session,
-                    "event_recordings_for_day",
-                    "getEventRecordFragmentsByDay",
-                )(day),
-                catalog_day=day,
-            )
-            return events or ordinary
 
     def recordings_for_days(
         self,
@@ -289,7 +277,6 @@ class ApkNativeRecordingBackend:
         del config, auth
         if days != newest_first_days(days):
             raise ValueError("Recording catalog days must be unique and newest first")
-        event_catalog = self.event_catalog_available(dev_id)
         results: list[tuple[date, list[dict[str, Any]]]] = []
         with self._open_session(dev_id, cancel_event) as session:
             query_many = getattr(session, "recordings_for_days", None)
@@ -311,36 +298,14 @@ class ApkNativeRecordingBackend:
                     ordinary = _normalize_recordings(
                         item[1], catalog_day=expected_day
                     )
-                    if event_catalog:
-                        events = _normalize_recordings(
-                            self._call_required(
-                                session,
-                                "event_recordings_for_day",
-                                "getEventRecordFragmentsByDay",
-                            )(expected_day),
-                            catalog_day=expected_day,
-                        )
-                        results.append((expected_day, events or ordinary))
-                    else:
-                        results.append((expected_day, ordinary))
+                    results.append((expected_day, ordinary))
                 return results
             query = self._call_required(session, "recordings_for_day", "getRecordFragmentsByDay")
             for day in days:
                 if _cancelled(cancel_event):
                     raise RecordingBackendUnavailable("APK-native catalog was cancelled")
                 ordinary = _normalize_recordings(query(day), catalog_day=day)
-                if event_catalog:
-                    events = _normalize_recordings(
-                        self._call_required(
-                            session,
-                            "event_recordings_for_day",
-                            "getEventRecordFragmentsByDay",
-                        )(day),
-                        catalog_day=day,
-                    )
-                    results.append((day, events or ordinary))
-                else:
-                    results.append((day, ordinary))
+                results.append((day, ordinary))
         return results
 
     def receive_clip(
