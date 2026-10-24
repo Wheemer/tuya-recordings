@@ -174,26 +174,53 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
     }
 
 
-def _person_detection_timestamps(
-    states: list[Any], start: datetime, end: datetime
+_PERSON_MARKER_RECEIPT_WINDOW_SECONDS = 120
+
+
+def _person_detection_markers(
+    states: list[Any],
+    recording_ranges: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
 ) -> list[int]:
-    """Return only explicit camera event times, never HA receipt times."""
+    """Return SD-timeline marker times for person notifications.
+
+    The camera catalog is always the source of a marker's displayed time. A
+    notification-supplied camera timestamp is used when available. Some Tuya
+    IPC firmware sends only ``ipc_human`` without a timestamp, though; in that
+    case, match the notification receipt to the nearest native catalog range
+    and mark the range start rather than drawing at HA's receipt time.
+    """
     day_start = int(start.timestamp())
     day_end = int(end.timestamp())
-    timestamps: list[int] = []
+    ranges = sorted(
+        (
+            int(item.get("start") or 0),
+            int(item.get("end") or 0),
+        )
+        for item in recording_ranges
+        if int(item.get("end") or 0) > int(item.get("start") or 0)
+    )
+    markers: set[int] = set()
     for state in states:
+        if getattr(state, "state", None) != "on":
+            continue
         attributes = state.attributes.get("last_event_attributes")
         if not isinstance(attributes, dict):
             continue
-        # These fields arrive in the camera's notification payload. The
-        # recorder state-change time and Tuya DP receipt time are transport
-        # timing, not SD-card timing, and must never place a timeline marker.
-        for key in ("time", "timestamp"):
+        for key in ("time", "timestamp", "dp_timestamp"):
             candidate = _as_epoch_seconds(attributes.get(key))
-            if day_start <= candidate < day_end:
-                timestamps.append(candidate)
+            if candidate and day_start <= candidate < day_end:
+                marker = _recording_marker_at(candidate, ranges)
+                if marker is not None:
+                    markers.add(marker)
                 break
-    return sorted(set(timestamps))
+        else:
+            received_at = int(state.last_changed.timestamp())
+            marker = _recording_marker_near(received_at, ranges)
+            if marker is not None:
+                markers.add(marker)
+    return sorted(markers)
 
 
 def _as_epoch_seconds(value: Any) -> int:
@@ -205,21 +232,30 @@ def _as_epoch_seconds(value: Any) -> int:
     return epoch // 1000 if epoch > 10_000_000_000 else epoch
 
 
-def _person_detections_in_recordings(
-    timestamps: list[int], recording_ranges: list[dict[str, Any]]
-) -> list[int]:
-    """Keep a person marker only when the camera SD catalog contains it."""
-    ranges = sorted(
-        (
-            (int(item.get("start") or 0), int(item.get("end") or 0))
-            for item in recording_ranges
-        ),
-    )
-    return [
-        timestamp
-        for timestamp in timestamps
-        if any(start <= timestamp < end for start, end in ranges if end > start)
-    ]
+def _recording_marker_at(
+    timestamp: int, ranges: list[tuple[int, int]]
+) -> int | None:
+    """Return an exact catalog-backed marker for a camera event timestamp."""
+    for range_start, range_end in ranges:
+        if range_start <= timestamp < range_end:
+            return timestamp
+    return None
+
+
+def _recording_marker_near(
+    received_at: int, ranges: list[tuple[int, int]]
+) -> int | None:
+    """Match an untimestamped notification to its nearby native SD event."""
+    closest: tuple[int, int] | None = None
+    closest_distance = _PERSON_MARKER_RECEIPT_WINDOW_SECONDS + 1
+    for range_start, range_end in ranges:
+        if range_start <= received_at < range_end:
+            return range_start
+        distance = min(abs(received_at - range_start), abs(received_at - range_end))
+        if distance < closest_distance:
+            closest = (range_start, range_end)
+            closest_distance = distance
+    return closest[0] if closest is not None else None
 
 
 def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
@@ -549,14 +585,14 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
         except Exception as err:  # Recorder must never block SD-card playback.
             _LOGGER.debug("Unable to load person-detection history: %s", err)
             return
-        detections = {
-            dev_id: _person_detection_timestamps(rows, start, end)
-            for dev_id, rows in zip(sources, state_rows, strict=True)
-        }
+        rows_by_device = dict(zip(sources, state_rows, strict=True))
         for camera in data.get("cameras", []):
             dev_id = str(camera.get("dev_id") or "")
-            camera["person_detections"] = _person_detections_in_recordings(
-                detections.get(dev_id, []), camera.get("recording_ranges", [])
+            camera["person_detections"] = _person_detection_markers(
+                rows_by_device.get(dev_id, []),
+                camera.get("recording_ranges", []),
+                start,
+                end,
             )
 
     def _schedule_catalog_refresh(

@@ -448,7 +448,7 @@ def test_timeline_range_resolution_uses_containing_then_next_range():
     assert _timeline_range_for_time(index, "missing", 110) is None
 
 def test_person_detection_markers_use_explicit_camera_event_time():
-    """Timeline markers reject HA receipt time and use explicit camera time."""
+    """Timeline markers use the exact camera event time in its SD range."""
     from datetime import datetime, timezone
     from types import SimpleNamespace
 
@@ -458,38 +458,68 @@ def test_person_detection_markers_use_explicit_camera_event_time():
     day_end = datetime(2026, 10, 10, tzinfo=timezone.utc)
     states = [
         SimpleNamespace(
+            state="on",
             last_changed=datetime(2026, 10, 9, 14, 20, tzinfo=timezone.utc),
             attributes={"last_event_attributes": {"time": 1791535800000}},
         ),
         SimpleNamespace(
+            state="on",
             last_changed=datetime(2026, 10, 9, 14, 30, tzinfo=timezone.utc),
             attributes={"last_event_attributes": {"timestamp": 1791536400}},
         ),
         SimpleNamespace(
+            state="on",
             last_changed=datetime(2026, 10, 9, 14, 40, tzinfo=timezone.utc),
             attributes={"last_event_attributes": {"time": 12345}},
         ),
         SimpleNamespace(
+            state="on",
             last_changed=datetime(2026, 10, 9, 14, 50, tzinfo=timezone.utc),
             attributes={"last_event_attributes": {"dp_timestamp": 1791537000}},
         ),
     ]
 
-    assert recordings_http._person_detection_timestamps(
-        states, day_start, day_end
-    ) == [1791535800, 1791536400]
+    assert recordings_http._person_detection_markers(
+        states,
+        [
+            {"start": 1791535700, "end": 1791535900},
+            {"start": 1791536300, "end": 1791536500},
+            {"start": 1791536900, "end": 1791537100},
+        ],
+        day_start,
+        day_end,
+    ) == [1791535800, 1791536400, 1791537000]
 
 
-def test_person_detection_markers_require_a_matching_sd_catalog_range():
+def test_person_detection_markers_match_untimestamped_notifications_to_sd_range():
     from custom_components.tuya_recordings import http as recordings_http
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
 
-    assert recordings_http._person_detections_in_recordings(
-        [100, 125, 199, 220],
+    day_start = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    day_end = datetime(1970, 1, 2, tzinfo=timezone.utc)
+    states = [
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime.fromtimestamp(138, timezone.utc),
+            attributes={"last_event_attributes": {"cmd": "ipc_human"}},
+        ),
+        SimpleNamespace(
+            state="off",
+            last_changed=datetime.fromtimestamp(162, timezone.utc),
+            attributes={"last_event_attributes": {"cmd": "ipc_human"}},
+        ),
+    ]
+
+    assert recordings_http._person_detection_markers(
+        states,
         [
             {"start": 110, "end": 130},
-            {"start": 200, "end": 240},
+            {"start": 140, "end": 170},
         ],
-    ) == [125, 220]
+        day_start,
+        day_end,
+    ) == [140]
 
 
 def test_panel_data_preserves_camera_event_catalog_metadata(tmp_path):
