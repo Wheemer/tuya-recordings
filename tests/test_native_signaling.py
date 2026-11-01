@@ -6,6 +6,7 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import 
 
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.models import (
     MqttIdentity,
+    StreamConfig,
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import (
     MotoClient,
@@ -69,7 +70,17 @@ def test_mqtt_offer_uses_camera_advertised_connection_metadata():
 def test_relay_frames_preserve_apk_signaling_header():
     offer = json.loads(
         relay_offer_frame(
-            "account", "camera", "session", "trace", "sdp", [], {}, {}, "camera-moto-id"
+            "account",
+            "camera",
+            "session",
+            "trace",
+            "sdp",
+            [],
+            {},
+            {},
+            "camera-moto-id",
+            True,
+            4,
         )
     )
     candidate = json.loads(
@@ -79,8 +90,41 @@ def test_relay_frames_preserve_apk_signaling_header():
     )
 
     assert offer["header"]["moto_id"] == "camera-moto-id"
-    assert offer["header"]["security_level"] == 3
+    assert offer["header"]["security_level"] == 4
+    assert offer["msg"]["preconnect"] is True
     assert candidate["header"]["moto_id"] == "camera-moto-id"
+
+
+def test_stream_config_preserves_relay_connection_metadata():
+    config = StreamConfig.from_json(
+        {
+            "password": "camera-password",
+            "p2pConfig": {
+                "motoId": "camera-moto-id",
+                "securityLevel": 4,
+                "preconnect": 1,
+                "session": {
+                    "sessionId": "session",
+                    "aesKey": "0123456789abcdef",
+                    "iceUfrag": "ufrag",
+                    "icePassword": "password",
+                    "traceId": "trace",
+                },
+                "tcpRelay": {
+                    "urls": ["tcp4:relay.example.test:1443"],
+                    "username": "1:user",
+                    "credential": "credential",
+                    "sessionId": "relay-session",
+                },
+            },
+        },
+        "camera",
+        "0123456789abcdef",
+    )
+
+    assert config.moto_id == "camera-moto-id"
+    assert config.preconnect is True
+    assert config.security_level == 4
 
 
 def test_signaling_tls_validates_the_broker_certificate_chain():

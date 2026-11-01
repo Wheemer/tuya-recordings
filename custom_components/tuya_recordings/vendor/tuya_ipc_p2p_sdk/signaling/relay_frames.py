@@ -41,6 +41,8 @@ def relay_offer_frame(
     tcp_token: JsonValue,
     log_config: JsonValue,
     moto_id: str = "",
+    preconnect: bool = False,
+    security_level: int = 3,
 ) -> bytes:
     """Build the tunnelled offer."""
     header = _header("offer", uid, device_id, session_id, trace_id, moto_id)
@@ -48,7 +50,7 @@ def relay_offer_frame(
         {
             "is_pre": 0,
             "p2p_skill": 1635,
-            "security_level": 3,
+            "security_level": security_level,
         }
     )
     return dump_json(
@@ -56,7 +58,7 @@ def relay_offer_frame(
             "header": header,
             "msg": {
                 "sdp": sdp,
-                "preconnect": True,
+                "preconnect": preconnect,
                 "token": ice_servers,
                 "tcp_token": tcp_token,
                 "log": log_config,

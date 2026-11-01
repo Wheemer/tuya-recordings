@@ -226,6 +226,8 @@ class StreamSession:
                 tcp_token,
                 log_config,
                 self._config.moto_id,
+                self._config.preconnect,
+                self._config.security_level,
             ),
         )
         for candidate in self._candidates:
