@@ -129,6 +129,7 @@ class StreamSession:
             device_id=self._config.device_id,
             session_id=session_id,
             local_key=self._config.local_key,
+            moto_id=self._config.moto_id,
             on_answer=self._on_answer,
             on_candidate=self._on_remote_candidate,
             on_disconnect=self._on_device_disconnect,
@@ -224,6 +225,9 @@ class StreamSession:
                 ice_servers,
                 tcp_token,
                 log_config,
+                self._config.moto_id,
+                self._config.preconnect,
+                self._config.security_level,
             ),
         )
         for candidate in self._candidates:
@@ -235,6 +239,7 @@ class StreamSession:
                     offer.session_id,
                     trace_id,
                     candidate,
+                    self._config.moto_id,
                 ),
             )
         LOGGER.debug("Tunnelled the offer and %s candidates", len(self._candidates))
