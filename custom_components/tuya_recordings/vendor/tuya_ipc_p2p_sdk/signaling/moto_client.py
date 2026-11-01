@@ -52,7 +52,7 @@ class MotoClient:
         on_candidate: Callable[[str], None],
         on_disconnect: Callable[[int], None],
         protocol_version: str = "2.2",
-        preconnect: bool = False,
+        preconnect: bool = True,
         security_level: int = 3,
         moto_id: str = "",
     ) -> None:

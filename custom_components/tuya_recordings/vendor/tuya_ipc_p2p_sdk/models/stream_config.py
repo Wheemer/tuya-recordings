@@ -33,7 +33,7 @@ class StreamConfig:
     p2p_session: P2pSession = field(repr=False)
     relay_token: RelayToken = field(repr=False)
     security_level: int = field(default=3, repr=False)
-    preconnect: bool = field(default=False, repr=False)
+    preconnect: bool = field(default=True, repr=False)
     ice_servers: list[JsonObject] = field(default_factory=list, repr=False)
     log_config: JsonObject | None = field(default=None, repr=False)
 
@@ -46,12 +46,6 @@ class StreamConfig:
             security_level = optional_int(source, "securityLevel")
         if security_level not in {2, 3, 4}:
             security_level = 3
-        raw_preconnect = p2p_config.get("preconnect")
-        preconnect = (
-            bool(raw_preconnect)
-            if isinstance(raw_preconnect, bool) or type(raw_preconnect) is int
-            else False
-        )
         return cls(
             device_id=device_id,
             local_key=local_key,
@@ -62,7 +56,9 @@ class StreamConfig:
                 or ""
             ),
             security_level=security_level,
-            preconnect=preconnect,
+            # The consumer app supplies its connection-optimization setting
+            # to the native SDK; it does not read this from p2pConfig.
+            preconnect=True,
             p2p_session=P2pSession.from_json(require_object(p2p_config, "session")),
             relay_token=RelayToken.from_json(require_object(p2p_config, "tcpRelay")),
             ice_servers=object_list(p2p_config, "ices"),

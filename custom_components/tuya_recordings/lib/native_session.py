@@ -91,7 +91,9 @@ class NativeCameraSessionConfig:
     p2p_type: int
     trace_id: str
     p2p_policy: int = 0
-    preconnect: int = 0
+    # Smart Life's consumer camera client enables connection optimization by
+    # default. This is app policy, not a value supplied by ``p2pConfig``.
+    preconnect: int = 1
     local_id: str = field(default="", repr=False)
     p2p_id: str = ""
     config_json: str = field(default="", repr=False)
@@ -393,7 +395,7 @@ def normalize_camera_info(
     *,
     local_key: str,
     trace_id: str,
-    preconnect: int = 0,
+    preconnect: int = 1,
     local_id: str = "",
     app_session: dict[str, Any] | None = None,
     app_region: str = "us",
@@ -411,9 +413,6 @@ def normalize_camera_info(
         raise NativeSessionError("Unsupported APK-native P2P configuration") from err
     token = _p2p_config_string(camera_info)
     p2p_config = _parse_json_object("p2pConfig", token)
-    token_preconnect = p2p_config.get("preconnect")
-    if isinstance(token_preconnect, bool) or type(token_preconnect) is int:
-        preconnect = int(bool(token_preconnect))
     skill = _string(camera_info.get("skill") or camera_info.get("skillV4"), "skill")
     password = _string(camera_info.get("password"), "camera password")
     p2p_id = str(camera_info.get("id") or camera_info.get("p2pId") or dev_id)

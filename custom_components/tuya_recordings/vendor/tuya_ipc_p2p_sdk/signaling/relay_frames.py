@@ -41,7 +41,7 @@ def relay_offer_frame(
     tcp_token: JsonValue,
     log_config: JsonValue,
     moto_id: str = "",
-    preconnect: bool = False,
+    preconnect: bool = True,
     security_level: int = 3,
 ) -> bytes:
     """Build the tunnelled offer."""
