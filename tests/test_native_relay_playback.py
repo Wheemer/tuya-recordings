@@ -163,7 +163,7 @@ async def test_signaling_uses_mqtt_only_after_lan_is_unavailable(monkeypatch):
 
     class MqttFallback:
         def __init__(self, **kwargs):
-            calls.append("mqtt-init")
+            calls.append(("mqtt-init", kwargs))
 
         async def async_connect(self):
             calls.append("mqtt-connect")
@@ -181,7 +181,14 @@ async def test_signaling_uses_mqtt_only_after_lan_is_unavailable(monkeypatch):
     )
     await playback._open_signaling("sdp", [], "trace", {}, {})
 
-    assert calls == ["lan-close", "mqtt-init", "mqtt-connect", "mqtt-query", "mqtt-offer"]
+    assert [call[0] if isinstance(call, tuple) else call for call in calls] == [
+        "lan-close",
+        "mqtt-init",
+        "mqtt-connect",
+        "mqtt-query",
+        "mqtt-offer",
+    ]
+    assert calls[1][1]["moto_id"] == "camera-moto-id"
     assert playback._signaling_path == "mqtt"
 
 
