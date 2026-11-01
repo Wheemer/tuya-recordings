@@ -121,6 +121,26 @@ def test_normalize_camera_info_for_p2p_type_4():
     assert config.derived_password == derive_native_password("camera-password", "local-key")
 
 
+def test_normalize_camera_info_uses_consumer_app_preconnect_policy():
+    config = normalize_camera_info(
+        "dev123",
+        camera_info(p2pConfig={
+            "preconnect": 0,
+            "session": {
+                "icePassword": "pw",
+                "iceUfrag": "ufrag",
+                "aesKey": "0123456789abcdef",
+                "sessionId": "sid",
+            },
+            "ices": [{"urls": "stun:127.0.0.1:3478"}],
+        }),
+        local_key="local-key",
+        trace_id="trace-1",
+    )
+
+    assert config.preconnect == 1
+
+
 def test_playback_catalog_v3_uses_the_apk_capability_bit():
     config = normalize_camera_info(
         "dev123",

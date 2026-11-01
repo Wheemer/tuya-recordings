@@ -39,7 +39,7 @@ def test_mqtt_offer_preserves_apk_signaling_header():
     header = published[0][1]["header"]
     assert header["moto_id"] == "camera-moto-id"
     assert header["security_level"] == 3
-    assert published[0][1]["msg"]["preconnect"] is False
+    assert published[0][1]["msg"]["preconnect"] is True
 
 
 def test_mqtt_offer_uses_camera_advertised_connection_metadata():
@@ -95,14 +95,17 @@ def test_relay_frames_preserve_apk_signaling_header():
     assert candidate["header"]["moto_id"] == "camera-moto-id"
 
 
-def test_stream_config_preserves_relay_connection_metadata():
+def test_stream_config_uses_consumer_app_preconnect_policy():
     config = StreamConfig.from_json(
         {
             "password": "camera-password",
             "p2pConfig": {
                 "motoId": "camera-moto-id",
                 "securityLevel": 4,
-                "preconnect": 1,
+                # The app-wide consumer setting, not this token field,
+                # controls native preconnect. An explicit false token value
+                # must not disable it.
+                "preconnect": 0,
                 "session": {
                     "sessionId": "session",
                     "aesKey": "0123456789abcdef",
