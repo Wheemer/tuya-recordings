@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.11 (2026-11-01)
+
+### Fixes
+
+- Follows the Smart Life and Tuya Smart consumer-app preconnect policy for
+  native SD-card playback signaling. The app enables preconnect independently
+  of a conflicting `p2pConfig.preconnect` token value, improving compatibility
+  with cameras that did not return an IMM signaling answer.
+- Keeps the APK-native transport selection intact: cameras using local P2P
+  policy use LAN signaling when locally online; other cameras use MQTT.
+
 ## Tuya Recordings v0.4.10 (2026-11-01)
 
 ### Fixes
