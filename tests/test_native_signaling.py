@@ -37,6 +37,32 @@ def test_mqtt_offer_preserves_apk_signaling_header():
     header = published[0][1]["header"]
     assert header["moto_id"] == ""
     assert header["security_level"] == 3
+    assert published[0][1]["msg"]["preconnect"] is False
+
+
+def test_mqtt_offer_uses_camera_advertised_connection_metadata():
+    published = []
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8884, "client", "user", "pass"),
+        uid="account",
+        device_id="camera",
+        session_id="session",
+        local_key="0123456789abcdef",
+        on_answer=lambda _sdp: None,
+        on_candidate=lambda _candidate: None,
+        on_disconnect=lambda _reason: None,
+        preconnect=True,
+        security_level=4,
+    )
+
+    async def capture(protocol, data):
+        published.append((protocol, data))
+
+    client._async_publish = capture
+    asyncio.run(client.async_send_offer("sdp", [], "trace", {}, {}))
+
+    assert published[0][1]["header"]["security_level"] == 4
+    assert published[0][1]["msg"]["preconnect"] is True
 
 
 def test_relay_frames_preserve_apk_signaling_header():

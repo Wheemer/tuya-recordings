@@ -35,6 +35,11 @@ from ..vendor.tuya_ipc_p2p_sdk.transport import (
 )
 
 from .native_app_mqtt import NativeAppMqttConfig
+from .native_lan_signaling import (
+    Lan302Client,
+    NativeLanSignalError,
+    NativeLanUnavailableError,
+)
 from .native_playback_stream import (
     NativePlaybackCodecInfo,
     NativePlaybackStreamFrame,
@@ -110,10 +115,11 @@ class NativeRelayPlaybackError(RuntimeError):
 class NativeRelayPlaybackSession:
     """One bounded Smart Life signaled, direct-LAN SD playback session.
 
-    Construction performs no I/O. ``connect`` sends one MQTT signaling offer,
-    waits for the camera to nominate the LAN ICE pair, authenticates conversation
-    zero, and prepares one playback conversation. MQTT carries signaling only;
-    no relay, reconnect, or retry path exists.
+    Construction performs no I/O. ``connect`` follows the APK's LAN-first
+    signaling policy, then uses MQTT only when local transport is unavailable.
+    A locally reached camera is never sent a second MQTT offer after an
+    unsuccessful LAN offer. It authenticates conversation zero and prepares one
+    playback conversation. No relay or retry loop exists.
     """
 
     def __init__(
@@ -143,6 +149,7 @@ class NativeRelayPlaybackSession:
         self._parser = NativePlaybackStreamParser()
         self._control_decoder = NativeSimpleCommandDecoder()
         self._moto: MotoClient | None = None
+        self._signaling_path = "unconnected"
         self._session: DirectSession | None = None
         self._ice: IceResponder | None = None
         self._control: KcpConversation | None = None
@@ -214,7 +221,7 @@ class NativeRelayPlaybackSession:
             or "none"
         )
         return (
-            "transport=direct-ice, signaling=mqtt, relay=disabled, "
+            f"transport=direct-ice, signaling={self._signaling_path}, relay=disabled, "
             f"connected={self._connected}, "
             f"session=({session_status}), "
             f"ice=({ice_status}), control=(records={self._control_records},"
@@ -228,7 +235,7 @@ class NativeRelayPlaybackSession:
         )
 
     async def connect(self, *, media: bool = True) -> None:
-        """Negotiate once through MQTT, then require direct LAN media."""
+        """Negotiate LAN-first, then require direct LAN media."""
         if self._closed or self._moto is not None:
             raise NativeRelayPlaybackError("Playback session cannot be connected")
         loop = asyncio.get_running_loop()
@@ -250,22 +257,8 @@ class NativeRelayPlaybackSession:
             p2p.ice_password,
             p2p.aes_key,
         )
-        self._moto = MotoClient(
-            identity=self._mqtt_identity,
-            uid=self._uid,
-            device_id=config.device_id,
-            session_id=p2p.session_id,
-            local_key=config.local_key,
-            on_answer=self._on_answer,
-            on_candidate=self._on_remote_candidate,
-            on_disconnect=self._on_disconnect,
-            protocol_version=self._native_config.mqtt_protocol_version,
-        )
         try:
-            await self._moto.async_connect()
-            with suppress(TuyaIpcP2pError):
-                await self._moto.async_send_sig_query()
-            await self._moto.async_send_offer(
+            await self._open_signaling(
                 self._offer.sdp,
                 config.ice_servers_as_json(),
                 trace_id,
@@ -326,6 +319,59 @@ class NativeRelayPlaybackSession:
         except BaseException:
             await self.close()
             raise
+
+    async def _open_signaling(
+        self,
+        sdp: str,
+        ice_servers: Any,
+        trace_id: str,
+        tcp_token: Any,
+        log_config: Any,
+    ) -> None:
+        """Use the camera-advertised local policy before MQTT fallback."""
+        if self._native_config.p2p_policy == 1:
+            lan = Lan302Client(
+                uid=self._uid,
+                device_id=self._stream_config.device_id,
+                session_id=self._stream_config.p2p_session.session_id,
+                local_key=self._stream_config.local_key,
+                on_answer=self._on_answer,
+                on_candidate=self._on_remote_candidate,
+                on_disconnect=self._on_disconnect,
+                preconnect=bool(self._native_config.preconnect),
+                security_level=self._native_config.p2p_security_level,
+            )
+            try:
+                await lan.async_connect()
+                await lan.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
+                self._moto = lan  # type: ignore[assignment]
+                self._signaling_path = "lan"
+                return
+            except NativeLanUnavailableError:
+                await lan.async_close()
+            except NativeLanSignalError as err:
+                await lan.async_close()
+                raise NativeRelayPlaybackError(
+                    "Camera did not complete local P2P signaling"
+                ) from err
+        self._moto = MotoClient(
+            identity=self._mqtt_identity,
+            uid=self._uid,
+            device_id=self._stream_config.device_id,
+            session_id=self._stream_config.p2p_session.session_id,
+            local_key=self._stream_config.local_key,
+            on_answer=self._on_answer,
+            on_candidate=self._on_remote_candidate,
+            on_disconnect=self._on_disconnect,
+            protocol_version=self._native_config.mqtt_protocol_version,
+            preconnect=bool(self._native_config.preconnect),
+            security_level=self._native_config.p2p_security_level,
+        )
+        await self._moto.async_connect()
+        with suppress(TuyaIpcP2pError):
+            await self._moto.async_send_sig_query()
+        await self._moto.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
+        self._signaling_path = "mqtt"
 
     async def query_recordings(self, day: date) -> NativeV4CatalogPage:
         """Query one recording day on authenticated conversation zero."""

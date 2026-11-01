@@ -52,6 +52,8 @@ class MotoClient:
         on_candidate: Callable[[str], None],
         on_disconnect: Callable[[int], None],
         protocol_version: str = "2.2",
+        preconnect: bool = False,
+        security_level: int = 3,
     ) -> None:
         """Bind the client to one device, one session and the callbacks that consume it."""
         if protocol_version not in {"2.2", "2.3"}:
@@ -67,6 +69,10 @@ class MotoClient:
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
         self._protocol_version = protocol_version
+        self._preconnect = bool(preconnect)
+        if security_level not in {2, 3, 4}:
+            raise ValueError("Unsupported signaling security level")
+        self._security_level = security_level
         self._publish_topic = f"smart/mb/out/{device_id}"
         self._subscribe_topic = f"smart/mb/in/{device_id}"
         # Match Smart Life's per-device SandO state: a positive origin in
@@ -163,7 +169,7 @@ class MotoClient:
             {
                 "is_pre": 0,
                 "p2p_skill": 1635,
-                "security_level": 3,
+                "security_level": self._security_level,
             }
         )
         await self._async_publish(
@@ -172,7 +178,7 @@ class MotoClient:
                 "header": header,
                 "msg": {
                     "sdp": sdp,
-                    "preconnect": True,
+                    "preconnect": self._preconnect,
                     "token": ice_servers,
                     "tcp_token": tcp_token,
                     "log": log_config,

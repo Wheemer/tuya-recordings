@@ -116,6 +116,110 @@ def test_construction_does_not_open_camera_or_schedule_background_work():
 
 
 @pytest.mark.asyncio
+async def test_signaling_prefers_lan_for_apk_local_policy(monkeypatch):
+    calls = []
+
+    class LocalSignal:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        async def async_connect(self):
+            calls.append(("connect",))
+
+        async def async_send_offer(self, *args):
+            calls.append(("offer", args))
+
+        async def async_close(self):
+            calls.append(("close",))
+
+    class UnexpectedMqtt:
+        def __init__(self, **kwargs):
+            raise AssertionError("MQTT must not be selected when LAN succeeds")
+
+    monkeypatch.setattr(relay_module, "Lan302Client", LocalSignal)
+    monkeypatch.setattr(relay_module, "MotoClient", UnexpectedMqtt)
+    playback = NativeRelayPlaybackSession(
+        replace(camera_config(), p2p_policy=1), APP_SESSION
+    )
+    await playback._open_signaling("sdp", [], "trace", {}, {})
+
+    assert [call[0] for call in calls] == ["init", "connect", "offer"]
+    assert playback._signaling_path == "lan"
+
+
+@pytest.mark.asyncio
+async def test_signaling_uses_mqtt_only_after_lan_is_unavailable(monkeypatch):
+    calls = []
+
+    class UnavailableLan:
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            raise relay_module.NativeLanUnavailableError("not local")
+
+        async def async_close(self):
+            calls.append("lan-close")
+
+    class MqttFallback:
+        def __init__(self, **kwargs):
+            calls.append("mqtt-init")
+
+        async def async_connect(self):
+            calls.append("mqtt-connect")
+
+        async def async_send_sig_query(self):
+            calls.append("mqtt-query")
+
+        async def async_send_offer(self, *args):
+            calls.append("mqtt-offer")
+
+    monkeypatch.setattr(relay_module, "Lan302Client", UnavailableLan)
+    monkeypatch.setattr(relay_module, "MotoClient", MqttFallback)
+    playback = NativeRelayPlaybackSession(
+        replace(camera_config(), p2p_policy=1), APP_SESSION
+    )
+    await playback._open_signaling("sdp", [], "trace", {}, {})
+
+    assert calls == ["lan-close", "mqtt-init", "mqtt-connect", "mqtt-query", "mqtt-offer"]
+    assert playback._signaling_path == "mqtt"
+
+
+@pytest.mark.asyncio
+async def test_signaling_does_not_send_mqtt_offer_after_lan_offer_failure(monkeypatch):
+    calls = []
+
+    class FailingLan:
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            calls.append("lan-connect")
+
+        async def async_send_offer(self, *args):
+            calls.append("lan-offer")
+            raise relay_module.NativeLanSignalError("camera did not answer")
+
+        async def async_close(self):
+            calls.append("lan-close")
+
+    class UnexpectedMqtt:
+        def __init__(self, **kwargs):
+            raise AssertionError("MQTT must not follow a LAN offer failure")
+
+    monkeypatch.setattr(relay_module, "Lan302Client", FailingLan)
+    monkeypatch.setattr(relay_module, "MotoClient", UnexpectedMqtt)
+    playback = NativeRelayPlaybackSession(
+        replace(camera_config(), p2p_policy=1), APP_SESSION
+    )
+
+    with pytest.raises(NativeRelayPlaybackError, match="local P2P"):
+        await playback._open_signaling("sdp", [], "trace", {}, {})
+
+    assert calls == ["lan-connect", "lan-offer", "lan-close"]
+
+
+@pytest.mark.asyncio
 async def test_close_does_not_wait_forever_for_transport_cleanup(monkeypatch):
     class HangingSession:
         async def async_close(self):

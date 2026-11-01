@@ -1,8 +1,17 @@
 # Changelog
 
-## Tuya Recordings v0.4.9 (unreleased)
+## Tuya Recordings v0.4.10 (2026-11-01)
 
 ### Fixes
+
+- Uses the APK's LAN-first P2P signaling path for cameras that advertise
+  local P2P policy, with a bounded local discovery and no signaling retry loop.
+- Keeps MQTT signaling as the fallback only when a camera is not locally
+  reachable; a failed local offer does not trigger a second MQTT offer.
+- Uses each camera's advertised P2P preconnect and security settings instead
+  of fixed MQTT signaling values.
+- Adds test coverage for local signaling selection, fallback boundaries, and
+  TinyTuya's required local transport dependency.
 
 - Uses the camera's ordinary SD-card day catalog as the timeline source, matching
   the Smart Life and Tuya Smart playback implementations.
