@@ -43,11 +43,13 @@ class Lan302Client:
         on_disconnect: Callable[[int], None],
         preconnect: bool,
         security_level: int,
+        moto_id: str = "",
     ) -> None:
         self._uid = uid
         self._device_id = device_id
         self._session_id = session_id
         self._local_key = local_key
+        self._moto_id = moto_id
         self._on_answer = on_answer
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
@@ -122,7 +124,7 @@ class Lan302Client:
             "from": self._uid,
             "to": self._device_id,
             "sessionid": self._session_id,
-            "moto_id": "",
+            "moto_id": self._moto_id,
             "path": "lan",
         }
         if trace_id:

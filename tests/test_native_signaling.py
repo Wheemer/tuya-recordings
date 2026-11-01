@@ -26,6 +26,7 @@ def test_mqtt_offer_preserves_apk_signaling_header():
         on_candidate=lambda _candidate: None,
         on_disconnect=lambda _reason: None,
         protocol_version="2.3",
+        moto_id="camera-moto-id",
     )
 
     async def capture(protocol, data):
@@ -35,7 +36,7 @@ def test_mqtt_offer_preserves_apk_signaling_header():
     asyncio.run(client.async_send_offer("sdp", [], "trace", {}, {}))
 
     header = published[0][1]["header"]
-    assert header["moto_id"] == ""
+    assert header["moto_id"] == "camera-moto-id"
     assert header["security_level"] == 3
     assert published[0][1]["msg"]["preconnect"] is False
 

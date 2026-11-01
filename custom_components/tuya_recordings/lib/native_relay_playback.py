@@ -340,6 +340,7 @@ class NativeRelayPlaybackSession:
                 on_disconnect=self._on_disconnect,
                 preconnect=bool(self._native_config.preconnect),
                 security_level=self._native_config.p2p_security_level,
+                moto_id=self._stream_config.moto_id,
             )
             try:
                 await lan.async_connect()
@@ -366,6 +367,7 @@ class NativeRelayPlaybackSession:
             protocol_version=self._native_config.mqtt_protocol_version,
             preconnect=bool(self._native_config.preconnect),
             security_level=self._native_config.p2p_security_level,
+            moto_id=self._stream_config.moto_id,
         )
         await self._moto.async_connect()
         with suppress(TuyaIpcP2pError):

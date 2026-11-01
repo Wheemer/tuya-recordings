@@ -54,6 +54,7 @@ class MotoClient:
         protocol_version: str = "2.2",
         preconnect: bool = False,
         security_level: int = 3,
+        moto_id: str = "",
     ) -> None:
         """Bind the client to one device, one session and the callbacks that consume it."""
         if protocol_version not in {"2.2", "2.3"}:
@@ -65,6 +66,7 @@ class MotoClient:
         self._device_id = device_id
         self._session_id = session_id
         self._key = local_key.encode()
+        self._moto_id = moto_id
         self._on_answer = on_answer
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
@@ -215,7 +217,7 @@ class MotoClient:
             "from": self._uid,
             "to": self._device_id,
             "sessionid": self._session_id,
-            "moto_id": "",
+            "moto_id": self._moto_id,
             "path": "mqtt",
         }
         if trace_id:
