@@ -1,0 +1,40 @@
+name: Attest release asset
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+jobs:
+  attest:
+    name: Attest HACS release archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Download release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --pattern tuya_recordings.zip --dir dist
+
+      - name: Validate archive layout
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tools.build_release_zip import validate_archive
+
+          validate_archive(Path("dist/tuya_recordings.zip"))
+          PY
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/tuya_recordings.zip
