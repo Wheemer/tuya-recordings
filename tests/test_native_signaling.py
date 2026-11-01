@@ -69,18 +69,18 @@ def test_mqtt_offer_uses_camera_advertised_connection_metadata():
 def test_relay_frames_preserve_apk_signaling_header():
     offer = json.loads(
         relay_offer_frame(
-            "account", "camera", "session", "trace", "sdp", [], {}, {}
+            "account", "camera", "session", "trace", "sdp", [], {}, {}, "camera-moto-id"
         )
     )
     candidate = json.loads(
         relay_candidate_frame(
-            "account", "camera", "session", "trace", "candidate:1"
+            "account", "camera", "session", "trace", "candidate:1", "camera-moto-id"
         )
     )
 
-    assert offer["header"]["moto_id"] == ""
+    assert offer["header"]["moto_id"] == "camera-moto-id"
     assert offer["header"]["security_level"] == 3
-    assert candidate["header"]["moto_id"] == ""
+    assert candidate["header"]["moto_id"] == "camera-moto-id"
 
 
 def test_signaling_tls_validates_the_broker_certificate_chain():
