@@ -94,7 +94,7 @@ def test_finalize_mp4_rejects_silent_recording(monkeypatch, tmp_path):
     assert not temp.exists()
 
 
-def test_finalize_mp4_allows_missing_ffprobe(monkeypatch, tmp_path):
+def test_missing_ffprobe_does_not_mark_invalid_media_ready(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     output = tmp_path / "clip.mp4"
     source.write_bytes(b"source")
@@ -107,6 +107,6 @@ def test_finalize_mp4_allows_missing_ffprobe(monkeypatch, tmp_path):
 
     monkeypatch.setattr("custom_components.tuya_recordings.lib.ffmpeg.subprocess.run", fake_run)
 
-    finalize_mp4_for_browser(source, output)
-
-    assert output.exists()
+    with pytest.raises(RuntimeError, match="Could not inspect"):
+        finalize_mp4_for_browser(source, output)
+    assert not output.exists()

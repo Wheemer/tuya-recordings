@@ -28,6 +28,7 @@ def test_runtime_data_uses_saved_smart_life_keys_and_scrubs_legacy_cloud_secrets
     assert "client_secret" not in saved
     assert "client_id" not in saved
     assert "_localtuya_entries" not in saved
+    assert "version" not in hass.config_entries.async_update_entry.call_args.kwargs
 
 
 def test_runtime_data_preserves_camera_pause_without_media_sync():

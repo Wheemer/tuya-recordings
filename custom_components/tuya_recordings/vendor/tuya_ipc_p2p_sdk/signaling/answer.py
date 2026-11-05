@@ -33,7 +33,12 @@ def parse_answer(sdp: str) -> SdpAnswer:
         elif line.startswith(_PASSWORD_PREFIX):
             ice_password = line.removeprefix(_PASSWORD_PREFIX)
         elif line.startswith(_AES_KEY_PREFIX):
-            aes_key = bytes.fromhex(line.removeprefix(_AES_KEY_PREFIX))
+            try:
+                aes_key = bytes.fromhex(line.removeprefix(_AES_KEY_PREFIX))
+            except ValueError:
+                raise TuyaIpcP2pProtocolError(
+                    "Failed to parse answer: invalid AES key encoding"
+                ) from None
     if not ice_ufrag or not ice_password or len(aes_key) != MEDIA_KEY_SIZE:
         raise TuyaIpcP2pProtocolError(
             f"Failed to parse answer: ufrag={bool(ice_ufrag)} pwd={bool(ice_password)}"

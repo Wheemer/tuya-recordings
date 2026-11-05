@@ -8,7 +8,10 @@ import os
 import struct
 import subprocess
 import threading
+import select
+import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -18,10 +21,54 @@ from .native_frames import (
     NativePlaybackFrameType,
     validate_playback_frame_event,
 )
+from .native_packet_cache import PACKET_HEADER, TimestampedVideoMuxer, TimestampedAacMuxer, mux_camera_packets
 
 
 class NativeMuxError(RuntimeError):
     """Native playback events could not be converted into a media file."""
+
+
+class _StderrTail:
+    """Drain process diagnostics continuously, retaining only a bounded tail."""
+
+    def __init__(self, stream):
+        self.data = bytearray()
+        self.stream = stream
+        self.thread = threading.Thread(target=self._read, name="tuya-mux-stderr", daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while self.stream is not None and (chunk := self.stream.read(4096)):
+                self.data.extend(chunk)
+                del self.data[:-65536]
+        except (OSError, ValueError):
+            return
+
+    def finish(self):
+        self.thread.join(timeout=2)
+        return bytes(self.data)
+
+
+def _write_pipe(handle, data):
+    try:
+        fd = handle.fileno()
+    except (AttributeError, OSError, ValueError):
+        handle.write(data)
+        return
+    os.set_blocking(fd, False)
+    pending = memoryview(data)
+    deadline = time.monotonic() + 5
+    while pending:
+        if time.monotonic() >= deadline:
+            raise NativeMuxError("ffmpeg input pipe stopped accepting data")
+        if not select.select([], [fd], [], 0.1)[1]:
+            continue
+        try:
+            written = os.write(fd, pending[:65536])
+        except BlockingIOError:
+            continue
+        pending = pending[written:]
 
 
 # A segment header is emitted before each independently seekable browser
@@ -33,6 +80,8 @@ BROWSER_STREAM_AUDIO_PCM_S16LE = 2
 BROWSER_STREAM_END = 3
 BROWSER_STREAM_AUDIO_G711U = 4
 BROWSER_STREAM_AUDIO_FORMAT = 5
+BROWSER_STREAM_AUDIO_G711A = 6
+BROWSER_STREAM_AUDIO_AAC_MP4 = 7
 _BROWSER_STREAM_HEADER = struct.Struct(">BQI")
 _BROWSER_STREAM_SEGMENT = struct.Struct(">IQ")
 _BROWSER_STREAM_AUDIO_FORMAT = struct.Struct(">IB")
@@ -62,11 +111,13 @@ class NativePlaybackMuxer:
 
     output_path: Path
     require_audio: bool = True
-    process_module: Any = subprocess
     protocol: int = NATIVE_PLAYBACK_EVENT_VERSION
     _video_path: Path = field(init=False, repr=False)
     _audio_path: Path = field(init=False, repr=False)
     _temp_path: Path = field(init=False, repr=False)
+    _packet_path: Path = field(init=False, repr=False)
+    _audio_format: tuple[str, int, int] = field(default=("", 0, 0), init=False, repr=False)
+    _origin: Fraction | None = field(default=None, init=False, repr=False)
     _video_bytes: int = field(default=0, init=False, repr=False)
     _audio_bytes: int = field(default=0, init=False, repr=False)
     _started: bool = field(default=False, init=False, repr=False)
@@ -79,8 +130,11 @@ class NativePlaybackMuxer:
         self._video_path = self.output_path.with_suffix(".video.h264")
         self._audio_path = self.output_path.with_suffix(".audio.aac")
         self._temp_path = self.output_path.with_suffix(".mux.tmp.mp4")
+        self._packet_path = self.output_path.with_suffix(".packets.tmp")
         self._video_bytes = 0
         self._audio_bytes = 0
+        self._audio_format = ("", 0, 0)
+        self._origin = None
         self._started = False
         self._finished = False
 
@@ -110,6 +164,8 @@ class NativePlaybackMuxer:
         self._finished = False
         self._video_bytes = 0
         self._audio_bytes = 0
+        self._audio_format = ("", 0, 0)
+        self._origin = None
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event = validate_playback_frame_event(event, protocol=self.protocol)
@@ -140,13 +196,21 @@ class NativePlaybackMuxer:
             raise NativeMuxError("Native playback emitted no video packets")
         if self.require_audio and self._audio_bytes <= 0:
             raise NativeMuxError("Native playback emitted no audio packets")
-        self._run_ffmpeg()
+        assert self._origin is not None
+        codec, rate, channels = self._audio_format
+        try:
+            mux_camera_packets(self._video_path, self._audio_path, self._packet_path,
+                self._temp_path, audio_codec=codec, sample_rate=rate, channels=channels,
+                origin=self._origin)
+        except Exception as err:
+            raise NativeMuxError(f"Native packet remux failed: {err}") from err
+        self._temp_path.replace(self.output_path)
         if not self.output_path.exists() or self.output_path.stat().st_size <= 0:
             raise NativeMuxError("Native mux did not create a playable media file")
         self._cleanup_intermediates()
 
     def cleanup(self) -> None:
-        for path in (self._video_path, self._audio_path, self._temp_path, self.output_path):
+        for path in (self._video_path, self._audio_path, self._packet_path, self._temp_path, self.output_path):
             path.unlink(missing_ok=True)
 
     def _write_media_codec_packet(self, data: bytes, info: dict[str, Any]) -> None:
@@ -154,67 +218,40 @@ class NativePlaybackMuxer:
         if codec in {"h264", "avc"}:
             _append_bytes(self._video_path, data)
             self._video_bytes += len(data)
+            self._record_packet(1, data, info)
             return
-        if codec in {"aac", "mpeg4-generic"}:
-            data = _aac_with_adts(data, info)
+        if codec in {"aac", "mpeg4-generic", "pcm_s16le", "g711u", "g711a"}:
+            if codec in {"aac", "mpeg4-generic"}:
+                codec = "aac"
+                data = _aac_with_adts(data, info)
+            rate, channels = info.get("sampleRate"), info.get("channels")
+            if type(rate) is not int or not 0 < rate <= 192000 or channels not in {1, 2}:
+                raise NativeMuxError("Native cached audio requires valid sampleRate and channels")
+            audio_format = (codec, rate, channels)
+            if self._audio_format[0] and self._audio_format != audio_format:
+                raise NativeMuxError("Camera changed audio format during cached recording")
+            self._audio_format = audio_format
             _append_bytes(self._audio_path, data)
             self._audio_bytes += len(data)
+            self._record_packet(2, data, info)
             return
         raise NativeMuxError(f"Unsupported native raw packet codec: {codec or 'unknown'}")
 
-    def _run_ffmpeg(self) -> None:
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-fflags",
-            "+genpts",
-            "-f",
-            "h264",
-            "-i",
-            str(self._video_path),
-        ]
-        if self._audio_bytes > 0:
-            command.extend(["-f", "aac", "-i", str(self._audio_path)])
-        command.extend([
-            "-map",
-            "0:v:0",
-        ])
-        if self._audio_bytes > 0:
-            command.extend(["-map", "1:a:0"])
-        command.extend(["-c", "copy"])
-        if self._audio_bytes > 0:
-            command.extend(["-bsf:a", "aac_adtstoasc"])
-        command.extend(
-            [
-                "-movflags",
-                "+faststart",
-                "-y",
-                str(self._temp_path),
-            ]
-        )
-        result = self.process_module.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0:
-            self._temp_path.unlink(missing_ok=True)
-            raise NativeMuxError(
-                "ffmpeg failed to mux native Tuya recording: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-        if not self._temp_path.exists() or self._temp_path.stat().st_size <= 0:
-            raise NativeMuxError("ffmpeg did not create a native Tuya recording")
-        self._temp_path.replace(self.output_path)
+    def _record_packet(self, kind: int, data: bytes, info: dict[str, Any]) -> None:
+        timestamp, scale = info.get("timestamp"), info.get("timestampScale", 1000)
+        if type(timestamp) is not int or not 0 <= timestamp < 1 << 64 or type(scale) is not int or not 0 < scale <= 1_000_000:
+            raise NativeMuxError("Native cached packet has invalid camera timing")
+        if not data:
+            raise NativeMuxError("Native cached packet is empty")
+        stamp = Fraction(timestamp, scale)
+        self._origin = stamp if self._origin is None else min(self._origin, stamp)
+        _append_bytes(self._packet_path, PACKET_HEADER.pack(kind, int(bool(info.get("isKeyFrame"))), timestamp, scale, len(data)) + data)
 
     def _cleanup_intermediates(self) -> None:
         self._video_path.unlink(missing_ok=True)
         self._audio_path.unlink(missing_ok=True)
         self._temp_path.unlink(missing_ok=True)
+        self._packet_path.unlink(missing_ok=True)
 
 
 def _decode_payload(payload: dict[str, Any]) -> bytes:
@@ -228,12 +265,14 @@ def _codec_name(info: dict[str, Any]) -> str:
     codec = info.get("codecName") or info.get("codec") or info.get("codecId")
     if isinstance(codec, str):
         return codec.lower()
-    if codec in {1, 2, 27, 28}:
+    if codec in {1, 27}:
         return "h264"
-    if codec in {4, 86018, 86019, 10}:
+    if codec in {4, 86018}:
         return "aac"
     if codec == 133:
         return "g711u"
+    if codec == 132:
+        return "g711a"
     if codec == 0xFFFE:
         return "pcm_s16le"
     return ""
@@ -322,6 +361,7 @@ class NativePlaybackFmp4StreamMuxer:
     _started: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
     _reader_error: BaseException | None = field(default=None, init=False, repr=False)
+    _stderr: Any = field(default=None, init=False, repr=False)
 
     def __enter__(self) -> Self:
         self.open()
@@ -401,6 +441,7 @@ class NativePlaybackFmp4StreamMuxer:
             self.cleanup()
             raise
         self._reader = threading.Thread(target=self._read_stdout, name="tuya-recordings-fmp4", daemon=True)
+        self._stderr = _StderrTail(self._proc.stderr)
         self._reader.start()
         self._video_bytes = 0
         self._audio_bytes = 0
@@ -461,7 +502,7 @@ class NativePlaybackFmp4StreamMuxer:
             self._reader.join(timeout=5)
         if self._reader_error is not None:
             raise NativeMuxError(f"Native stream mux reader failed: {type(self._reader_error).__name__}")
-        stderr = proc.stderr.read() if proc.stderr is not None else b""
+        stderr = self._stderr.finish() if self._stderr is not None else b""
         if proc.returncode != 0:
             raise NativeMuxError(
                 "ffmpeg failed to stream native Tuya recording: "
@@ -486,13 +527,16 @@ class NativePlaybackFmp4StreamMuxer:
         if self._reader is not None:
             self._reader.join(timeout=1)
             self._reader = None
+        if self._stderr is not None:
+            self._stderr.finish()
+            self._stderr = None
 
     def _write_video(self, data: bytes) -> None:
         if not data:
             return
         if self._video_handle is None:
             raise NativeMuxError("Native stream video pipe is not open")
-        self._video_handle.write(data)
+        _write_pipe(self._video_handle, data)
         self._video_bytes += len(data)
 
     def _write_audio(self, data: bytes) -> None:
@@ -500,7 +544,7 @@ class NativePlaybackFmp4StreamMuxer:
             return
         if self._audio_handle is None:
             raise NativeMuxError("Native stream audio pipe is not open")
-        self._audio_handle.write(data)
+        _write_pipe(self._audio_handle, data)
         self._audio_bytes += len(data)
 
     def _read_stdout(self) -> None:
@@ -533,7 +577,7 @@ class NativePlaybackFmp4StreamMuxer:
 
 @dataclass(slots=True)
 class NativePlaybackBrowserStreamMuxer:
-    """Stream copied H.264 plus browser-decodable PCM or G.711 audio."""
+    """Stream copied H264/AAC or browser-decodable PCM/G711 audio."""
 
     chunk_callback: Any
     process_module: Any = subprocess
@@ -547,10 +591,16 @@ class NativePlaybackBrowserStreamMuxer:
     _audio_bytes: int = field(default=0, init=False, repr=False)
     _output_bytes: int = field(default=0, init=False, repr=False)
     _reader_error: BaseException | None = field(default=None, init=False, repr=False)
+    _stderr: Any = field(default=None, init=False, repr=False)
     _first_video_timestamp: int = field(default=0, init=False, repr=False)
-    _audio_format: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _audio_format: tuple[int, int, int] | None = field(default=None, init=False, repr=False)
     _announced: bool = field(default=False, init=False, repr=False)
     _h264_parameter_sets: bytes = field(default=b"", init=False, repr=False)
+    _packet_video: Any = field(default=None, init=False, repr=False)
+    _video_info: dict = field(default_factory=dict, init=False, repr=False)
+    _packet_audio: Any = field(default=None, init=False, repr=False)
+    _audio_codec: str = field(default="", init=False, repr=False)
+    _first_audio_timestamp: int = field(default=0, init=False, repr=False)
 
     def __enter__(self) -> Self:
         self.open()
@@ -574,9 +624,18 @@ class NativePlaybackBrowserStreamMuxer:
     def open(self) -> None:
         if not callable(self.chunk_callback):
             raise NativeMuxError("Native browser stream requires a chunk callback")
+        self.cleanup()
+        self._video_bytes = self._audio_bytes = self._output_bytes = 0
+        self._first_video_timestamp = 0
+        self._audio_format = None
+        self._announced = False
+        self._h264_parameter_sets = b""
+        self._audio_codec = ""
+
+    def _open_legacy_video(self) -> None:
+        """Serve callback fixtures/older adapters without a declared clock."""
         if not callable(self.pipe_factory):
             raise NativeMuxError("Native browser stream requires POSIX pipes")
-        self.cleanup()
         video_read, video_write = self.pipe_factory()
         try:
             self._proc = self.process_module.Popen(
@@ -623,19 +682,13 @@ class NativePlaybackBrowserStreamMuxer:
                         os.close(fd)
             self.cleanup()
             raise
-        self._video_bytes = 0
-        self._audio_bytes = 0
-        self._output_bytes = 0
         self._reader_error = None
-        self._first_video_timestamp = 0
-        self._audio_format = None
-        self._announced = False
-        self._h264_parameter_sets = b""
         self._reader = threading.Thread(
             target=self._read_stdout,
             name="tuya-recordings-browser-stream",
             daemon=True,
         )
+        self._stderr = _StderrTail(self._proc.stderr)
         self._reader.start()
 
     def handle_event(self, event: dict[str, Any]) -> None:
@@ -674,7 +727,25 @@ class NativePlaybackBrowserStreamMuxer:
                 self._first_video_timestamp = int(info.get("timestamp") or 0)
                 if not parameter_sets:
                     data = self._h264_parameter_sets + data
+            self._video_info = info
             self._write_video(data)
+            return
+        if self._audio_codec and self._audio_codec != codec:
+            raise NativeMuxError("Camera changed audio codec during playback")
+        self._audio_codec = codec
+        if codec in {"aac", "mpeg4-generic"}:
+            self._emit_audio_format(info)
+            data = _aac_with_adts(data, info)
+            scale = info.get("timestampScale")
+            if type(scale) is not int or not 0 < scale <= 1_000_000:
+                raise NativeMuxError("Native AAC timestamp scale is invalid")
+            if self._packet_audio is None:
+                self._first_audio_timestamp = int(info.get("timestamp") or 0)
+                self._packet_audio = TimestampedAacMuxer(
+                    data, lambda chunk: self._emit_record(BROWSER_STREAM_AUDIO_AAC_MP4, self._first_audio_timestamp, chunk)
+                )
+            self._packet_audio.push(data, int(info.get("timestamp") or 0), scale)
+            self._audio_bytes += len(data)
             return
         if codec == "pcm_s16le":
             self._emit_audio_format(info)
@@ -685,11 +756,11 @@ class NativePlaybackBrowserStreamMuxer:
                 data,
             )
             return
-        if codec in {"g711u", "pcmu"}:
+        if codec in {"g711u", "pcmu", "g711a", "pcma"}:
             self._emit_audio_format(info)
             self._audio_bytes += len(data)
             self._emit_record(
-                BROWSER_STREAM_AUDIO_G711U,
+                BROWSER_STREAM_AUDIO_G711A if codec in {"g711a", "pcma"} else BROWSER_STREAM_AUDIO_G711U,
                 int(info.get("timestamp") or 0),
                 data,
             )
@@ -703,6 +774,16 @@ class NativePlaybackBrowserStreamMuxer:
             raise NativeMuxError("Native playback emitted no video packets")
         if self._audio_bytes <= 0:
             raise NativeMuxError("Native playback emitted no audio packets")
+        if self._packet_audio is not None:
+            self._packet_audio.close()
+            self._packet_audio = None
+        if self._packet_video is not None:
+            self._packet_video.close()
+            self._packet_video = None
+            if not self._output_bytes:
+                raise NativeMuxError("Native packet remux emitted no video")
+            self._emit_record(BROWSER_STREAM_END, 0, b"")
+            return
         self._close_video()
         proc = self._proc
         if proc is None:
@@ -724,7 +805,7 @@ class NativePlaybackBrowserStreamMuxer:
             raise NativeMuxError(
                 f"Native browser stream reader failed: {type(self._reader_error).__name__}"
             )
-        stderr = proc.stderr.read() if proc.stderr is not None else b""
+        stderr = self._stderr.finish() if self._stderr is not None else b""
         if proc.returncode != 0:
             raise NativeMuxError(
                 "ffmpeg failed to remux native browser video: "
@@ -736,6 +817,12 @@ class NativePlaybackBrowserStreamMuxer:
         self.cleanup()
 
     def cleanup(self) -> None:
+        if self._packet_audio is not None:
+            self._packet_audio.close(flush=False)
+            self._packet_audio = None
+        if self._packet_video is not None:
+            self._packet_video.close(flush=False)
+            self._packet_video = None
         self._close_video()
         proc = self._proc
         self._proc = None
@@ -750,14 +837,35 @@ class NativePlaybackBrowserStreamMuxer:
         if self._reader is not None:
             self._reader.join(timeout=1)
             self._reader = None
+        if self._stderr is not None:
+            self._stderr.finish()
+            self._stderr = None
 
     def _write_video(self, data: bytes) -> None:
         if not data:
             return
+        scale = self._video_info.get("timestampScale")
+        if scale is not None or self._packet_video is not None:
+            if self._proc is not None:
+                raise NativeMuxError("Camera changed video clock contract during playback")
+            if type(scale) is not int or not 0 < scale <= 1_000_000:
+                raise NativeMuxError("Native video timestamp scale is invalid")
+            if self._packet_video is None:
+                self._packet_video = TimestampedVideoMuxer(data, self._emit_video_chunk)
+            self._packet_video.push(data, int(self._video_info.get("timestamp") or 0), scale,
+                                    self._video_info.get("isKeyFrame", False))
+            self._video_bytes += len(data)
+            return
+        if self._proc is None:
+            self._open_legacy_video()
         if self._video_handle is None:
             raise NativeMuxError("Native browser video pipe is not open")
-        self._video_handle.write(data)
+        _write_pipe(self._video_handle, data)
         self._video_bytes += len(data)
+
+    def _emit_video_chunk(self, chunk):
+        self._output_bytes += len(chunk)
+        self._emit_record(BROWSER_STREAM_VIDEO, self._first_video_timestamp, chunk)
 
     def _read_stdout(self) -> None:
         proc = self._proc
@@ -788,14 +896,20 @@ class NativePlaybackBrowserStreamMuxer:
         channels = int(info.get("channels") or 0)
         if not 1 <= sample_rate <= 192000 or not 1 <= channels <= 8:
             raise NativeMuxError("Native browser audio format is invalid")
-        audio_format = (sample_rate, channels)
+        scale = int(info.get("timestampScale") or 0)
+        if not 0 <= scale <= 1_000_000:
+            raise NativeMuxError("Native browser timestamp scale is invalid")
+        audio_format = (sample_rate, channels, scale)
         if audio_format == self._audio_format:
             return
+        if self._audio_format is not None:
+            raise NativeMuxError("Camera changed audio format during playback")
         self._audio_format = audio_format
         self._emit_record(
             BROWSER_STREAM_AUDIO_FORMAT,
             0,
-            _BROWSER_STREAM_AUDIO_FORMAT.pack(sample_rate, channels),
+            _BROWSER_STREAM_AUDIO_FORMAT.pack(sample_rate, channels)
+            + (struct.pack(">I", scale) if scale else b""),
         )
 
     def _close_video(self) -> None:

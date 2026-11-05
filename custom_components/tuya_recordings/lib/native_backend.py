@@ -27,6 +27,7 @@ from .native_playback import (
     native_playback_request,
 )
 from .native_provider import NativeCameraConfigAuthError
+from .native_gateway import NativeGatewayAuthError
 from .native_session import (
     NativeCameraSessionConfig,
     NativePlaybackRequest,
@@ -56,6 +57,9 @@ class RecordingBackend(Protocol):
     name: str
     apk_native: bool
     clip_playback_available: bool
+
+    def recording_days_for_month(self, dev_id: str, month: date, *, cancel_event=None) -> list[date]:
+        """Return camera-advertised recorded days, without retrieving media."""
 
     def recordings_for_day(
         self,
@@ -168,6 +172,9 @@ class NativeBackendNotConfigured:
     apk_native = True
     clip_playback_available = False
 
+    def recording_days_for_month(self, *args: Any, **kwargs: Any) -> list[date]:
+        raise RecordingBackendUnavailable(self.reason)
+
     def recordings_for_day(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         raise RecordingBackendUnavailable(self.reason)
 
@@ -236,6 +243,13 @@ class ApkNativeRecordingBackend:
         """Release reusable native camera workers owned by this backend."""
         if self._provider.close is not None:
             self._provider.close()
+            CAMERA_COMMANDS.clear_quarantine(self)
+
+    def recording_days_for_month(self, dev_id: str, month: date, *, cancel_event=None) -> list[date]:
+        """Use the same metadata-session ownership as daily catalog reads."""
+        with self._open_session(dev_id, cancel_event) as session:
+            query = self._call_required(session, "recording_days_for_month", "getRecordDaysByMonth")
+            return query(month)
 
     def event_catalog_available(self, dev_id: str) -> bool:
         """Return whether the camera advertises Smart Life's event timeline."""
@@ -500,6 +514,8 @@ class ApkNativeRecordingBackend:
             except Exception as err:
                 if queued_cancel.is_set():
                     raise CameraWorkCancelled("Camera operation cancelled") from err
+                if isinstance(err, NativeGatewayAuthError):
+                    raise RecordingBackendAuthError("Tuya app-session authorization expired") from err
                 raise
             finally:
                 target = entered if entered is not None else session
@@ -510,8 +526,11 @@ class ApkNativeRecordingBackend:
                         target.close()
                     elif hasattr(target, "disconnect"):
                         target.disconnect()
-                except Exception:
-                    pass
+                except Exception as err:
+                    CAMERA_COMMANDS.quarantine(self)
+                    raise RecordingBackendUnavailable(
+                        "Native camera transport cleanup did not complete"
+                    ) from err
 
     @staticmethod
     def _call_required(session: Any, name: str, operation: str) -> Callable[..., Any]:

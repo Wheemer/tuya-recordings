@@ -120,14 +120,17 @@ def encode_payload(
     return encode_frame(sequence, source, aes_ecb_encrypt(key, plain))
 
 
-def decode_payload(key: bytes, payload: bytes) -> JsonObject:
-    """Return the ``data`` object of one inbound signaling payload."""
+def decode_payload(key: bytes, payload: bytes) -> tuple[int, JsonObject]:
+    """Return the protocol and data of one inbound MQTT payload."""
     if payload[:3] == _VERSION_2_3:
         plain = _decode_payload_2_3(key, payload)
     else:
         plain = aes_ecb_decrypt(key, decode_frame(payload).body)
     decoded = parse_json_object(plain)
+    protocol = decoded.get("protocol")
+    if type(protocol) is not int:
+        raise TuyaIpcP2pProtocolError("Failed to decode payload: no protocol number")
     data = decoded.get("data")
     if not isinstance(data, dict):
         raise TuyaIpcP2pProtocolError("Failed to decode payload: no data object")
-    return data
+    return protocol, data

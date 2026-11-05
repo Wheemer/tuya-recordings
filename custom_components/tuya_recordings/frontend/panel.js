@@ -4,9 +4,12 @@ class TuyaRecordingsPanel extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this.data = null;
     this.selectedCamera = "";
+    this.selectedAccount = "";
     this.selectedDate = "";
     this.selectedClip = null;
     this.loading = false;
+    this.dataLoadRevision = 0;
+    this.pendingDataLoad = false;
     this.error = "";
     this.signedPaths = new Map();
     this.playbackRevision = 0;
@@ -117,20 +120,33 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   async loadData({ quiet = false } = {}) {
-    if (!this._hass || this.loading) return;
+    if (!this._hass) return;
     if (quiet && this.selectedClip) return;
+    if (this.loading) {
+      if (!quiet) {
+        this.dataLoadRevision += 1;
+        this.pendingDataLoad = true;
+      }
+      return;
+    }
+    const revision = ++this.dataLoadRevision;
     if (!quiet) this.stopPlayback();
     this.loading = true;
     this.error = "";
     if (!quiet) this.render();
     try {
       const params = new URLSearchParams();
+      if (this.selectedAccount) params.set("entry_id", this.selectedAccount);
       if (this.selectedCamera) params.set("camera", this.selectedCamera);
       if (this.selectedDate) params.set("date", this.selectedDate);
+      if (this.calendarOpen && this.calendarMonth) params.set("month", this.calendarMonth);
       let data = this.withReadyThumbnails(
         await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
       );
+      if (revision !== this.dataLoadRevision) return;
       this.data = data;
+      this.selectedAccount = data.entry_id || this.selectedAccount;
+      if (this.selectedAccount) params.set("entry_id", this.selectedAccount);
       const cameras = data.cameras || [];
       if (!this.selectedCamera || !cameras.some((camera) => camera.dev_id === this.selectedCamera)) {
         this.selectedCamera = cameras[0]?.dev_id || "";
@@ -143,6 +159,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           data = this.withReadyThumbnails(
             await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
           );
+          if (revision !== this.dataLoadRevision) return;
           this.data = data;
         }
       }
@@ -156,9 +173,14 @@ class TuyaRecordingsPanel extends HTMLElement {
         await this.signClip(this.selectedClip);
       }
     } catch (err) {
-      this.error = err?.message || String(err);
+      if (revision === this.dataLoadRevision) this.error = err?.message || String(err);
     } finally {
       this.loading = false;
+      if (this.pendingDataLoad) {
+        this.pendingDataLoad = false;
+        void this.loadData();
+        return;
+      }
       this.render();
       this.scheduleCatalogRefresh();
     }
@@ -192,15 +214,19 @@ class TuyaRecordingsPanel extends HTMLElement {
       return;
     }
     this.pendingTimelineRender = false;
-    this.disposePlayer?.();
-    this.disposePlayer = null;
+    const retainedPlayer = this.selectedClip && this.playerRevision === this.playbackRevision
+      ? this.shadowRoot.querySelector(".camera-player") : null;
+    if (!retainedPlayer) {
+      this.disposePlayer?.();
+      this.disposePlayer = null;
+    }
     this.timeline?.destroy?.();
     this.timeline = null;
     const cameras = this.data?.cameras || [];
     const camera = this.camera;
     const clips = this.clips;
     const clipCount = this.timelineMode ? this.recordingRanges.length : clips.length;
-    this.shadowRoot.innerHTML = `
+    const markup = `
       <link rel="stylesheet" href="/tuya_recordings_static/vendor/plyr/plyr.css">
       <style>
         .camera-player { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #000; contain: layout paint; --plyr-color-main: #e85b24; --plyr-control-icon-size: 20px; --plyr-control-spacing: 8px; --plyr-control-radius: 4px; --plyr-video-control-background-hover: #c54816; }
@@ -606,6 +632,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           ${this.renderPauseToggle()}
         </div>
         ${this.renderStats(this.data?.stats)}<div class="toolbar">
+          ${(this.data?.accounts?.length || 0) > 1 ? `<label>Account<select id="account">${this.data.accounts.map(account => `<option value="${this.escape(account.entry_id)}" ${account.entry_id === this.selectedAccount ? "selected" : ""}>${this.escape(account.name)}</option>`).join("")}</select></label>` : ""}
           <label>
             Camera
             <select id="camera" ${cameras.length === 0 || this.loading ? "disabled" : ""}>
@@ -631,8 +658,39 @@ class TuyaRecordingsPanel extends HTMLElement {
         ${!this.error ? this.renderBody(clips) : ""}
       </div>
     `;
+    if (retainedPlayer) {
+      const template = document.createElement("template");
+      template.innerHTML = markup;
+      this.replaceAroundPlayer(this.shadowRoot, template.content, retainedPlayer);
+    } else {
+      this.shadowRoot.innerHTML = markup;
+    }
     this.bindEvents();
     this.afterRender();
+  }
+
+  replaceAroundPlayer(current, fresh, player) {
+    const branch = [...current.children].find(node => node === player || node.contains(player));
+    const nextBranch = [...fresh.children].find(node => node.matches?.(".camera-player") || node.querySelector?.(".camera-player"));
+    if (!branch || !nextBranch) {
+      this.disposePlayer?.();
+      this.disposePlayer = null;
+      current.replaceChildren(...fresh.childNodes);
+      return;
+    }
+    // Keep the player and all its ancestors connected. Detaching and restoring
+    // the same video node can still pause it in a browser/WebView.
+    for (const node of [...current.childNodes]) if (node !== branch) node.remove();
+    let before = true;
+    for (const node of [...fresh.childNodes]) {
+      if (node === nextBranch) { before = false; continue; }
+      if (before) current.insertBefore(node, branch);
+      else current.append(node);
+    }
+    if (branch === player) return;
+    for (const attribute of [...branch.attributes]) branch.removeAttribute(attribute.name);
+    for (const attribute of nextBranch.attributes) branch.setAttribute(attribute.name, attribute.value);
+    this.replaceAroundPlayer(branch, nextBranch, player);
   }
 
   renderCalendar(camera) {
@@ -692,6 +750,17 @@ class TuyaRecordingsPanel extends HTMLElement {
     `;
   }
 
+  timelineDayBounds() {
+    const local = new Date(`${this.selectedDate}T00:00:00`);
+    const next = new Date(local);
+    next.setDate(next.getDate() + 1);
+    const fromServer = this.data?.selected_date === this.selectedDate
+      && Number.isFinite(this.data?.day_start) && this.data.day_end > this.data.day_start;
+    const start = fromServer ? this.data.day_start : local.getTime() / 1000;
+    const end = fromServer ? this.data.day_end : next.getTime() / 1000;
+    return { start, end, duration: end - start };
+  }
+
   renderTimelineBody(ranges) {
     const selected = this.selectedClip
       && this.selectedClip.dev_id === this.selectedCamera
@@ -699,7 +768,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       ? this.selectedClip
       : null;
     const preview = selected || ranges[ranges.length - 1] || null;
-    const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
+    const { start: dayStart, duration: dayDuration } = this.timelineDayBounds();
     const selectedTime = this.timelineInitialTime(ranges, dayStart);
     const player = selected?.signed_playback_url
       ? this.renderPlayer(selected, "timeline-video")
@@ -714,7 +783,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       <div class="timeline-shell">
         <div class="timeline-heading"><strong>${this.escape(this.formatDisplayDate(this.selectedDate))}</strong><span id="timeline-clock">${this.escape(this.formatTime(selectedTime))}</span></div>
         <div class="time-ruler-wrap">
-          <div id="recording-timeline" class="time-ruler" role="slider" tabindex="0" aria-label="Recording timeline" aria-valuemin="0" aria-valuemax="86400">
+          <div id="recording-timeline" class="time-ruler" role="slider" tabindex="0" aria-label="Recording timeline" aria-valuemin="0" aria-valuemax="${dayDuration}">
             <div class="time-ruler-content">
               ${this.renderTimelineHours()}
               <div class="recording-lane">${this.renderRecordingSegments(ranges)}${this.renderAIDetectionMarkers(this.camera?.ai_detections || [])}</div>
@@ -736,7 +805,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       && anchor.date === this.selectedDate
       && Number.isFinite(anchor.time)
     ) {
-      return Math.max(dayStart, Math.min(dayStart + 86399, anchor.time));
+      return Math.max(dayStart, Math.min(this.timelineDayBounds().end - 1, anchor.time));
     }
     const selected = this.selectedClip
       && this.selectedClip.dev_id === this.selectedCamera
@@ -751,43 +820,43 @@ class TuyaRecordingsPanel extends HTMLElement {
     if (this.selectedDate !== this.localDateString(new Date())) {
       return latest?.start || dayStart + 43200;
     }
-    const now = Math.min(Date.now() / 1000, dayStart + 86399);
+    const now = Math.min(Date.now() / 1000, this.timelineDayBounds().end - 1);
     // Keep a current day parked at "now", but do not hide every segment when
     // the camera's latest catalog response is hours behind the clock.
     return latest && now - latest.end > 15 * 60 ? latest.start : now;
   }
 
   renderTimelineHours() {
-    return Array.from({ length: 25 }, (_, hour) => {
+    const { start, duration } = this.timelineDayBounds();
+    return Array.from({ length: Math.floor(duration / 3600) + 1 }, (_, hour) => {
       const label = new Intl.DateTimeFormat(this._hass?.locale?.language || undefined, {
         hour: "numeric",
         hour12: this._hass?.locale?.time_format !== "24",
-      }).format(new Date(2000, 0, 1, hour === 24 ? 0 : hour));
-      return `<span class="timeline-hour" style="left:${(hour / 24) * 100}%">${this.escape(label)}</span>`;
+        timeZone: this.data?.time_zone || undefined,
+      }).format(new Date((start + hour * 3600) * 1000));
+      return `<span class="timeline-hour" style="left:${(hour * 3600 / duration) * 100}%">${this.escape(label)}</span>`;
     }).join("");
   }
 
   renderRecordingSegments(ranges) {
-    const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
-    const dayEnd = dayStart + 86400;
+    const { start: dayStart, end: dayEnd, duration } = this.timelineDayBounds();
     return ranges.map((range) => {
       const start = Math.max(dayStart, Number(range.start));
       const end = Math.min(dayEnd, Number(range.end));
-      const left = ((start - dayStart) / 86400) * 100;
-      const width = Math.max(0.14, ((end - start) / 86400) * 100);
+      const left = ((start - dayStart) / duration) * 100;
+      const width = Math.max(0.14, ((end - start) / duration) * 100);
       return `<button class="recording-segment" type="button" data-start="${range.start}" data-end="${range.end}" style="left:${left}%;width:${width}%" aria-label="Play recording at ${this.escape(this.formatTime(range.start))}"></button>`;
     }).join("");
   }
 
   renderAIDetectionMarkers(detections) {
-    const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
-    const dayEnd = dayStart + 86400;
+    const { start: dayStart, end: dayEnd, duration } = this.timelineDayBounds();
     return detections.map((detection) => {
       const detectedAt = Number(detection?.start);
       const detectedEnd = Number(detection?.end);
       if (!Number.isFinite(detectedAt) || !Number.isFinite(detectedEnd) || detectedEnd <= detectedAt || detectedAt < dayStart || detectedAt >= dayEnd) return "";
-      const left = ((detectedAt - dayStart) / 86400) * 100;
-      const width = Math.max(0.14, ((Math.min(detectedEnd, dayEnd) - detectedAt) / 86400) * 100);
+      const left = ((detectedAt - dayStart) / duration) * 100;
+      const width = Math.max(0.14, ((Math.min(detectedEnd, dayEnd) - detectedAt) / duration) * 100);
       const code = typeof detection?.ai_code === "string" ? detection.ai_code : "AI";
       const label = this.escape(`${code} detected at ${this.formatTime(detectedAt)}`);
       return `<span class="person-detection-marker" style="left:${left}%;width:${width}%" title="${label}" aria-label="${label}"></span>`;
@@ -855,6 +924,14 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   bindEvents() {
+    this.shadowRoot.getElementById("account")?.addEventListener("change", event => {
+      this.stopPlayback();
+      this.selectedClip = null;
+      this.selectedCamera = "";
+      this.selectedDate = "";
+      this.selectedAccount = event.target.value;
+      this.loadData();
+    });
     this.shadowRoot.getElementById("camera")?.addEventListener("change", async (event) => {
       this.stopPlayback();
       this.selectedCamera = event.target.value;
@@ -874,6 +951,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           this.calendarMonth = this.selectedDate.slice(0, 7);
         }
         this.render();
+        if (this.calendarOpen) void this.loadData({quiet: true});
       });
       this.shadowRoot.getElementById("calendar-previous")?.addEventListener("click", () => this.shiftCalendarMonth(-1));
       this.shadowRoot.getElementById("calendar-next")?.addEventListener("click", () => this.shiftCalendarMonth(1));
@@ -910,6 +988,9 @@ class TuyaRecordingsPanel extends HTMLElement {
       if (range) await this.openTimelineRange(range, time);
     });
     this.shadowRoot.querySelectorAll(".clip").forEach((button) => {
+      this.boundClipButtons ||= new WeakSet();
+      if (this.boundClipButtons.has(button)) return;
+      this.boundClipButtons.add(button);
       const open = async (event) => {
         if (event?.target?.closest?.("video, .camera-player")) return;
         const start = Number(button.dataset.start);
@@ -932,6 +1013,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     void this.setupTimeline();
     const video = this.shadowRoot.querySelector(".camera-player video");
     if (!video) return;
+    if (this.playerVideo === video && this.disposePlayer) return;
     const revision = this.playbackRevision;
     try {
       this.debugPlayback("player-import", this.selectedClip);
@@ -949,6 +1031,8 @@ class TuyaRecordingsPanel extends HTMLElement {
         onPosition: epoch => this.updateTimelinePlayhead(epoch),
         debug: detail => this.debugPlayback("playback", this.selectedClip, detail),
       });
+      this.playerVideo = video;
+      this.playerRevision = revision;
     } catch (error) {
       this.debugPlayback("player-error", this.selectedClip, { message: error?.message || String(error) });
       console.error("Tuya Recordings player could not load", error);
@@ -973,7 +1057,7 @@ class TuyaRecordingsPanel extends HTMLElement {
   statusText(camera, clipCount) {
     if (this.loading && !this.data) return "";
     if (!camera) return "No camera selected";
-    const online = camera.online ? "online" : "offline";
+    const online = camera.online === true ? "online" : camera.online === false ? "offline" : "status unknown";
     const refresh = this.data?.catalog_refresh_pending ? " • Updating recordings" : "";
     return `${clipCount} recording${clipCount === 1 ? "" : "s"} • Camera ${online}${refresh}`;
   }
@@ -1120,7 +1204,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     if (!container || !this.timelineMode) return;
     const ranges = this.recordingRanges;
     const content = container.querySelector(".time-ruler-content");
-    const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
+    const { start: dayStart, duration: dayDuration } = this.timelineDayBounds();
     if (!content || !Number.isFinite(dayStart)) return;
     this.timeline?.destroy?.();
     let scrollFrame = 0;
@@ -1133,14 +1217,14 @@ class TuyaRecordingsPanel extends HTMLElement {
     let playbackUpdatesSuspended = false;
     let expectedPlaybackTime = null;
     const scrollWidth = () => Math.max(1, container.scrollWidth - container.clientWidth);
-    const epochAtPlayhead = () => dayStart + (container.scrollLeft / scrollWidth()) * 86400;
+    const epochAtPlayhead = () => dayStart + (container.scrollLeft / scrollWidth()) * dayDuration;
     const displayTime = (epoch) => {
       const clock = this.shadowRoot.getElementById("timeline-clock");
       if (clock) clock.textContent = this.formatTime(epoch);
-      container.setAttribute("aria-valuenow", String(Math.max(0, Math.min(86400, Math.round(epoch - dayStart)))));
+      container.setAttribute("aria-valuenow", String(Math.max(0, Math.min(dayDuration, Math.round(epoch - dayStart)))));
     };
     const applyTime = (epoch) => {
-      container.scrollLeft = Math.max(0, Math.min(scrollWidth(), ((epoch - dayStart) / 86400) * scrollWidth()));
+      container.scrollLeft = Math.max(0, Math.min(scrollWidth(), ((epoch - dayStart) / dayDuration) * scrollWidth()));
       displayTime(epoch);
     };
     const setTime = (epoch) => {
@@ -1175,7 +1259,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       const bounds = container.getBoundingClientRect();
       const offsetFromPlayhead = clientX - bounds.left - (bounds.width / 2);
       const scroll = Math.max(0, Math.min(scrollWidth(), container.scrollLeft + offsetFromPlayhead));
-      return dayStart + (scroll / scrollWidth()) * 86400;
+      return dayStart + (scroll / scrollWidth()) * dayDuration;
     };
     const playAt = async (epoch) => {
       const range = this.rangeForTime(epoch, ranges);
@@ -1332,7 +1416,7 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   get pauseEntityId() {
-    return "switch.tuya_recordings_pause_camera_activity";
+    return this.data?.pause_entity_id || "switch.tuya_recordings_pause_camera_activity";
   }
 
   get pauseEntity() {
@@ -1380,6 +1464,7 @@ class TuyaRecordingsPanel extends HTMLElement {
   formatTime(epochSeconds) {
     const locale = this._hass?.locale || {};
     const options = {
+      timeZone: this.data?.time_zone || undefined,
       hour: "numeric",
       minute: "2-digit",
       second: "2-digit",
@@ -1426,6 +1511,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     selected.setMonth(selected.getMonth() + offset);
     this.calendarMonth = this.localDateString(selected).slice(0, 7);
     this.render();
+    void this.loadData({quiet: true});
   }
 
   localDateString(value) {

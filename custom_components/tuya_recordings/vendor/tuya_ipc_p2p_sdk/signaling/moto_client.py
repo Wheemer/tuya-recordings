@@ -7,6 +7,7 @@ import contextlib
 import secrets
 import ssl
 import time
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import aiomqtt
@@ -25,11 +26,7 @@ _CONNECT_TIMEOUT_SECONDS = 15
 _KEEPALIVE_SECONDS = 60
 _SOURCE_LENGTH = 4
 
-# Some Tuya brokers present a certificate for a different regional hostname.
-# Keep certificate-chain validation mandatory; only hostname matching is relaxed
-# for that documented interoperability constraint.
 _BROKER_TLS = ssl.create_default_context()
-_BROKER_TLS.check_hostname = False
 
 
 class MotoClient:
@@ -55,6 +52,7 @@ class MotoClient:
         preconnect: bool = True,
         security_level: int = 3,
         moto_id: str = "",
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         """Bind the client to one device, one session and the callbacks that consume it."""
         if protocol_version not in {"2.2", "2.3"}:
@@ -70,6 +68,7 @@ class MotoClient:
         self._on_answer = on_answer
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
+        self._on_failure = on_failure
         self._protocol_version = protocol_version
         self._preconnect = bool(preconnect)
         if security_level not in {2, 3, 4}:
@@ -85,6 +84,20 @@ class MotoClient:
         self._sequence = 2
         self._client: aiomqtt.Client | None = None
         self._reader: asyncio.Task[None] | None = None
+        self._received = 0
+        self._decode_failures = 0
+        self._session_mismatches = 0
+        self._inbound: Counter[str] = Counter()
+        self._published = 0
+        self._reader_failure = "none"
+
+    @property
+    def diagnostics(self) -> str:
+        inbound = ",".join(f"{kind}={count}" for kind, count in sorted(self._inbound.items()))
+        return (f"published={self._published}, received={self._received}, decode_failures={self._decode_failures}, "
+                f"session_mismatches={self._session_mismatches}, "
+                f"inbound={inbound or 'none'}, "
+                f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
 
     async def async_connect(self) -> None:
         """Connect the broker, subscribe, and start consuming inbound payloads."""
@@ -122,21 +135,33 @@ class MotoClient:
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            LOGGER.debug("Signaling reader stopped: %s", exception)
+            self._reader_failure = type(exception).__name__
+            LOGGER.debug("Signaling reader stopped: %s", self._reader_failure)
+        else:
+            self._reader_failure = "stream_ended"
+        if self._on_failure is not None:
+            self._on_failure(self._reader_failure)
 
     def _consume(self, payload: bytes) -> None:
         """Decode one payload and dispatch it to the session."""
+        self._received += 1
         try:
-            data = decode_payload(self._key, payload)
+            protocol, data = decode_payload(self._key, payload)
         except TuyaIpcP2pError as exception:
+            self._decode_failures += 1
             LOGGER.debug("Discarded an undecodable signaling payload: %s", exception)
+            return
+        if protocol != SESSION_PROTOCOL:
+            self._inbound["signal_query" if protocol == SIG_QUERY_PROTOCOL else "other_protocol"] += 1
             return
         header = data.get("header")
         message = data.get("msg")
         if not isinstance(header, dict) or not isinstance(message, dict):
+            self._inbound["invalid_shape"] += 1
             return
         session_id = optional_str(header, "sessionid")
         if session_id and session_id != self._session_id:
+            self._session_mismatches += 1
             return
         self._dispatch(optional_str(header, "type"), message)
 
@@ -144,18 +169,30 @@ class MotoClient:
         """Hand one decoded message to the callback that owns it."""
         if message_type == "answer":
             sdp = optional_str(message, "sdp")
+            self._inbound["answer" if sdp else "answer_without_sdp"] += 1
             if sdp:
                 self._on_answer(sdp)
         elif message_type == "candidate":
+            self._inbound["candidate"] += 1
             candidate = optional_str(message, "candidate")
             if candidate:
                 self._on_candidate(candidate)
         elif message_type == "disconnect":
+            self._inbound["disconnect"] += 1
             self._on_disconnect(optional_int(message, "close_reason") or 0)
+        else:
+            self._inbound["other_session_message"] += 1
 
     async def async_send_sig_query(self) -> None:
         """Send the signal query that precedes the offer."""
         await self._async_publish(SIG_QUERY_PROTOCOL, {"reqType": "sigQry"})
+
+    def configure_offer_metadata(self, *, moto_id: str, security_level: int) -> None:
+        """Apply an HTTP token result without dropping the subscribed reader."""
+        if security_level not in {2, 3, 4}:
+            raise ValueError("Unsupported signaling security level")
+        self._moto_id = moto_id
+        self._security_level = security_level
 
     async def async_send_offer(
         self,
@@ -243,19 +280,19 @@ class MotoClient:
         )
         try:
             await client.publish(self._publish_topic, payload, qos=1)
+            self._published += 1
         except aiomqtt.MqttError as exception:
             raise TuyaIpcP2pConnectionError(f"Failed to publish: {exception}") from exception
 
     async def async_close(self) -> None:
         """Stop consuming and disconnect from the broker."""
         reader = self._reader
-        self._reader = None
         if reader is not None:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reader
+            self._reader = None
         client = self._client
-        self._client = None
         if client is not None:
-            with contextlib.suppress(Exception):
-                await client.__aexit__(None, None, None)
+            await client.__aexit__(None, None, None)
+            self._client = None

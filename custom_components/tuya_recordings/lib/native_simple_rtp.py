@@ -29,6 +29,35 @@ class NativeSimpleMediaPacket:
         """Return the persistent media-stream identifier in the native header."""
         return struct.unpack_from("<I", self.header)[0]
 
+    @property
+    def audio_format_indices(self) -> tuple[int, int, int]:
+        """Read HandleReadAudioStream's extension fields, not RTP guesses."""
+        if not self.extension:
+            return 0, 0, 1  # SDK's 8 kHz, mono, 16-bit defaults.
+        return struct.unpack_from("<3H", self.extension, 2)
+
+    @property
+    def camera_timestamp(self) -> int:
+        """Shared camera millisecond clock passed through the SDK callbacks."""
+        return struct.unpack_from("<Q", self.header, 8)[0]
+
+
+# ThingRTPUnpackerDispatcher::CreateRtpUnpacker @0x1b8394.
+# These are SDK payload assignments, not universal RTP dynamic assignments.
+SIMPLE_AUDIO_CODECS = {0: 133, 8: 132, 97: 4, 99: 0xFFFE}
+
+
+def simple_audio_payload(packet: NativeRtpPacket) -> bytes:
+    """Strip the SDK AAC AU header while retaining encoded audio bytes."""
+    if packet.payload_type != 97:
+        return packet.payload
+    if len(packet.payload) < 4 or packet.payload[:2] != b"\x00\x10":
+        raise NativeSimpleRtpError("Native AAC RTP AU header is invalid")
+    size = int.from_bytes(packet.payload[2:4], "big") >> 3
+    if size != len(packet.payload) - 4:
+        raise NativeSimpleRtpError("Native AAC RTP AU size is invalid")
+    return packet.payload[4:]
+
 
 @dataclass(frozen=True, slots=True)
 class NativeRtpPacket:
@@ -101,21 +130,35 @@ class NativeH264RtpDepacketizer:
         self._last_sequence: int | None = None
         self._units: list[bytes] = []
         self._fragment: bytearray | None = None
+        self._frame_bytes = 0
+        self._presentation_timestamp: int | None = None
+        self.completed_timestamps: tuple[int, ...] = ()
 
-    def push(self, packet: NativeRtpPacket) -> tuple[bytes, ...]:
+    def push(self, packet: NativeRtpPacket, *, presentation_timestamp: int | None = None) -> tuple[bytes, ...]:
         if not packet.payload:
             raise NativeSimpleRtpError("H.264 RTP payload is empty")
         completed: list[bytes] = []
+        times: list[int] = []
+        self.completed_timestamps = ()
         if self._timestamp is not None and packet.timestamp != self._timestamp:
+            previous_time = self._presentation_timestamp
             previous = self._finish()
             if previous is not None:
                 completed.append(previous)
+                assert previous_time is not None
+                times.append(previous_time)
         if self._last_sequence is not None and packet.sequence != (
             self._last_sequence + 1
         ) & 0xFFFF:
             self._reset()
+        if self._timestamp is None:
+            self._presentation_timestamp = packet.timestamp if presentation_timestamp is None else presentation_timestamp
         self._timestamp = packet.timestamp
         self._last_sequence = packet.sequence
+        self._frame_bytes += len(packet.payload)
+        if self._frame_bytes > SIMPLE_MEDIA_MAX_PAYLOAD_BYTES:
+            self._reset()
+            raise NativeSimpleRtpError("H.264 access unit exceeds the native media limit")
         nal_type = packet.payload[0] & 0x1F
         if 1 <= nal_type <= 23:
             self._units.append(packet.payload)
@@ -128,11 +171,16 @@ class NativeH264RtpDepacketizer:
                 f"Unsupported H.264 RTP NAL unit type {nal_type}"
             )
         if not packet.marker:
+            self.completed_timestamps = tuple(times)
             return tuple(completed)
+        current_time = self._presentation_timestamp
         current = self._finish()
         if current is None:
             raise NativeSimpleRtpError("H.264 marker ended an incomplete access unit")
         completed.append(current)
+        assert current_time is not None
+        times.append(current_time)
+        self.completed_timestamps = tuple(times)
         return tuple(completed)
 
     def _push_stap_a(self, payload: bytes) -> None:
@@ -171,6 +219,8 @@ class NativeH264RtpDepacketizer:
         self._last_sequence = None
         self._units.clear()
         self._fragment = None
+        self._frame_bytes = 0
+        self._presentation_timestamp = None
 
     def _finish(self) -> bytes | None:
         if self._fragment is not None or not self._units:

@@ -70,6 +70,7 @@ class NativePlaybackStreamFrame:
     field_28: int
     codec_info: NativePlaybackCodecInfo | None
     payload: bytes
+    timestamp_scale: int = 0
 
     @property
     def is_audio(self) -> bool:

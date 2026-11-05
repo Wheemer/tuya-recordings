@@ -1,5 +1,25 @@
 # Changelog
 
+## Tuya Recordings v0.4.11 (2026-11-05)
+
+### Fixes
+
+- Follows Smart Life and Tuya Smart's native `connect_v3` sequence: generate
+  fresh session credentials for each connection, use the app token when valid,
+  and initialize through the native HTTP offer when the SDK requires it.
+- Restores a single LAN socket attempt for cameras that advertise local
+  signaling. Prevents automatic reconnects and blocks MQTT fallback after a
+  LAN offer or incomplete LAN cleanup.
+- Distinguishes LAN availability, MQTT offer publishing, and IMM answer
+  failures in the logs without exposing session credentials. Related: #25.
+- Fixes calendar selection during refresh and preserves the last known dates
+  after a failed catalog lookup.
+
+### Playback
+
+- Preserves camera timestamps and adds AAC-LC audio for supported native SD
+  streams without transcoding.
+
 ## Tuya Recordings v0.4.11-1 (2026-11-01)
 
 ### Fixes

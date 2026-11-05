@@ -54,6 +54,26 @@ def camera_info(**updates):
     return data
 
 
+@pytest.mark.parametrize("preferred,ability,expected", [
+    (4, 8, 3), (3, 16, 4), (3, 4, 2), (2, 28, 2),
+    (4, 28, 4), (3, 0, 3), (4, None, 3),
+])
+@pytest.mark.parametrize("nested", [False, True])
+def test_security_level_matches_native_mutual_capability_negotiation(
+    preferred, ability, expected, nested
+):
+    info = camera_info()
+    token = info["p2pConfig"]
+    fields = token["session"] if nested else token
+    fields["securityLevel"] = preferred
+    if ability is not None:
+        fields["skill"] = {"security_ability": ability}
+    config = normalize_camera_info(
+        "dev123", info, local_key="local-key", trace_id="trace-1"
+    )
+    assert config.p2p_security_level == expected
+
+
 def test_native_api_request_matches_apk_overloads():
     assert native_session_api_request(
         "dev123", trace_id="ipc_p2p_android_dev123_1234"

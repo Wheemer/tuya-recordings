@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import PurePosixPath
 
 import voluptuous as vol
 from homeassistant.config_entries import (
@@ -123,6 +124,11 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
             "mobile_mqtts_url": session.mobile_mqtts_url,
             "device_fingerprint": session.device_fingerprint,
         }
+        if self._reauth_entry is not None:
+            previous = self._reauth_entry.data.get(CONF_NATIVE_APP_SESSION, {})
+            expected_uid = previous.get("uid")
+            if expected_uid and expected_uid != session.uid:
+                return self.async_abort(reason="wrong_account")
         try:
             if self._native_gateway is None:
                 raise NativeGatewayError("Native gateway is unavailable")
@@ -278,11 +284,10 @@ def _validate_media_storage_path(value: str) -> str:
     path = str(value or "").strip()
     if not path.startswith("/"):
         raise vol.Invalid("path_not_absolute")
-    if path.rstrip("/") in {"", "/media", "/config", "/config/www"} or path.startswith(
-        "/config/www/"
-    ):
+    parts = PurePosixPath(path).parts
+    if len(parts) < 3 or parts[1] != "media" or ".." in parts:
         raise vol.Invalid("path_not_allowed")
-    return path
+    return str(PurePosixPath(path))
 
 
 def _validate_form_input(user_input: dict[str, Any]) -> dict[str, str]:

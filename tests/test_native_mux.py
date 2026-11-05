@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from custom_components.tuya_recordings.lib.native_frames import (
@@ -18,19 +16,6 @@ from custom_components.tuya_recordings.lib.native_mux import (
     NativePlaybackInteractiveBrowserMuxer,
     NativePlaybackMuxer,
 )
-
-
-class FakeProcess:
-    def __init__(self, returncode=0):
-        self.commands = []
-        self.returncode = returncode
-
-    def run(self, command, **kwargs):
-        self.commands.append((command, kwargs))
-        output = Path(command[-1])
-        if self.returncode == 0:
-            output.write_bytes(b"mp4")
-        return type("Result", (), {"returncode": self.returncode, "stderr": "", "stdout": "failed"})()
 
 
 def event(frame_type, payload=b"", info=None):
@@ -57,10 +42,17 @@ def media_info(codec_name, codec_id, *, frame_no=1, key_frame=False, sample_rate
     return info
 
 
-def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path):
-    process = FakeProcess()
+def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path, monkeypatch):
+    from custom_components.tuya_recordings.lib import native_mux
+    received = []
+
+    def mux(video_path, audio_path, packet_path, output, **kwargs):
+        received.append((video_path.read_bytes(), audio_path.read_bytes(), packet_path.read_bytes(), kwargs))
+        output.write_bytes(b"mp4")
+
+    monkeypatch.setattr(native_mux, "mux_camera_packets", mux)
     output = tmp_path / "clip.mp4"
-    with NativePlaybackMuxer(output, process_module=process) as muxer:
+    with NativePlaybackMuxer(output) as muxer:
         muxer.handle_event(event(NativePlaybackFrameType.STARTED))
         muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"h264", media_info("h264", 27, key_frame=True)))
         muxer.handle_event(
@@ -73,11 +65,10 @@ def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path):
         muxer.handle_event(event(NativePlaybackFrameType.FINISHED))
 
     assert output.read_bytes() == b"mp4"
-    command = process.commands[0][0]
-    assert "-f" in command
-    assert "h264" in command
-    assert "aac" in command
-    assert "aac_adtstoasc" in command
+    assert received[0][0] == b"h264"
+    assert received[0][1].endswith(b"aac")
+    assert received[0][3]["audio_codec"] == "aac"
+    assert not output.with_suffix(".packets.tmp").exists()
     assert not output.with_suffix(".video.h264").exists()
     assert not output.with_suffix(".audio.aac").exists()
 
@@ -98,7 +89,7 @@ def test_native_muxer_rejects_decoded_frames_for_no_transcoding_path(tmp_path):
 
 
 def test_native_muxer_requires_audio_by_default(tmp_path):
-    muxer = NativePlaybackMuxer(tmp_path / "clip.mp4", process_module=FakeProcess())
+    muxer = NativePlaybackMuxer(tmp_path / "clip.mp4")
     muxer.open()
     muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"h264", media_info("h264", 27, key_frame=True)))
     with pytest.raises(NativeMuxError, match="no audio"):

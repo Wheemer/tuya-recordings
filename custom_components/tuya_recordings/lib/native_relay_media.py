@@ -12,6 +12,7 @@ from .native_playback_stream import NativePlaybackStreamFrame
 NATIVE_CODEC_H264 = 1
 NATIVE_CODEC_AAC = 4
 NATIVE_CODEC_G711U = 133
+NATIVE_CODEC_G711A = 132
 NATIVE_CODEC_PCM_S16LE = 0xFFFE
 FFMPEG_CODEC_H264 = 27
 FFMPEG_CODEC_AAC = 86018
@@ -36,6 +37,7 @@ def playback_stream_frame(frame: NativePlaybackStreamFrame) -> NativePlaybackFra
         if codec_id not in {
             NATIVE_CODEC_AAC,
             NATIVE_CODEC_G711U,
+            NATIVE_CODEC_G711A,
             FFMPEG_CODEC_AAC,
             NATIVE_CODEC_PCM_S16LE,
         } and not _is_adts(frame.payload):
@@ -70,10 +72,13 @@ def playback_stream_frame(frame: NativePlaybackStreamFrame) -> NativePlaybackFra
             timestamp=_timestamp(frame),
             frame_info=frame.codec_info.raw if frame.codec_info is not None else b"",
         )
+    metadata = info.to_jsonable()
+    if frame.timestamp_scale:
+        metadata["timestampScale"] = frame.timestamp_scale
     return NativePlaybackFrame(
         NativePlaybackFrameType.MEDIA_CODEC,
         frame.payload,
-        info.to_jsonable(),
+        metadata,
     )
 
 

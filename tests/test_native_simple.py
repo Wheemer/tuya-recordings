@@ -12,6 +12,8 @@ from custom_components.tuya_recordings.lib.native_simple import (
     decode_thumbnail_reply,
     encode_audio_open,
     encode_catalog_request,
+    encode_recording_month_request,
+    decode_recording_month_reply,
     encode_event_catalog_request,
     encode_playback_start,
     encode_playback_start_fragments,
@@ -35,6 +37,28 @@ def test_encodes_apk_catalog_command():
 
     assert header(packet) == (0x12345678, 2, 0, 3, 1, 16)
     assert struct.unpack_from("<4i", packet, 20) == (0, 2026, 9, 18)
+
+
+def test_month_request_matches_native_channel_and_integer_month():
+    packet = encode_recording_month_request(request_id=42, channel=0, month=date(2026, 11, 1))
+    assert header(packet) == (0x12345678, 42, 0, 3, 0, 16)
+    assert struct.unpack_from("<4i", packet, 20) == (0, 0, 0, 202611)
+
+
+@pytest.mark.parametrize("size,offset", [(16, 12), (80, 76)])
+def test_month_reply_decodes_both_native_callback_layouts(size, offset):
+    payload = bytearray(size)
+    struct.pack_into("<I", payload, offset, (1 << 1) | (1 << 28) | (1 << 31))
+    command = NativeSimpleCommand(42, 1, 3, 0, bytes(payload))
+    assert decode_recording_month_reply(command, request_id=42, month=date(2026, 2, 1)) == [date(2026, 2, 1), date(2026, 2, 28)]
+    with pytest.raises(NativeSimpleError, match="request ID"):
+        decode_recording_month_reply(command, request_id=43, month=date(2026, 2, 1))
+
+
+def test_month_reply_rejects_truncated_payload():
+    command = NativeSimpleCommand(42, 1, 3, 0, bytes(15))
+    with pytest.raises(NativeSimpleError, match="invalid size"):
+        decode_recording_month_reply(command, request_id=42, month=date(2026, 11, 1))
 
 
 def test_encodes_apk_v3_catalog_command():

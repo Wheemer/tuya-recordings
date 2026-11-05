@@ -149,8 +149,23 @@ class NativeCameraSessionConfig:
 
     @property
     def p2p_security_level(self) -> int:
-        value = self.p2p_config.get("securityLevel")
-        return value if type(value) is int and value in {2, 3, 4} else 3
+        """Match native token security negotiation, including nested tokens."""
+        config = self.p2p_config
+        session = config.get("session")
+        session = session if isinstance(session, dict) else {}
+        value = config.get("securityLevel", session.get("securityLevel", 3))
+        preferred = value if type(value) is int and value in {2, 3, 4} else 3
+        skill = config.get("skill", session.get("skill", {}))
+        ability = skill.get("security_ability", 8) if isinstance(skill, dict) else 8
+        ability = ability if type(ability) is int and ability >= 0 else 8
+        mutual = ability & 0x1C
+        if mutual & (1 << preferred):
+            return preferred
+        for level in (4, 3, 2):
+            if mutual & (1 << level):
+                return level
+        # libThingP2PSDK.so 0x80504..0x80518 uses L3 when no bits match.
+        return 3
 
     @property
     def p2p_ice_servers(self) -> list[dict[str, Any]]:

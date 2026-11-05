@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+import av
 
 
 def finalize_mp4_for_browser(input_path: Path, output_path: Path, *, require_audio: bool = True) -> None:
+    streams = _probe_stream_codecs(input_path)
+    raw_audio = any(stream.get("codec_name") in {"pcm_s16le", "pcm_mulaw", "pcm_alaw"}
+                    for stream in streams or [])
     temp_path = output_path.with_suffix(".faststart.tmp.mp4")
     temp_path.unlink(missing_ok=True)
     result = subprocess.run(
@@ -24,6 +28,7 @@ def finalize_mp4_for_browser(input_path: Path, output_path: Path, *, require_aud
             "copy",
             "-movflags",
             "+faststart",
+            *(["-f", "mov"] if raw_audio else []),
             "-y",
             str(temp_path),
         ],
@@ -129,7 +134,12 @@ def _probe_stream_codecs(path: Path) -> list[dict] | None:
             check=False,
         )
     except FileNotFoundError:
-        return None
+        try:
+            with av.open(str(path)) as container:
+                return [{"codec_type": stream.type, "codec_name": stream.codec_context.name}
+                        for stream in container.streams if stream.type in {"audio", "video"}]
+        except Exception as err:
+            raise RuntimeError("Could not inspect cached recording audio/video streams") from err
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed to inspect Tuya recording: {result.stderr.strip() or result.stdout.strip()}")
     try:

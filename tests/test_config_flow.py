@@ -10,11 +10,14 @@ except ImportError:
 from homeassistant.helpers import config_validation as cv
 
 from custom_components.tuya_recordings.config_flow import (
+    TuyaRecordingsConfigFlow,
     _native_authorize_schema,
     _options_schema,
     _user_schema,
     _validate_form_input,
 )
+
+
 from custom_components.tuya_recordings.const import (
     CONF_ALERT_RESET_SECONDS,
     CONF_APP_PROFILE,
@@ -27,6 +30,23 @@ from custom_components.tuya_recordings.const import (
     CONF_REGION,
     DEFAULT_CATALOG_SYNC_MINUTES,
 )
+
+
+@pytest.mark.asyncio
+async def test_reauthorization_rejects_other_account_before_inventory_request():
+    from unittest.mock import AsyncMock, Mock
+
+    flow = TuyaRecordingsConfigFlow()
+    flow._pending_entry_data = {}
+    flow._reauth_entry = SimpleNamespace(data={"native_app_session": {"uid": "original"}})
+    session = SimpleNamespace(sid="sid", ecode="ecode", uid="other",
+        partner_identity="partner", mobile_mqtts_url="mqtt.example.test",
+        device_fingerprint="fingerprint")
+    flow._native_authorization = SimpleNamespace(finish=AsyncMock(return_value=session))
+    flow._native_gateway = Mock()
+    result = await flow.async_step_native_authorize({})
+    assert result["reason"] == "wrong_account"
+    flow._native_gateway.device_connection_inventory_data.assert_not_called()
 
 
 def test_user_schema_is_frontend_serializable():
@@ -87,6 +107,11 @@ def test_media_storage_path_validation_returns_field_error():
     errors = _validate_form_input({CONF_MEDIA_STORAGE_PATH: "/config/www/tuya_recordings"})
 
     assert errors == {CONF_MEDIA_STORAGE_PATH: "path_not_allowed"}
+
+
+@pytest.mark.parametrize("path", ["/mnt/videos", "/media", "/media/../config/recordings", "/media/videos/../../etc"])
+def test_storage_is_confined_to_private_media_subdirectory(path):
+    assert _validate_form_input({CONF_MEDIA_STORAGE_PATH: path}) == {CONF_MEDIA_STORAGE_PATH: "path_not_allowed"}
 
 
 @pytest.mark.parametrize("path", ["/media/tuya_recordings", " /media/tuya_recordings "])

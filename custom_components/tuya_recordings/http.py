@@ -4,7 +4,7 @@ import asyncio
 import logging
 import queue
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -14,6 +14,7 @@ from aiohttp import WSCloseCode, web
 from homeassistant.components import http
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers import entity_registry as er
 
 from .client import TuyaRecordingsAuthError, TuyaRecordingsClient
 from .lib.commands import CameraWorkBusy, CameraWorkCancelled
@@ -39,6 +40,52 @@ _DATA_PLAYBACK_WS = "_playback_websocket"
 _PLAYBACK_HANDOFF_TIMEOUT = 30.0
 
 
+def _account_clients(hass):
+    return {key: value for key, value in hass.data.get(DOMAIN, {}).items()
+            if isinstance(value, dict) and isinstance(value.get("client"), TuyaRecordingsClient)}
+
+
+def _select_client(hass, entry_id=None, dev_id=None):
+    entries = _account_clients(hass)
+    if entry_id:
+        if entry_id not in entries:
+            raise web.HTTPNotFound(reason="Unknown Tuya Recordings account")
+        return entries[entry_id]["client"]
+    if dev_id and len(entries) > 1:
+        matches = [value["client"] for value in entries.values()
+                   if dev_id in (value["client"]._camera_inventory or {})
+                   or any(camera.get("devId") == dev_id for camera in
+                          (value["client"]._camera_index_cache or {}).get("cameras", []))]
+        if len(matches) != 1:
+            raise web.HTTPBadRequest(reason="Select the recording account for this camera")
+        return matches[0]
+    if entries:
+        return next(iter(entries.values()))["client"]
+    raise web.HTTPNotFound(reason="Tuya Recordings is not configured")
+
+
+class _TimelineCommands(queue.Queue):
+    """Bound controls and replace pending seeks before they reach the camera."""
+
+    def __init__(self):
+        super().__init__(maxsize=32)
+
+    def put(self, item, block=True, timeout=None):
+        with self.not_full:
+            if item[0] == "stop":
+                self.unfinished_tasks -= len(self.queue)
+                self.queue.clear()
+            elif item[0] == "seek":
+                while self.queue and self.queue[-1][0] == "seek":
+                    self.queue.pop()
+                    self.unfinished_tasks -= 1
+            if len(self.queue) >= self.maxsize:
+                raise queue.Full
+            self.queue.append(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
 def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_root: Path = Path("/media")) -> dict[str, Any]:
     """Build cache-backed panel data from the recording index."""
     cameras: list[dict[str, Any]] = []
@@ -59,7 +106,7 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         live_playback_available = (
             not cloud_activity_paused
             and _uncached_playback_available(client)
-            and camera.get("online") is True
+            and camera.get("online") is not False
         )
         clips = []
         recording_ranges = []
@@ -77,6 +124,8 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
             "thumbnail_bytes": 0,
         }
         for clip in camera.get("clips", []):
+            if not media_cache_only and clip.get("on_camera") is False:
+                continue
             start = int(clip.get("start") or 0)
             end = int(clip.get("end") or 0)
             clip_date = str(clip.get("date") or "")
@@ -154,11 +203,15 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         stats["camera_stats"].append(camera_stats)
         clips.sort(key=lambda item: int(item["start"]), reverse=True)
         recording_ranges.sort(key=lambda item: int(item["start"]))
+        if not media_cache_only and isinstance(months := camera.get("recordingMonths"), dict):
+            for available in months.values():
+                if isinstance(available, list):
+                    dates.update(value for value in available if isinstance(value, str))
         cameras.append(
             {
                 "dev_id": dev_id,
                 "name": str(camera.get("name") or dev_id),
-                "online": bool(camera.get("online")),
+                "online": camera.get("online"),
                 "dates": sorted(dates, reverse=True),
                 "playback_mode": playback_mode,
                 "clips": clips,
@@ -403,6 +456,8 @@ def _timeline_range_for_time(index: dict[str, Any], dev_id: str, position: int) 
         if camera.get("devId") != dev_id:
             continue
         for clip in camera.get("clips", []):
+            if clip.get("on_camera") is False:
+                continue
             start = int(clip.get("start") or 0)
             end = int(clip.get("end") or 0)
             if start > 0 and end > start:
@@ -450,14 +505,15 @@ def _resume_background_camera_work(
 ) -> None:
     """Resume background work only for the playback generation that owns it."""
     domain_data = hass.data.get(DOMAIN, {}) if hasattr(hass, "data") else {}
-    if domain_data.get(_DATA_PLAYBACK_GENERATION) != generation:
-        return
+    owns_entry = False
     for entry_data in domain_data.values():
         if not isinstance(entry_data, dict) or entry_data.get("client") is not client:
             continue
         if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) == generation:
             entry_data.pop(DATA_INTERACTIVE_PLAYBACK_ACTIVE, None)
-    client.resume_background_work()
+            owns_entry = True
+    if owns_entry:
+        client.resume_background_work()
 
 
 def _clip_title(start: int, end: int) -> str:
@@ -475,7 +531,15 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
         self._catalog_refresh_tasks: dict[tuple[int, str, str], asyncio.Task[None]] = {}
 
     async def get(self, request: web.Request) -> web.Response:
-        client = self._client()
+        client = self._client(request.query.get("entry_id"), request.query.get("camera"))
+        month = None
+        if month_text := request.query.get("month"):
+            try:
+                month = date.fromisoformat(f"{month_text}-01")
+            except ValueError as err:
+                raise web.HTTPBadRequest(reason="Invalid recording month") from err
+            if month > dt_util.now().date() or month.year < 1970:
+                raise web.HTTPBadRequest(reason="Invalid recording month")
         if client.background_work_paused:
             data = await self.hass.async_add_executor_job(self._build_data, client)
             data["on_demand"] = not client.media_sync_enabled and not client.thumbnail_sync_enabled
@@ -490,12 +554,37 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
             if dev_id and not any(camera.get("devId") == dev_id for camera in index.get("cameras", [])):
                 raise web.HTTPNotFound(reason="Unknown camera")
             refresh_pending = self._schedule_catalog_refresh(client, dev_id, day, index)
+            if month is not None and dev_id:
+                refresh_pending |= self._schedule_catalog_refresh(client, dev_id, month, index, month_query=True)
             data = await self.hass.async_add_executor_job(build_panel_data, client, index)
             data["on_demand"] = True
             data["selected_date"] = day.isoformat()
             data["catalog_refresh_pending"] = refresh_pending
         else:
             data = await self.hass.async_add_executor_job(self._build_data, client)
+        entries = _account_clients(self.hass)
+        entry_id = next(key for key, value in entries.items() if value["client"] is client)
+        data["entry_id"] = entry_id
+        data["accounts"] = [{"entry_id": key, "name": getattr(value.get("entry"), "title", None) or f"Account {number}"}
+                            for number, (key, value) in enumerate(entries.items(), 1)]
+        try:
+            data["pause_entity_id"] = er.async_get(self.hass).async_get_entity_id("switch", DOMAIN, f"{entry_id}_cloud_activity_paused")
+        except (AttributeError, KeyError):
+            data["pause_entity_id"] = None
+        for camera in data.get("cameras", []):
+            for clip in [*camera.get("clips", []), *camera.get("recording_ranges", [])]:
+                path = clip.get("playback_url") or ""
+                if path.startswith(f"/api/{DOMAIN}/"):
+                    clip["playback_url"] = f"{path}{'&' if '?' in path else '?'}entry_id={quote(entry_id)}"
+        try:
+            selected_day = date.fromisoformat(data.get("selected_date") or request.query.get("date") or dt_util.now().date().isoformat())
+        except ValueError as err:
+            raise web.HTTPBadRequest(reason="Invalid recording date") from err
+        zone = dt_util.DEFAULT_TIME_ZONE
+        data["selected_date"] = selected_day.isoformat()
+        data["time_zone"] = str(zone)
+        data["day_start"] = int(datetime.combine(selected_day, time.min, zone).timestamp())
+        data["day_end"] = int(datetime.combine(selected_day + timedelta(days=1), time.min, zone).timestamp())
         return web.json_response(data)
 
     def _schedule_catalog_refresh(
@@ -504,21 +593,24 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
         dev_id: str,
         day: date,
         index: dict[str, Any],
+        *, month_query: bool = False,
     ) -> bool:
         """Run one request-driven catalog refresh without delaying panel paint."""
         target = dev_id
         if not target and index.get("cameras"):
             return False
-        key = (id(client), target, day.isoformat())
+        key = (id(client), target, ("month:" if month_query else "") + day.isoformat())
         existing = self._catalog_refresh_tasks.get(key)
         if existing is not None and not existing.done():
             return True
-        if not client.browse_refresh_due(target, day):
+        due = client.browse_month_refresh_due if month_query else client.browse_refresh_due
+        if not due(target, day):
             return False
 
         async def _refresh() -> None:
             try:
-                await self.hass.async_add_executor_job(client.browse_recordings, target, day)
+                query = client.browse_recording_month if month_query else client.browse_recordings
+                await self.hass.async_add_executor_job(query, target, day)
             except (CameraWorkBusy, CameraWorkCancelled):
                 _LOGGER.debug(
                     "Tuya Recordings catalog refresh deferred for %s on %s",
@@ -541,11 +633,8 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
     def _build_data(client: TuyaRecordingsClient) -> dict[str, Any]:
         return build_panel_data(client, client.cached_camera_index())
 
-    def _client(self) -> TuyaRecordingsClient:
-        for entry_data in self.hass.data.get(DOMAIN, {}).values():
-            if isinstance(entry_data, dict) and isinstance(client := entry_data.get("client"), TuyaRecordingsClient):
-                return client
-        raise web.HTTPNotFound(reason="Tuya Recordings is not configured")
+    def _client(self, entry_id=None, dev_id=None) -> TuyaRecordingsClient:
+        return _select_client(self.hass, entry_id, dev_id)
 
 
 class TuyaRecordingsDebugView(http.HomeAssistantView):
@@ -562,6 +651,8 @@ class TuyaRecordingsDebugView(http.HomeAssistantView):
             data = await request.json()
         except ValueError:
             data = {}
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(reason="Expected a JSON object")
         _LOGGER.debug(
             "Tuya Recordings frontend event phase=%s dev=%s start=%s end=%s detail=%s",
             data.get("phase"),
@@ -589,7 +680,7 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         except ValueError as exc:
             raise web.HTTPBadRequest(reason="Invalid recording time") from exc
 
-        client = self._client()
+        client = self._client(request.query.get("entry_id"), dev_id)
         if start_int <= 0 or end_int <= start_int:
             raise web.HTTPBadRequest(reason="Invalid recording time range")
         playback_mode = request.query.get("mode", "clip")
@@ -700,11 +791,8 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
             lock.release()
             _resume_background_camera_work(self.hass, client, generation)
 
-    def _client(self) -> TuyaRecordingsClient:
-        for entry_data in self.hass.data.get(DOMAIN, {}).values():
-            if isinstance(entry_data, dict) and isinstance(client := entry_data.get("client"), TuyaRecordingsClient):
-                return client
-        raise web.HTTPNotFound(reason="Tuya Recordings is not configured")
+    def _client(self, entry_id=None, dev_id=None) -> TuyaRecordingsClient:
+        return _select_client(self.hass, entry_id, dev_id)
 
     def _start_reauth(self, client: TuyaRecordingsClient) -> None:
         for entry_data in self.hass.data.get(DOMAIN, {}).values():
@@ -816,7 +904,7 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: web.Request, dev_id: str) -> web.WebSocketResponse:
-        client = self._client()
+        client = self._client(request.query.get("entry_id"), dev_id)
         _raise_native_playback_unavailable(client)
         try:
             position = int(request.query["position"])
@@ -870,7 +958,7 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
             await ws.close()
             return ws
 
-        commands: queue.Queue[tuple[str, Any]] = queue.Queue()
+        commands: queue.Queue[tuple[str, Any]] = _TimelineCommands()
         chunks: queue.Queue[bytes | Exception | object] = queue.Queue(maxsize=8)
         sentinel = object()
         domain_data[_DATA_PLAYBACK_STOP] = stop_event
@@ -953,9 +1041,15 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
                 except ValueError:
                     await ws.send_json({"type": "error", "message": "Invalid command"})
                     continue
+                if not isinstance(payload, dict):
+                    await ws.send_json({"type": "error", "message": "Expected a command object"})
+                    continue
                 action = str(payload.get("action") or "")
                 if action in {"pause", "resume"}:
-                    commands.put((action, None))
+                    try:
+                        commands.put((action, None))
+                    except queue.Full:
+                        await ws.send_json({"type": "error", "message": "Camera command queue is full"})
                     continue
                 if action != "seek":
                     await ws.send_json({"type": "error", "message": "Invalid command"})
@@ -965,15 +1059,18 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
                 except (KeyError, TypeError, ValueError):
                     await ws.send_json({"type": "error", "message": "Invalid position"})
                     continue
-                resolved = _timeline_range_for_time(index, dev_id, wanted)
+                current_index = await self.hass.async_add_executor_job(client.cached_camera_index)
+                resolved = _timeline_range_for_time(current_index, dev_id, wanted)
                 if resolved is None:
                     await ws.send_json({"type": "error", "message": "No recording at that time"})
                     continue
                 start, end = resolved
                 wanted = max(start, min(end - 1, wanted))
-                commands.put(
-                    ("seek", client.timeline_request(dev_id, start, end, wanted))
-                )
+                try:
+                    commands.put(("seek", client.timeline_request(dev_id, start, end, wanted)))
+                except queue.Full:
+                    await ws.send_json({"type": "error", "message": "Camera command queue is full"})
+                    continue
                 await ws.send_json({"type": "seeking", "position": wanted})
         finally:
             stop_event.set()
@@ -994,13 +1091,8 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
                 await ws.close()
         return ws
 
-    def _client(self) -> TuyaRecordingsClient:
-        for entry_data in self.hass.data.get(DOMAIN, {}).values():
-            if isinstance(entry_data, dict) and isinstance(
-                client := entry_data.get("client"), TuyaRecordingsClient
-            ):
-                return client
-        raise web.HTTPNotFound(reason="Tuya Recordings is not configured")
+    def _client(self, entry_id=None, dev_id=None) -> TuyaRecordingsClient:
+        return _select_client(self.hass, entry_id, dev_id)
 
 class TuyaRecordingsThumbnailView(http.HomeAssistantView):
     """Serve generated Tuya recording thumbnails from the private cache."""
@@ -1018,7 +1110,7 @@ class TuyaRecordingsThumbnailView(http.HomeAssistantView):
         except ValueError as exc:
             raise web.HTTPBadRequest(reason="Invalid recording time") from exc
 
-        client = self._client()
+        client = self._client(request.query.get("entry_id"), dev_id)
         thumbnail_path = client.thumbnail_path(dev_id, start_int, end_int)
         if not getattr(client, "media_sync_enabled", False):
             raise web.HTTPNotFound(reason="Tuya recording thumbnails are available only in local cache mode")
@@ -1026,8 +1118,5 @@ class TuyaRecordingsThumbnailView(http.HomeAssistantView):
             raise web.HTTPNotFound(reason="Tuya recording thumbnail is not cached yet")
         return web.FileResponse(thumbnail_path, headers={"Cache-Control": "private, max-age=3600"})
 
-    def _client(self) -> TuyaRecordingsClient:
-        for entry_data in self.hass.data.get(DOMAIN, {}).values():
-            if isinstance(entry_data, dict) and isinstance(client := entry_data.get("client"), TuyaRecordingsClient):
-                return client
-        raise web.HTTPNotFound(reason="Tuya Recordings is not configured")
+    def _client(self, entry_id=None, dev_id=None) -> TuyaRecordingsClient:
+        return _select_client(self.hass, entry_id, dev_id)

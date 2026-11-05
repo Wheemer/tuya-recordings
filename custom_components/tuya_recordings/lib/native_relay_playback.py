@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from contextlib import suppress
+from dataclasses import replace
 from datetime import date
 from typing import Any
 
 from ..vendor.tuya_ipc_p2p_sdk import MqttIdentity, StreamConfig
+from ..vendor.tuya_ipc_p2p_sdk.models.p2p_session import P2pSession
 from ..vendor.tuya_ipc_p2p_sdk.control import (
     auth_credential,
     session_sequence,
@@ -51,6 +54,8 @@ from .native_simple_rtp import (
     NativeSimpleMediaParser,
     NativeSimpleRtpError,
     parse_rtp_packet,
+    SIMPLE_AUDIO_CODECS,
+    simple_audio_payload,
 )
 from .native_simple import (
     NativeSimpleCommand,
@@ -61,6 +66,8 @@ from .native_simple import (
     decode_thumbnail_reply,
     encode_audio_open,
     encode_catalog_request,
+    encode_recording_month_request,
+    decode_recording_month_reply,
     encode_event_catalog_request,
     encode_playback_start,
     encode_playback_start_fragments,
@@ -84,10 +91,9 @@ _MEDIA_QUEUE_LIMIT = 256
 _VIDEO_CONVERSATION = 1
 _AUDIO_CONVERSATION = 2
 _VIDEO_RTP_PAYLOAD_TYPE = 96
-_G711U_RTP_PAYLOAD_TYPE = 99
-_NATIVE_PCM_S16LE_CODEC = 0xFFFE
 _DISCONNECT_GRACE_SECONDS = 0.3
 _CLOSE_STEP_TIMEOUT_SECONDS = 2.0
+_HTTP_TOKEN_TIMEOUT_SECONDS = 15.0
 
 
 def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
@@ -126,20 +132,30 @@ class NativeRelayPlaybackSession:
         self,
         config: NativeCameraSessionConfig,
         app_session: dict[str, Any],
+        *,
+        call_api: Any = None,
     ) -> None:
         self._native_config = config.validate()
+        self._call_api = call_api
         if self._native_config.p2p_type != 4:
             raise NativeRelayPlaybackError(
                 "Native relay playback currently supports P2P type 4 cameras"
             )
-        self._stream_config = _stream_config(config)
-        self._mqtt_identity = _mqtt_identity(
-            app_session, config.app_region, config.app_profile_id
-        )
+        self._http_initialized = False
+        self._http_trace_id = ""
         self._uid = config.app_uid
         if not self._uid:
             raise NativeRelayPlaybackError("Smart Life account UID is unavailable")
-        self._local_cid = self._stream_config.p2p_session.session_id
+        self._local = self._new_local_session(config.trace_id)
+        try:
+            self._stream_config = _stream_config(config, self._local)
+        except NativeRelayPlaybackError:
+            if not self._requires_http_token():
+                raise
+            self._stream_config = None
+        self._mqtt_identity = _mqtt_identity(
+            app_session, config.app_region, config.app_profile_id
+        )
         self._control_messages: asyncio.Queue[NativeSimpleCommand] = asyncio.Queue(
             maxsize=_CONTROL_QUEUE_LIMIT
         )
@@ -148,8 +164,11 @@ class NativeRelayPlaybackSession:
         )
         self._parser = NativePlaybackStreamParser()
         self._control_decoder = NativeSimpleCommandDecoder()
-        self._moto: MotoClient | None = None
+        self._moto: MotoClient | Lan302Client | None = None
         self._signaling_path = "unconnected"
+        self._lan_status = "not_attempted"
+        self._offer_status = "not_sent"
+        self._answer_status = "not_received"
         self._session: DirectSession | None = None
         self._ice: IceResponder | None = None
         self._control: KcpConversation | None = None
@@ -186,7 +205,19 @@ class NativeRelayPlaybackSession:
     @property
     def local_cid(self) -> str:
         """Return the SDK session identifier used by V4 camera requests."""
-        return self._local_cid
+        return self._local.session_id
+
+    def _new_local_session(self, trace_id: str) -> P2pSession:
+        """Generate connect_v3's local identity independently of the app token."""
+        session_id = (
+            f"{self._native_config.dev_id}{int(time.time())}"
+            f"{random_alphanumeric(_RENDEZVOUS_SUFFIX_LENGTH)}"
+        )
+        return P2pSession(
+            session_id=session_id, aes_key=secrets.token_bytes(16),
+            ice_ufrag=random_alphanumeric(4), ice_password=random_alphanumeric(24),
+            trace_id=trace_id, uid=self._uid,
+        )
 
     @property
     def transport_diagnostics(self) -> str:
@@ -204,7 +235,7 @@ class NativeRelayPlaybackSession:
         )
         samples = (
             ",".join(
-                f"{conversation}:{length}:{prefix}"
+                f"{conversation}:{length}"
                 for conversation, (length, prefix) in sorted(
                     self._raw_media_samples.items()
                 )
@@ -231,7 +262,10 @@ class NativeRelayPlaybackSession:
             f"sequences=({self._preview_sequences or 'none'}->"
             f"{self._media_sequences()}), "
             f"codec_info={self._rtp_codec_info or 'none'}, "
-            f"response_payloads={self._control_payloads or 'none'}"
+            f"signaling_details=({getattr(self._moto, 'diagnostics', 'unavailable')}), "
+            f"lan={self._lan_status}, offer={self._offer_status}, "
+            f"answer={self._answer_status}, "
+            f"http_initialized={self._http_initialized}"
         )
 
     async def connect(self, *, media: bool = True) -> None:
@@ -241,15 +275,25 @@ class NativeRelayPlaybackSession:
         loop = asyncio.get_running_loop()
         self._answer = loop.create_future()
         self._ended = loop.create_future()
+        if self._native_config.p2p_policy != 1:
+            self._lan_status = "not_selected_by_policy"
+        if self._stream_config is None:
+            if self._native_config.p2p_policy == 1:
+                self._lan_status = "bootstrap_unavailable"
+            try:
+                await self._initialize_http_offer(self._native_config.trace_id)
+            except BaseException:
+                await self.close()
+                raise
         config = self._stream_config
         p2p = config.p2p_session
         rendezvous_id = (
             f"{config.device_id}{int(time.time())}"
             f"{random_alphanumeric(_RENDEZVOUS_SUFFIX_LENGTH)}"
         )
-        token = config.relay_token.with_session_id(rendezvous_id)
-        trace_id = f"{p2p.trace_id}_{config.device_id}_{int(time.time() * 1000)}"
-        self._offer = build_offer(
+        token = config.relay_token if self._http_initialized else config.relay_token.with_session_id(rendezvous_id)
+        trace_id = self._http_trace_id if self._http_initialized else self._native_config.trace_id
+        self._offer = self._offer or build_offer(
             self._uid,
             p2p.session_id,
             int(time.time()),
@@ -265,19 +309,26 @@ class NativeRelayPlaybackSession:
                 token.as_json(),
                 config.log_config_as_json(),
             )
+            config = self._stream_config
+            p2p = config.p2p_session
             self._ice = IceResponder(
                 p2p.ice_password,
                 self._on_local_candidate,
                 send_key=self._offer.aes_key,
                 on_segment=self._on_direct_segment,
+                local_ufrag=p2p.ice_ufrag,
             )
             await self._ice.async_gather()
             self._session = DirectSession(self._ice.send_segment)
             answer = await self._wait_for_answer()
+            if self._ended.done():
+                raise self._ended.result()
             self._ice.set_receive_key(answer.aes_key)
             await self._ice.async_wait_for_nomination(
                 _DIRECT_NOMINATION_TIMEOUT_SECONDS
             )
+            if self._ended.done():
+                raise self._ended.result()
             self._control = self._session.control
             self._control.set_message_handler(
                 lambda record: self._on_control_record(record, answer.aes_key)
@@ -329,7 +380,7 @@ class NativeRelayPlaybackSession:
         log_config: Any,
     ) -> None:
         """Use the camera-advertised local policy before MQTT fallback."""
-        if self._native_config.p2p_policy == 1:
+        if self._native_config.p2p_policy == 1 and not self._http_initialized:
             lan = Lan302Client(
                 uid=self._uid,
                 device_id=self._stream_config.device_id,
@@ -342,38 +393,149 @@ class NativeRelayPlaybackSession:
                 security_level=self._native_config.p2p_security_level,
                 moto_id=self._stream_config.moto_id,
             )
+            self._moto = lan
+            self._signaling_path = "lan"
+            self._lan_status = "connecting"
             try:
                 await lan.async_connect()
+                self._lan_status = "socket_open"
+                self._offer_status = "sending"
                 await lan.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
-                self._moto = lan  # type: ignore[assignment]
-                self._signaling_path = "lan"
+                self._offer_status = "sent"
                 return
             except NativeLanUnavailableError:
-                await lan.async_close()
+                self._lan_status = "unavailable"
+                await self._close_failed_lan(lan)
             except NativeLanSignalError as err:
-                await lan.async_close()
+                self._lan_status = "failed"
+                await self._close_failed_lan(lan)
                 raise NativeRelayPlaybackError(
-                    "Camera did not complete local P2P signaling"
+                    f"Camera did not complete local P2P signaling ({self.transport_diagnostics})"
                 ) from err
+        if not self._http_initialized and self._requires_http_token():
+            await self._initialize_http_offer(trace_id)
+            sdp = self._require_offer().sdp
+            ice_servers = self._stream_config.ice_servers_as_json()
+            tcp_token = self._stream_config.relay_token.as_json()
+            log_config = self._stream_config.log_config_as_json()
+        if self._moto is None:
+            await self._connect_mqtt(self._stream_config.p2p_session.session_id)
+        if self._ended is not None and self._ended.done():
+            raise self._ended.result()
+        with suppress(TuyaIpcP2pError):
+            await self._moto.async_send_sig_query()
+        if self._ended is not None and self._ended.done():
+            raise self._ended.result()
+        self._signaling_path = "mqtt"
+        self._offer_status = "sending"
+        try:
+            await self._moto.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
+        except TuyaIpcP2pError as err:
+            self._offer_status = "publish_failed"
+            raise NativeRelayPlaybackError(
+                f"Native MQTT offer publish failed ({self.transport_diagnostics})"
+            ) from err
+        self._offer_status = "published"
+
+    async def _close_failed_lan(self, lan: Lan302Client) -> None:
+        if not await _bounded_cleanup(lan.async_close()):
+            raise NativeRelayPlaybackError("Native LAN cleanup timed out")
+        self._moto = None
+
+    async def _connect_mqtt(self, session_id: str) -> None:
         self._moto = MotoClient(
             identity=self._mqtt_identity,
             uid=self._uid,
-            device_id=self._stream_config.device_id,
-            session_id=self._stream_config.p2p_session.session_id,
-            local_key=self._stream_config.local_key,
+            device_id=self._native_config.dev_id,
+            session_id=session_id,
+            local_key=self._native_config.local_key,
             on_answer=self._on_answer,
             on_candidate=self._on_remote_candidate,
             on_disconnect=self._on_disconnect,
             protocol_version=self._native_config.mqtt_protocol_version,
             preconnect=bool(self._native_config.preconnect),
             security_level=self._native_config.p2p_security_level,
-            moto_id=self._stream_config.moto_id,
+            moto_id=self._stream_config.moto_id if self._stream_config else "",
+            on_failure=self._on_signaling_failure,
         )
         await self._moto.async_connect()
-        with suppress(TuyaIpcP2pError):
-            await self._moto.async_send_sig_query()
-        await self._moto.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
-        self._signaling_path = "mqtt"
+
+    def _requires_http_token(self) -> bool:
+        """Match ordinary connect_v3 token selection, never a timeout retry."""
+        token = self._native_config.p2p_config
+        session = token.get("session", {})
+        session = session if isinstance(session, dict) else {}
+        skill = token.get("skill", session.get("skill", {}))
+        cloud = skill.get("cloudP2P", 0) if isinstance(skill, dict) else 0
+        expiry = token.get("expire", session.get("expire", 0))
+        return (type(cloud) is int and cloud != 0) or type(expiry) is not int or expiry <= int(time.time())
+
+    async def _initialize_http_offer(self, trace_id: str) -> None:
+        """Run native state zero once, before the ordinary MQTT offer state."""
+        if self._http_initialized:
+            return
+        if not callable(self._call_api):
+            raise NativeRelayPlaybackError("Native initial HTTP offer gateway is unavailable")
+        device_id = self._native_config.dev_id
+        local = self._local
+        session_id = local.session_id
+        offer = build_offer(self._uid, session_id, int(time.time()),
+                            local.ice_ufrag, local.ice_password, local.aes_key)
+        message = {
+            "header": {
+                "from": self._uid, "to": device_id,
+                "sessionid": session_id, "moto_id": "",
+                "type": "offer", "trace_id": trace_id,
+                "is_pre": 0, "p2p_skill": 1635,
+            },
+            # Discarded/expired app tokens are not installed into state zero.
+            # The native builder omits its empty token/relay/log fields.
+            "msg": {"sdp": offer.sdp},
+        }
+        body = {"api": "thing.m.rtc.session.offer_1.0", "devId": device_id,
+                "msg": json.dumps(message, separators=(",", ":"))}
+        # The app already listens to account MQTT while native HTTP callbacks
+        # run. Subscribe first so a fast answer cannot be lost.
+        await self._connect_mqtt(session_id)
+        # Joining cancellation avoids a detached gateway request overlapping
+        # the next serialized camera command.
+        task = asyncio.create_task(asyncio.to_thread(
+            self._call_api, "thing.m.rtc.session.offer", "1.0", body, {}
+        ))
+        self._signaling_path = "http-init"
+        try:
+            async with asyncio.timeout(_HTTP_TOKEN_TIMEOUT_SECONDS):
+                result = await asyncio.shield(task)
+        except (asyncio.CancelledError, TimeoutError) as error:
+            with suppress(Exception):
+                await task
+            if isinstance(error, TimeoutError):
+                raise NativeRelayPlaybackError("Native initial HTTP offer timed out") from error
+            raise
+        if not isinstance(result, dict) or not isinstance(result.get("p2pConfig"), dict):
+            raise NativeRelayPlaybackError("Native HTTP offer returned no P2P configuration")
+        token = result["p2pConfig"]
+        remote = token.get("session")
+        if not isinstance(remote, dict) or remote.get("sessionId") != session_id:
+            raise NativeRelayPlaybackError("Native HTTP offer returned a different session")
+        if token.get("isCloudSession"):
+            raise NativeRelayPlaybackError("Native HTTP offer requires a cloud media session; relay is disabled")
+        merged = {**self._native_config.p2p_config, **token,
+                  "session": {**self._native_config.p2p_config.get("session", {}), **remote}}
+        info = json.loads(self._native_config.config_json)
+        info["p2pConfig"] = merged
+        updated = replace(self._native_config, token=json.dumps(merged), config_json=json.dumps(info))
+        # The local offer already committed these ICE/media credentials.
+        self._stream_config = _stream_config(updated, local)
+        self._native_config = updated
+        self._offer = offer
+        self._http_initialized = True
+        self._http_trace_id = trace_id
+        if isinstance(self._moto, MotoClient):
+            self._moto.configure_offer_metadata(
+                moto_id=self._stream_config.moto_id,
+                security_level=self._native_config.p2p_security_level,
+            )
 
     async def query_recordings(self, day: date) -> NativeV4CatalogPage:
         """Query one recording day on authenticated conversation zero."""
@@ -403,6 +565,18 @@ class NativeRelayPlaybackSession:
                 raise NativeRelayPlaybackError(
                     f"Camera returned an invalid catalog reply: {err}"
                 ) from err
+
+    async def query_recording_days(self, month: date) -> list[date]:
+        """Query one month bitmap on the same serialized metadata session."""
+        self._require_connected()
+        if self._playback_started:
+            raise NativeRelayPlaybackError("Recording month cannot be queried during playback")
+        request_id = self._allocate_request_id()
+        self._send_control(encode_recording_month_request(request_id=request_id, channel=0, month=month))
+        while True:
+            command = await self._receive_or_transport_failure(self._control_messages)
+            if command.request_id == request_id:
+                return decode_recording_month_reply(command, request_id=request_id, month=month)
 
     async def query_event_recordings(self, day: date) -> NativeV4CatalogPage:
         """Query Smart Life's capability-gated event timeline."""
@@ -657,40 +831,67 @@ class NativeRelayPlaybackSession:
 
     async def close(self) -> None:
         """Close every transport once and release the camera-side session."""
-        if self._closed:
+        if self._closed and self._session is None and self._moto is None and self._ice is None and not self._candidate_tasks:
             return
         if self._connected and self._playback_started:
             with suppress(Exception):
                 await _bounded_cleanup(self.stop())
         self._closed = True
         self._connected = False
+        failures = []
         for task in list(self._candidate_tasks):
             task.cancel()
         if self._candidate_tasks:
-            with suppress(Exception):
-                await _bounded_cleanup(
+            try:
+                finished = await _bounded_cleanup(
                     asyncio.gather(*self._candidate_tasks, return_exceptions=True)
                 )
-        self._candidate_tasks.clear()
+                if not finished:
+                    failures.append("candidate tasks timed out")
+            except Exception:
+                failures.append("candidate tasks failed")
+        self._candidate_tasks = {task for task in self._candidate_tasks if not task.done()}
         if self._answer is not None and not self._answer.done():
             self._answer.cancel()
+        elif self._answer is not None and not self._answer.cancelled():
+            self._answer.exception()
         if self._ice is not None:
-            self._ice.close()
-            self._ice = None
-        session, self._session = self._session, None
+            try:
+                self._ice.close()
+            except Exception:
+                failures.append("ICE close failed")
+            else:
+                self._ice = None
+        session = self._session
         if session is not None:
-            with suppress(Exception):
-                await _bounded_cleanup(session.async_close())
-        moto, self._moto = self._moto, None
+            try:
+                if await _bounded_cleanup(session.async_close()):
+                    self._session = None
+                else:
+                    failures.append("direct session close timed out")
+            except Exception:
+                failures.append("direct session close failed")
+        moto = self._moto
         if moto is not None:
-            with suppress(TuyaIpcP2pError):
+            # A missing remote disconnect acknowledgement does not imply a
+            # leaked local socket; local close below must independently finish.
+            with suppress(Exception):
                 await _bounded_cleanup(moto.async_send_disconnect())
             await asyncio.sleep(_DISCONNECT_GRACE_SECONDS)
-            with suppress(Exception):
-                await _bounded_cleanup(moto.async_close())
+            try:
+                if await _bounded_cleanup(moto.async_close()):
+                    self._moto = None
+                else:
+                    failures.append("signaling close timed out")
+            except Exception:
+                failures.append("signaling close failed")
         self._control = None
         self._video = None
         self._audio = None
+        if failures:
+            raise NativeRelayPlaybackError(
+                "Native transport cleanup incomplete: " + ", ".join(failures)
+            )
 
     async def abort(self) -> None:
         """Drop transports when the camera will not acknowledge playback stop."""
@@ -706,7 +907,7 @@ class NativeRelayPlaybackSession:
                 return await asyncio.shield(self._answer)
         except TimeoutError as err:
             raise NativeRelayPlaybackError(
-                f"Camera sent no native IMM answer ({self.transport_diagnostics})"
+                f"Timed out waiting for a usable native IMM answer ({self.transport_diagnostics})"
             ) from err
 
     def _on_answer(self, sdp: str) -> None:
@@ -716,7 +917,12 @@ class NativeRelayPlaybackSession:
         try:
             answer.set_result(parse_answer(sdp))
         except TuyaIpcP2pError as err:
-            answer.set_exception(err)
+            self._answer_status = "invalid_sdp"
+            answer.set_exception(NativeRelayPlaybackError(
+                f"Invalid native IMM answer: {err} ({self.transport_diagnostics})"
+            ))
+        else:
+            self._answer_status = "accepted"
 
     def _on_local_candidate(self, candidate: str) -> None:
         moto = self._moto
@@ -726,10 +932,13 @@ class NativeRelayPlaybackSession:
         self._candidate_tasks.add(task)
         task.add_done_callback(self._candidate_tasks.discard)
 
-    @staticmethod
-    async def _send_candidate(moto: MotoClient, candidate: str) -> None:
-        with suppress(TuyaIpcP2pError):
+    async def _send_candidate(self, moto: MotoClient | Lan302Client, candidate: str) -> None:
+        try:
             await moto.async_send_candidate(candidate)
+        except NativeLanSignalError:
+            self._on_signaling_failure("candidate send failed", transport="LAN")
+        except TuyaIpcP2pError:
+            pass
 
     def _on_remote_candidate(self, candidate: str) -> None:
         del candidate
@@ -738,6 +947,12 @@ class NativeRelayPlaybackSession:
         error = NativeRelayPlaybackError(
             f"Camera refused native session (close_reason={close_reason})"
         )
+        if self._answer is not None and not self._answer.done():
+            self._answer.set_exception(error)
+        self._fail_transport(error)
+
+    def _on_signaling_failure(self, reason: str, *, transport: str = "MQTT") -> None:
+        error = NativeRelayPlaybackError(f"Native {transport} signaling stopped ({reason})")
         if self._answer is not None and not self._answer.done():
             self._answer.set_exception(error)
         self._fail_transport(error)
@@ -802,7 +1017,7 @@ class NativeRelayPlaybackSession:
         if conversation not in self._raw_media_samples:
             self._raw_media_samples[conversation] = (
                 len(plaintext),
-                plaintext[:64].hex(),
+                "",
             )
         for packet in packets:
             self._media_stream_packets[packet.stream_id] = (
@@ -821,34 +1036,45 @@ class NativeRelayPlaybackSession:
             self._rtp_packets[key] = self._rtp_packets.get(key, 0) + 1
             if (
                 conversation == _AUDIO_CONVERSATION
-                and rtp.payload_type == _G711U_RTP_PAYLOAD_TYPE
+                and rtp.payload_type in SIMPLE_AUDIO_CODECS
             ):
+                try:
+                    audio_payload = simple_audio_payload(rtp)
+                except NativeSimpleRtpError as err:
+                    self._fail_transport(NativeRelayPlaybackError(str(err)))
+                    continue
+                sample_rate, channels, bit_width = packet.audio_format_indices
+                if sample_rate >= 10 or channels >= 2 or bit_width >= 2:
+                    self._fail_transport(NativeRelayPlaybackError("Camera audio format indices are invalid"))
+                    continue
+                if rtp.payload_type == 99 and bit_width != 1:
+                    self._fail_transport(NativeRelayPlaybackError("Native PCM playback requires 16-bit camera samples"))
+                    continue
                 self._audio_frame_number += 1
+                timestamp = packet.camera_timestamp or rtp.timestamp
                 self._put_nowait(
                     self._media_frames,
                     NativePlaybackStreamFrame(
                         frame_type=3,
                         has_codec_info=True,
-                        payload_length=len(rtp.payload),
-                        field_8=0,
-                        field_12=rtp.timestamp,
+                        payload_length=len(audio_payload),
+                        field_8=timestamp >> 32,
+                        field_12=timestamp & 0xFFFFFFFF,
                         field_16=0,
                         field_20=0,
                         field_24=0,
                         field_28=self._audio_frame_number,
                         codec_info=NativePlaybackCodecInfo(
-                            # These cameras expose payload type 99, but their
-                            # playback channel delivers the SDK's decoded
-                            # 16-bit PCM callback bytes, not G.711 codewords.
-                            codec=_NATIVE_PCM_S16LE_CODEC,
-                            sample_rate_index=0,
-                            channels_index=0,
-                            bit_width_index=1,
+                            codec=SIMPLE_AUDIO_CODECS[rtp.payload_type],
+                            sample_rate_index=sample_rate,
+                            channels_index=channels,
+                            bit_width_index=bit_width,
                             field_4=0,
                             field_5=0,
                             raw=b"",
                         ),
-                        payload=rtp.payload,
+                        payload=audio_payload,
+                        timestamp_scale=1000 if packet.camera_timestamp else (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 96000)[sample_rate],
                     ),
                     "media",
                 )
@@ -859,10 +1085,10 @@ class NativeRelayPlaybackSession:
             ):
                 continue
             try:
-                access_units = self._h264.push(rtp)
+                access_units = self._h264.push(rtp, presentation_timestamp=packet.camera_timestamp or rtp.timestamp)
             except NativeSimpleRtpError:
                 continue
-            for access_unit in access_units:
+            for access_unit, timestamp in zip(access_units, self._h264.completed_timestamps, strict=True):
                 self._video_frame_number += 1
                 self._put_nowait(
                     self._media_frames,
@@ -870,14 +1096,15 @@ class NativeRelayPlaybackSession:
                         frame_type=1,
                         has_codec_info=False,
                         payload_length=len(access_unit),
-                        field_8=0,
-                        field_12=rtp.timestamp,
+                        field_8=timestamp >> 32,
+                        field_12=timestamp & 0xFFFFFFFF,
                         field_16=0,
                         field_20=0,
                         field_24=0,
                         field_28=self._video_frame_number,
                         codec_info=None,
                         payload=access_unit,
+                        timestamp_scale=1000 if packet.camera_timestamp else 90000,
                     ),
                     "media",
                 )
@@ -990,7 +1217,7 @@ class NativeRelayPlaybackSession:
         except Exception as err:
             raise NativeRelayPlaybackError("Native IMM answer failed") from err
 
-def _stream_config(config: NativeCameraSessionConfig) -> StreamConfig:
+def _stream_config(config: NativeCameraSessionConfig, local: P2pSession) -> StreamConfig:
     try:
         camera_info = json.loads(config.config_json)
     except json.JSONDecodeError as err:
@@ -998,7 +1225,9 @@ def _stream_config(config: NativeCameraSessionConfig) -> StreamConfig:
     if not isinstance(camera_info, dict):
         raise NativeRelayPlaybackError("Camera config is not an object")
     try:
-        return StreamConfig.from_json(camera_info, config.dev_id, config.local_key)
+        return StreamConfig.from_json(
+            camera_info, config.dev_id, config.local_key, local_session=local,
+        )
     except (KeyError, TypeError, ValueError, TuyaIpcP2pError) as err:
         raise NativeRelayPlaybackError(
             "Camera config has no complete native IMM playback session"

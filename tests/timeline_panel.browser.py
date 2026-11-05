@@ -390,8 +390,69 @@ def main() -> None:
                   };
                 }"""
             )
+            redraw_player_report = page.evaluate(
+                """() => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  panel.afterRender = () => {};
+                  panel.selectedClip = {...panel.recordingRanges[0], signed_playback_url: '/fixture'};
+                  panel.render();
+                  const player = panel.shadowRoot.querySelector('.camera-player');
+                  let disconnected = 0;
+                  customElements.define('player-connection-probe', class extends HTMLElement {
+                    disconnectedCallback() { disconnected++; }
+                  });
+                  player.append(document.createElement('player-connection-probe'));
+                  panel.playerRevision = panel.playbackRevision;
+                  panel.calendarOpen = !panel.calendarOpen;
+                  panel.render();
+                  return {same: panel.shadowRoot.querySelector('.camera-player') === player,
+                    connected: player.isConnected, disconnected};
+                }"""
+            )
+            calendar_race_report = page.evaluate(
+                """async () => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  panel.stopPlayback();
+                  panel.selectedClip = null;
+                  panel.selectedCamera = 'fixture';
+                  panel.selectedAccount = 'fixture-account';
+                  panel.selectedDate = '2026-11-03';
+                  panel.calendarMonth = '2026-11';
+                  panel.calendarOpen = true;
+                  panel.loading = false;
+                  const base = {on_demand:true, entry_id:'fixture-account',
+                    selected_date:'2026-11-03', stats:{cache_only:false},
+                    cameras:[{dev_id:'fixture',name:'Fixture',dates:['2026-11-01','2026-11-03'],
+                      clips:[],recording_ranges:[],playback_mode:'timeline'}]};
+                  panel.data = structuredClone(base);
+                  let complete;
+                  const delayed = new Promise(resolve => {complete = resolve;});
+                  const calls = [];
+                  panel._hass.callApi = async (method, path) => {
+                    calls.push(path);
+                    if (calls.length === 1) await delayed;
+                    const reply = structuredClone(base);
+                    reply.selected_date = new URLSearchParams(path.split('?')[1]).get('date');
+                    return reply;
+                  };
+                  panel.render();
+                  const inFlight = panel.loadData({quiet:true});
+                  panel.shadowRoot.querySelector('[data-date="2026-11-01"]').click();
+                  complete();
+                  await inFlight;
+                  await new Promise(resolve => setTimeout(resolve,100));
+                  return {selected:panel.selectedDate, calls,
+                    responseDate:panel.data.selected_date, loading:panel.loading};
+                }"""
+            )
             browser.close()
         assert not errors, errors
+        assert calendar_race_report["selected"] == "2026-11-01", calendar_race_report
+        assert calendar_race_report["responseDate"] == "2026-11-01", calendar_race_report
+        assert len(calendar_race_report["calls"]) == 2, calendar_race_report
+        assert "date=2026-11-01" in calendar_race_report["calls"][1], calendar_race_report
+        assert not calendar_race_report["loading"], calendar_race_report
+        assert redraw_player_report == {"same": True, "connected": True, "disconnected": 0}
         assert report["timelineItems"] == 2
         assert persistent_player == {
             "samePlayer": True,

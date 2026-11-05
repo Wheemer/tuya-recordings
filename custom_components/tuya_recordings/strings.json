@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Tuya Recordings",
-        "description": "Set up SD-card recording access for cameras already available through the official Tuya integration. The selected account app supplies the native camera credentials.",
+        "description": "Set up SD-card recording access for cameras in Smart Life or Tuya Smart. The selected app supplies camera discovery and native credentials through QR authorization.",
         "data": {
           "region": "Account region",
           "app_profile": "Account app",
@@ -33,13 +33,13 @@
     },
     "error": {
       "cannot_connect": "Could not connect to the selected Tuya region.",
-      "tuya_required": "Install and configure the official Tuya integration first.",
       "path_not_absolute": "Use an absolute Home Assistant path, such as /media/tuya_recordings.",
       "path_not_allowed": "Use a private storage folder under /media. Do not use /media itself, /config, or /config/www.",
       "native_authorization_start_failed": "Could not start camera authorization. No retry was made.",
       "invalid_value": "Enter a value within the displayed range."
     },
     "abort": {
+      "wrong_account": "Sign in to the same account used when this integration was configured. The existing account has not been changed.",
       "already_configured": "This Tuya account is already configured.",
       "native_authorization_missing": "Camera authorization was not started. Restart setup.",
       "native_authorization_failed": "Camera authorization was not approved or expired. Restart setup to create one new code."
@@ -51,7 +51,7 @@
         "title": "Tuya Recordings options",
         "description": "The SD-card catalog updates automatically. When pre-cache recordings is enabled, cached clips receive local thumbnails. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
         "data": {
-          "lookback_days": "Days to check (0 = all)",
+          "lookback_days": "Days to check (0 = automatic)",
           "catalog_sync_minutes": "Background catalog interval (minutes)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
@@ -60,7 +60,7 @@
           "media_storage_path": "Private video storage path"
         },
         "data_description": {
-          "lookback_days": "Use 0 to scan until the camera reports no older recordings for several days.",
+          "lookback_days": "Use 0 to scan up to 31 days, stopping after 7 consecutive empty days. This does not enumerate the entire SD card.",
           "catalog_sync_minutes": "How often to refresh SD-card recording lists while local video caching is off. Playback pauses this work automatically. Use a longer interval for cameras that permit only one P2P session.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
@@ -76,10 +76,5 @@
     },
     "error": {}
   },
-  "issues": {
-    "tuya_required": {
-      "title": "Official Tuya integration required",
-      "description": "Tuya Recordings requires the official Tuya integration to be installed and configured for the same Tuya account."
-    }
-  }
+  "issues": {}
 }

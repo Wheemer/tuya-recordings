@@ -8,8 +8,14 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_APP_PROFILE,
+    CONF_NATIVE_APP_SESSION,
+    CONF_DEVICE_LOCAL_KEYS,
+    CONF_DEVICE_PROTOCOL_VERSIONS,
+    CONF_DEVICE_INVENTORY,
     CONF_CATALOG_SYNC_MINUTES,
     CONF_CLOUD_ACTIVITY_PAUSED,
     CONF_LOOKBACK_DAYS,
@@ -52,6 +58,7 @@ from .lib.catalog import (
     next_catalog_retry_after,
 )
 from .lib.commands import (
+    CAMERA_COMMANDS,
     CameraWorkBusy,
     CameraWorkCancelled,
     Cancellation,
@@ -63,9 +70,9 @@ from .lib.native_playback import native_playback_request
 from .lib.native_session import NativePlaybackRequest
 from .lib.native_setup import build_recordings_backend
 from .lib.storage import write_catalog
+from .lib.native_gateway import NativeAppGatewayClient, NativeGatewayAuthError
 
 CACHE_TTL = timedelta(minutes=10)
-STALE_CACHE_TTL = timedelta(hours=12)
 RECORDING_SCAN_MAX_DAYS = 31
 RECORDING_SCAN_EMPTY_DAY_STOP = 7
 RECENT_RECORDING_SCAN_DAYS = 2
@@ -74,7 +81,7 @@ THUMBNAIL_CAMERA_FAILURE_COOLDOWN = 5 * 60
 THUMBNAIL_FAILURE_CACHE_LIMIT = 1024
 MEDIA_FAILURE_CACHE_VERSION = 2
 MEDIA_FAILURE_COOLDOWN = 15 * 60
-MEDIA_MAX_ATTEMPTS_PER_CAMERA = 1
+MEDIA_MAX_ATTEMPTS_PER_CAMERA = 1  # Consecutive failures, not successful downloads.
 MEDIA_SYNC_INTER_ATTEMPT_DELAY = 0.5
 MEDIA_SYNC_MIN_CLIP_AGE = 2 * 60
 MEDIA_SYNC_CAMERA_PASS_TIMEOUT = 2 * 60
@@ -135,12 +142,14 @@ class TuyaRecordingsClient:
         self._media_storage_path_override = media_storage_path
         self.update_options(entry_data)
         self._cache_path = cache_path
+        self._cache_write_lock = threading.RLock()
         self._cache_mtime_ns: int | None = None
         self._camera_index_cache: dict[str, Any] | None = None
         self._camera_index_cache_until = datetime.min.replace(tzinfo=timezone.utc)
         self._refresh_lock = threading.Lock()
         self._browse_devices_until = 0.0
         self._browse_days: dict[tuple[str, str], float] = {}
+        self._browse_months: dict[tuple[str, str], float] = {}
         self._browse_failures: dict[tuple[str, str], str] = {}
         self._browse_discovery_error = ""
         self._thumbnail_autofill_lock = threading.Lock()
@@ -325,7 +334,7 @@ class TuyaRecordingsClient:
             if error and not clips and (previous := previous_by_dev_id.get(str(dev_id))):
                 clips = list(previous.get("clips") or [])
             elif previous := previous_by_dev_id.get(str(dev_id)):
-                clips = _merge_cached_clips(clips, previous.get("clips") or [])
+                clips = self._reconcile_catalog(dev_id, clips, previous.get("clips") or [], days_checked)
             cameras.append(
                 {
                     "devId": dev_id,
@@ -334,6 +343,7 @@ class TuyaRecordingsClient:
                     "productId": device.get("productId") or device.get("product_id") or device.get("productKey"),
                     "online": device.get("online"),
                     "clips": clips,
+                    "recordingMonths": previous_by_dev_id.get(str(dev_id), {}).get("recordingMonths", {}),
                     "bridgeStatus": {
                         "error": error,
                         "listedCount": len(clips),
@@ -413,6 +423,35 @@ class TuyaRecordingsClient:
         with camera_work_scope(self.background_work_cancellation()):
             return self._browse_recordings(dev_id, day)
 
+    def browse_month_refresh_due(self, dev_id: str, month: date) -> bool:
+        return (not self.cloud_activity_paused and not self.background_work_paused
+                and time.monotonic() >= self._browse_months.get((dev_id, month.strftime("%Y-%m")), 0))
+
+    def browse_recording_month(self, dev_id: str, month: date) -> dict[str, Any]:
+        """Read one APK month bitmap, never scan every day to paint a calendar."""
+        self._raise_if_cloud_paused()
+        cancellation = self.background_work_cancellation()
+        with self._refresh_lock, camera_work_scope(cancellation):
+            index = self._camera_index_cache or {"cameras": []}
+            camera = next((item for item in index.get("cameras", []) if item.get("devId") == dev_id), None)
+            if camera is None:
+                raise ValueError("Unknown recording camera")
+            if not self.browse_month_refresh_due(dev_id, month):
+                return index
+            key = (dev_id, month.strftime("%Y-%m"))
+            # Throttle actual failures without treating them as fresh results.
+            self._browse_months.pop(key, None)
+            self._browse_months[key] = time.monotonic() + 30
+            if len(self._browse_months) > 64:
+                self._browse_months.pop(next(iter(self._browse_months)))
+            days = self._recordings_backend.recording_days_for_month(dev_id, month, cancel_event=cancellation)
+            months = dict(camera.get("recordingMonths") or {})
+            months[key[1]] = [value.isoformat() for value in days]
+            camera["recordingMonths"] = months
+            self._store_cache(index, self._camera_index_cache_until - datetime.now(timezone.utc))
+            self._browse_months[key] = time.monotonic() + 300
+            return index
+
     def browse_refresh_due(self, dev_id: str = "", day: date | None = None) -> bool:
         """Return whether an on-demand browse may contact a camera now."""
         if self.cloud_activity_paused or self.background_work_paused:
@@ -449,7 +488,7 @@ class TuyaRecordingsClient:
                     {**previous.get(self._device_id(device), {}),
                      "devId": self._device_id(device),
                      "name": device.get("name") or device.get("deviceName") or self._device_id(device),
-                     "online": bool(device.get("online")),
+                     "online": device.get("online"),
                      "clips": list(previous.get(self._device_id(device), {}).get("clips", []))}
                     for device in candidates if self._device_id(device)
                 ]}
@@ -466,7 +505,7 @@ class TuyaRecordingsClient:
                 key = (dev_id, day.isoformat())
                 if now < self._browse_days.get(key, 0) and key in self._browse_failures:
                     raise RuntimeError(self._browse_failures[key])
-                if camera.get("online") and now >= self._browse_days.get(key, 0):
+                if camera.get("online") is not False and now >= self._browse_days.get(key, 0):
                     self._browse_days[key] = now + 30
                     if len(self._browse_days) > 64:
                         oldest = next(iter(self._browse_days))
@@ -479,17 +518,7 @@ class TuyaRecordingsClient:
                         raise
                     self._browse_failures.pop(key, None)
                     previous_clips = list(camera.get("clips", []))
-                    previous_day_clips = [
-                        clip
-                        for clip in previous_clips
-                        if clip.get("date") == day.isoformat()
-                    ]
-                    if clips or not previous_day_clips:
-                        camera["clips"] = [
-                            clip
-                            for clip in previous_clips
-                            if clip.get("date") != day.isoformat()
-                        ] + clips
+                    camera["clips"] = self._reconcile_catalog(dev_id, clips, previous_clips, [day.isoformat()])
                     refreshed_at = datetime.now(timezone.utc).isoformat()
                     catalog_days = dict(camera.get("catalogDays") or {})
                     catalog_days[day.isoformat()] = refreshed_at
@@ -609,7 +638,7 @@ class TuyaRecordingsClient:
         self._raise_if_cloud_paused()
         if not self._native_clip_playback_available:
             raise RuntimeError("Smart Life APK-native recording catalog is not available")
-        today = date.today()
+        today = dt_util.now().date()
         all_clips: list[dict[str, Any]] = []
         days_checked: list[str] = []
         empty_days = 0
@@ -711,7 +740,7 @@ class TuyaRecordingsClient:
         try:
             with camera_work_scope(cancellation) as active:
                 now = datetime.now(timezone.utc)
-                today = date.today()
+                today = dt_util.now().date()
                 devices = self._camera_devices()
                 previous = {str(camera.get("devId")): camera for camera in (self._camera_index_cache or {}).get("cameras", [])}
                 cameras = []
@@ -733,7 +762,7 @@ class TuyaRecordingsClient:
                         clips = self._recordings_for_day(dev_id, day)
                         if active.is_set():
                             raise CameraWorkCancelled("Recording catalog pass cancelled")
-                        camera["clips"] = _merge_cached_clips(clips, camera["clips"])
+                        camera["clips"] = self._reconcile_catalog(dev_id, clips, camera["clips"], [day.isoformat()])
                         saved_days = camera.get("catalogDays")
                         scanned = dict(saved_days) if isinstance(saved_days, dict) else {}
                         scanned[day.isoformat()] = now.isoformat()
@@ -781,7 +810,7 @@ class TuyaRecordingsClient:
             if camera.get("devId")
         }
         cameras: list[dict[str, Any]] = []
-        today = date.today()
+        today = dt_util.now().date()
         recent_days = [today - timedelta(days=offset) for offset in range(RECENT_RECORDING_SCAN_DAYS)]
         generated_at = now.isoformat()
 
@@ -819,7 +848,7 @@ class TuyaRecordingsClient:
                             days_checked.append(day.isoformat())
                             clips.extend(day_clips)
                         remaining_days = remaining_days[len(queried):]
-                    clips = _merge_cached_clips(clips, previous_clips)
+                    clips = self._reconcile_catalog(dev_id, clips, previous_clips, days_checked)
                 except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
                     raise
                 except TuyaRecordingsApiError as exc:
@@ -1181,7 +1210,6 @@ class TuyaRecordingsClient:
                 if attempts and MEDIA_SYNC_INTER_ATTEMPT_DELAY > 0:
                     time.sleep(MEDIA_SYNC_INTER_ATTEMPT_DELAY)
                 check_cancelled()
-                attempts[dev_id] = attempts.get(dev_id, 0) + 1
                 self._set_media_sync_status("running", **{key: result[key] for key in ("downloaded", "skipped", "failed")},
                                            current={"dev_id": dev_id, "start": start, "end": end,
                                                     "position": position, "total": len(desired_clips)})
@@ -1192,6 +1220,7 @@ class TuyaRecordingsClient:
                     raise
                 except Exception as exc:
                     check_cancelled()
+                    attempts[dev_id] = attempts.get(dev_id, 0) + 1
                     self._media_failures[key] = time.time()
                     failures_changed = True
                     result["failed"] += 1
@@ -1458,6 +1487,8 @@ class TuyaRecordingsClient:
         try:
             stat = self._cache_path.stat()
             payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
             index = payload.get("index")
             expires_at = _parse_datetime(payload.get("expiresAt"))
             media_failures = payload.get("mediaFailures") if payload.get("mediaFailureVersion") == MEDIA_FAILURE_CACHE_VERSION else None
@@ -1472,6 +1503,15 @@ class TuyaRecordingsClient:
             self._media_failures = _parse_media_failures(media_failures)
 
     def _store_cache(self, index: dict[str, Any], ttl: timedelta) -> None:
+        with self._cache_write_lock:
+            self._store_cache_locked(index, ttl)
+
+    def _store_cache_locked(self, index: dict[str, Any], ttl: timedelta) -> None:
+        previous_months = {camera.get("devId"): camera.get("recordingMonths")
+                           for camera in (self._camera_index_cache or {}).get("cameras", [])}
+        for camera in index.get("cameras", []):
+            if "recordingMonths" not in camera and isinstance(months := previous_months.get(camera.get("devId")), dict):
+                camera["recordingMonths"] = months
         self._camera_index_cache = index
         self._camera_index_cache_until = datetime.now(timezone.utc) + ttl
         if self._cache_path is None:
@@ -1490,19 +1530,10 @@ class TuyaRecordingsClient:
             pass
 
     def _store_media_failures(self) -> None:
-        if self._cache_path is None:
-            return
-        try:
-            payload = json.loads(self._cache_path.read_text(encoding="utf-8")) if self._cache_path.exists() else {}
-            if not isinstance(payload, dict):
-                payload = {}
-            payload["mediaFailureVersion"] = MEDIA_FAILURE_CACHE_VERSION
-            payload["mediaFailures"] = _serialize_media_failures(self._media_failures)
-            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            write_catalog(self._cache_path, payload)
-            self._cache_mtime_ns = self._cache_path.stat().st_mtime_ns
-        except (OSError, ValueError, TypeError):
-            pass
+        with self._cache_write_lock:
+            if self._camera_index_cache is not None:
+                self._store_cache_locked(self._camera_index_cache,
+                    self._camera_index_cache_until - datetime.now(timezone.utc))
 
     def _load_cache_if_changed(self) -> None:
         if self._cache_path is None or not self._cache_path.exists():
@@ -1515,28 +1546,16 @@ class TuyaRecordingsClient:
             self.load_cache()
 
     def _stale_cache(self, now: datetime, reason: str) -> dict[str, Any]:
-        if not self._camera_index_cache:
-            return {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "warning": reason, "cameras": []}
-        stale = dict(self._camera_index_cache)
-        stale["cached"] = True
-        stale["stale"] = True
-        stale["warning"] = reason
-        self._camera_index_cache = stale
-        self._camera_index_cache_until = max(self._camera_index_cache_until, now + STALE_CACHE_TTL)
-        stale["cacheExpiresAt"] = self._camera_index_cache_until.isoformat()
-        if self._cache_path is not None:
-            try:
-                self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-                write_catalog(self._cache_path, {
-                    "expiresAt": self._camera_index_cache_until.isoformat(),
-                    "index": stale,
-                    "mediaFailureVersion": MEDIA_FAILURE_CACHE_VERSION,
-                    "mediaFailures": _serialize_media_failures(self._media_failures),
-                })
-                self._cache_mtime_ns = self._cache_path.stat().st_mtime_ns
-            except OSError:
-                pass
-        return stale
+        with self._cache_write_lock:
+            if not self._camera_index_cache:
+                return {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "warning": reason, "cameras": []}
+            stale = {**self._camera_index_cache, "cached": True, "stale": True, "warning": reason}
+            # Failure/busy responses must not renew the catalog's freshness.
+            expiry = self._camera_index_cache_until
+            stale["cacheExpiresAt"] = expiry.isoformat()
+            self._store_cache_locked(stale, expiry - datetime.now(timezone.utc))
+            self._camera_index_cache_until = expiry
+            return stale
 
     def set_camera_inventory(
         self, cameras: dict[str, str], *, source: str = "native_app_inventory"
@@ -1549,15 +1568,59 @@ class TuyaRecordingsClient:
             self._camera_index_cache_until = datetime.min.replace(tzinfo=timezone.utc)
             self._browse_devices_until = 0.0
 
+    def refresh_inventory(self, entry_data: dict[str, Any]) -> dict[str, Any]:
+        """Refresh account inventory/rotated keys only on explicit user refresh."""
+        self._raise_if_cloud_paused()
+        cancellation = self.background_work_cancellation()
+        with self._refresh_lock, CAMERA_COMMANDS.slot(cancellation):
+            session = entry_data[CONF_NATIVE_APP_SESSION]
+            gateway = NativeAppGatewayClient(region=self.region,
+                app_profile_id=entry_data.get(CONF_APP_PROFILE, "smart_life"),
+                device_fingerprint=session["device_fingerprint"])
+            try:
+                keys, protocols, devices = gateway.device_connection_inventory_data(session)
+            except NativeGatewayAuthError as err:
+                raise RecordingBackendAuthError("Camera account authorization expired") from err
+            finally:
+                gateway.session.close()
+            if cancellation.is_set():
+                raise CameraWorkCancelled("Inventory refresh cancelled")
+            updates = {CONF_DEVICE_LOCAL_KEYS: keys, CONF_DEVICE_PROTOCOL_VERSIONS: protocols,
+                       CONF_DEVICE_INVENTORY: camera_inventory_from_native_devices(devices)}
+            replacement = build_recordings_backend({**entry_data, **updates})
+            try:
+                self._recordings_backend.close()
+            except BaseException:
+                replacement.close()
+                raise
+            self._backend = replacement
+            self.set_camera_inventory(updates[CONF_DEVICE_INVENTORY])
+            return updates
+
     def _camera_devices(self) -> list[dict[str, Any]]:
         self._raise_if_cloud_paused()
         inventory = self._camera_inventory
         if not inventory:
             return []
         return [
-            {"devId": dev_id, "name": name, "online": True}
+            {"devId": dev_id, "name": name, "online": None}
             for dev_id, name in inventory.items()
         ]
+
+    def _reconcile_catalog(self, dev_id, fresh, previous, scanned_days):
+        """Replace successful remote days without deleting retained local clips."""
+        days = set(scanned_days)
+        fresh_keys = {(clip.get("start"), clip.get("end")) for clip in fresh}
+        retained = []
+        for clip in previous:
+            if clip.get("date") not in days or (clip.get("start"), clip.get("end")) in fresh_keys:
+                retained.append(clip)
+            elif self.clip_ready(dev_id, int(clip.get("start") or 0), int(clip.get("end") or 0)):
+                retained.append({**clip, "on_camera": False})
+        return _merge_cached_clips(
+            [{key: value for key, value in clip.items() if key != "on_camera"} for clip in fresh],
+            retained,
+        )
 
     def _camera_candidates(self, devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self._camera_inventory is not None:

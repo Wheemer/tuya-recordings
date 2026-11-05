@@ -118,8 +118,9 @@ Use a private `/media` location for cached files. Do not use `/config/www`.
 
 After setup, **Configure** on the Tuya Recordings integration provides:
 
-- **Days to check**: `0` scans all discoverable SD-card history; a higher value
-  limits catalog history.
+- **Days to check**: `0` scans up to 31 days and stops after 7 consecutive
+  empty days. It does not enumerate the entire SD card. A higher value limits
+  the scan to that number of days, up to 31.
 - **Background catalog interval**: 15 minutes to 24 hours for timeline mode.
 - **Pre-cache recordings** and **Sync window in hours** for local MP4 caching.
   A window of `0` means every discovered recording.
@@ -162,6 +163,11 @@ space for every discovered recording.
 ## Camera Detection Entities
 
 For each supported Tuya camera notification source, Tuya Recordings creates:
+
+These notification entities need a matching camera notification source from
+the official Tuya integration. QR-authorized SD playback and discovery work
+independently; without an official notification source these entities are not
+created. Sources loaded after Tuya Recordings are discovered automatically.
 
 - **Camera events**: a point-in-time event entity. It records `detected` or
   `cleared`, the original `tuya_event_code`, and camera-supplied metadata.
