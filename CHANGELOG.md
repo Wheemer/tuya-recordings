@@ -1,6 +1,6 @@
 # Changelog
 
-## Tuya Recordings v0.4.11-2 (2026-11-05)
+## Tuya Recordings v0.4.11 (2026-11-05)
 
 ### Fixes
 
