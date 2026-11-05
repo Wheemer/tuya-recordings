@@ -106,7 +106,6 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         live_playback_available = (
             not cloud_activity_paused
             and _uncached_playback_available(client)
-            and camera.get("online") is not False
         )
         clips = []
         recording_ranges = []
@@ -560,6 +559,7 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
             data["on_demand"] = True
             data["selected_date"] = day.isoformat()
             data["catalog_refresh_pending"] = refresh_pending
+            data["catalog_refresh_failed"] = client.browse_refresh_failed(dev_id)
         else:
             data = await self.hass.async_add_executor_job(self._build_data, client)
         entries = _account_clients(self.hass)

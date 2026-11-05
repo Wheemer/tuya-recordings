@@ -420,7 +420,7 @@ def main() -> None:
                   panel.calendarMonth = '2026-11';
                   panel.calendarOpen = true;
                   panel.loading = false;
-                  const base = {on_demand:true, entry_id:'fixture-account',
+                  const base = {on_demand:true, entry_id:'fixture-account', catalog_refresh_failed:true,
                     selected_date:'2026-11-03', stats:{cache_only:false},
                     cameras:[{dev_id:'fixture',name:'Fixture',dates:['2026-11-01','2026-11-03'],
                       clips:[],recording_ranges:[],playback_mode:'timeline'}]};
@@ -442,7 +442,9 @@ def main() -> None:
                   await inFlight;
                   await new Promise(resolve => setTimeout(resolve,100));
                   return {selected:panel.selectedDate, calls,
-                    responseDate:panel.data.selected_date, loading:panel.loading};
+                    responseDate:panel.data.selected_date, loading:panel.loading,
+                    status:panel.shadowRoot.querySelector('.status').textContent,
+                    dates:panel.data.cameras[0].dates};
                 }"""
             )
             browser.close()
@@ -452,6 +454,8 @@ def main() -> None:
         assert len(calendar_race_report["calls"]) == 2, calendar_race_report
         assert "date=2026-11-01" in calendar_race_report["calls"][1], calendar_race_report
         assert not calendar_race_report["loading"], calendar_race_report
+        assert "Could not refresh recordings" in calendar_race_report["status"]
+        assert calendar_race_report["dates"] == ["2026-11-03", "2026-11-01"]
         assert redraw_player_report == {"same": True, "connected": True, "disconnected": 0}
         assert report["timelineItems"] == 2
         assert persistent_player == {
