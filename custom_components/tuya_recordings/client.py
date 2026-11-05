@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -150,7 +151,7 @@ class TuyaRecordingsClient:
         self._browse_devices_until = 0.0
         self._browse_days: dict[tuple[str, str], float] = {}
         self._browse_months: dict[tuple[str, str], float] = {}
-        self._browse_failures: dict[tuple[str, str], str] = {}
+        self._browse_camera_failures: dict[str, float] = {}
         self._browse_discovery_error = ""
         self._thumbnail_autofill_lock = threading.Lock()
         self._thumbnail_create_lock = threading.Lock()
@@ -425,7 +426,28 @@ class TuyaRecordingsClient:
 
     def browse_month_refresh_due(self, dev_id: str, month: date) -> bool:
         return (not self.cloud_activity_paused and not self.background_work_paused
+                and time.monotonic() >= self._browse_camera_failures.get(dev_id, 0)
                 and time.monotonic() >= self._browse_months.get((dev_id, month.strftime("%Y-%m")), 0))
+
+    def browse_refresh_failed(self, dev_id: str) -> bool:
+        """Expose a sanitized status, never the raw backend exception."""
+        return dev_id in self._browse_camera_failures if dev_id else bool(self._browse_discovery_error)
+
+    @contextmanager
+    def _browse_camera_query(self, dev_id: str):
+        """Give a failed camera a quiet period across day and month requests."""
+        try:
+            yield
+        except (CameraWorkBusy, CameraWorkCancelled):
+            raise
+        except Exception:
+            self._browse_camera_failures.pop(dev_id, None)
+            self._browse_camera_failures[dev_id] = time.monotonic() + 30
+            if len(self._browse_camera_failures) > 64:
+                self._browse_camera_failures.pop(next(iter(self._browse_camera_failures)))
+            raise
+        else:
+            self._browse_camera_failures.pop(dev_id, None)
 
     def browse_recording_month(self, dev_id: str, month: date) -> dict[str, Any]:
         """Read one APK month bitmap, never scan every day to paint a calendar."""
@@ -444,7 +466,8 @@ class TuyaRecordingsClient:
             self._browse_months[key] = time.monotonic() + 30
             if len(self._browse_months) > 64:
                 self._browse_months.pop(next(iter(self._browse_months)))
-            days = self._recordings_backend.recording_days_for_month(dev_id, month, cancel_event=cancellation)
+            with self._browse_camera_query(dev_id):
+                days = self._recordings_backend.recording_days_for_month(dev_id, month, cancel_event=cancellation)
             months = dict(camera.get("recordingMonths") or {})
             months[key[1]] = [value.isoformat() for value in days]
             camera["recordingMonths"] = months
@@ -461,7 +484,8 @@ class TuyaRecordingsClient:
             return now >= self._browse_devices_until
         if day is None:
             return False
-        return now >= self._browse_days.get((dev_id, day.isoformat()), 0)
+        return (now >= self._browse_camera_failures.get(dev_id, 0)
+                and now >= self._browse_days.get((dev_id, day.isoformat()), 0))
 
     def _browse_recordings(self, dev_id: str, day: date | None) -> dict[str, Any]:
         """Run one cancellable on-demand catalog operation."""
@@ -503,20 +527,14 @@ class TuyaRecordingsClient:
                 if camera is None:
                     raise ValueError("Unknown camera")
                 key = (dev_id, day.isoformat())
-                if now < self._browse_days.get(key, 0) and key in self._browse_failures:
-                    raise RuntimeError(self._browse_failures[key])
-                if camera.get("online") is not False and now >= self._browse_days.get(key, 0):
+                # Inventory presence is not a test of native SD reachability.
+                if self.browse_refresh_due(dev_id, day):
+                    self._browse_days.pop(key, None)
                     self._browse_days[key] = now + 30
                     if len(self._browse_days) > 64:
-                        oldest = next(iter(self._browse_days))
-                        self._browse_days.pop(oldest)
-                        self._browse_failures.pop(oldest, None)
-                    try:
+                        self._browse_days.pop(next(iter(self._browse_days)))
+                    with self._browse_camera_query(dev_id):
                         clips = self._recordings_for_day(dev_id, day)
-                    except Exception as exc:
-                        self._browse_failures[key] = str(exc)
-                        raise
-                    self._browse_failures.pop(key, None)
                     previous_clips = list(camera.get("clips", []))
                     camera["clips"] = self._reconcile_catalog(dev_id, clips, previous_clips, [day.isoformat()])
                     refreshed_at = datetime.now(timezone.utc).isoformat()

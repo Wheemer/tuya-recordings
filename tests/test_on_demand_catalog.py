@@ -68,6 +68,21 @@ def test_on_demand_day_replaces_stale_day_and_persists_catalog(tmp_path):
     assert reloaded.cached_camera_index()["cameras"][0]["clips"] == camera["clips"]
 
 
+def test_on_demand_offline_inventory_hint_does_not_block_catalog(tmp_path):
+    import time
+
+    day = date(2026, 9, 21)
+    backend = DayCatalogBackend([])
+    client = client_for_day(tmp_path, backend)
+    client._camera_index_cache = {"cameras": [{"devId": "camera", "online": False, "clips": []}]}
+    client._browse_devices_until = time.monotonic() + 300
+
+    client.browse_recordings("camera", day)
+    client.browse_recordings("camera", day)
+
+    assert backend.queries == [("camera", day)]
+
+
 def test_on_demand_day_replaces_old_rows_for_same_day(tmp_path):
     replacement = {
         "start": 1790011901,
@@ -209,3 +224,51 @@ def test_failed_month_keeps_old_calendar_and_only_applies_short_cooldown(tmp_pat
     client.browse_recording_month("camera", month)
     assert camera["recordingMonths"]["2025-01"] == ["2025-01-12"]
     assert not client.browse_month_refresh_due("camera", month)
+
+
+@pytest.mark.parametrize("first_query", ["day", "month"])
+def test_failed_catalog_query_cools_down_all_dates_for_only_that_camera(
+    tmp_path, monkeypatch, first_query,
+):
+    from custom_components.tuya_recordings import client as client_module
+
+    clock = [100.0]
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+
+    class Backend(DayCatalogBackend):
+        def recordings_for_day(self, dev_id, config, auth, day):
+            self.queries.append((dev_id, day))
+            if len(self.queries) == 1:
+                clock[0] += 25  # The cooldown starts when the connection fails.
+                raise RuntimeError("private backend details")
+            return []
+
+        def recording_days_for_month(self, dev_id, month, *, cancel_event=None):
+            return self.recordings_for_day(dev_id, {}, {}, month)
+
+    backend = Backend([])
+    client = client_for_day(tmp_path, backend)
+    client.set_camera_inventory({"camera": "Front", "other": "Back"})
+    day, month = date(2026, 9, 21), date(2026, 9, 1)
+    client.browse_recordings()
+    with pytest.raises(RuntimeError, match="private backend details"):
+        if first_query == "day":
+            client.browse_recordings("camera", day)
+        else:
+            client.browse_recording_month("camera", month)
+    other_day, other_month = date(2026, 9, 22), date(2026, 8, 1)
+    clock[0] += 6
+    assert client.browse_refresh_failed("camera") is True
+    assert client.browse_refresh_failed("other") is False
+    assert not client.browse_refresh_due("camera", other_day)
+    assert not client.browse_month_refresh_due("camera", other_month)
+    client.browse_recordings("camera", other_day)
+    client.browse_recording_month("camera", other_month)
+    assert len(backend.queries) == 1
+    assert client.browse_refresh_due("other", other_day)
+    client.browse_recordings("other", other_day)
+    assert backend.queries[-1] == ("other", other_day)
+    clock[0] += 25
+    assert client.browse_refresh_due("camera", other_day)
+    client.browse_recordings("camera", other_day)
+    assert client.browse_refresh_failed("camera") is False

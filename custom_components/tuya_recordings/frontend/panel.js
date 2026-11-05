@@ -881,7 +881,10 @@ class TuyaRecordingsPanel extends HTMLElement {
     for (const camera of data?.cameras || []) {
       if (camera.playback_mode === "timeline") {
         camera.recording_ranges = camera.recording_ranges || [];
-        camera.dates = [...new Set(camera.recording_ranges.map((item) => item.date).filter(Boolean))].sort().reverse();
+        camera.dates = [...new Set([
+          ...(camera.dates || []),
+          ...camera.recording_ranges.map((item) => item.date).filter(Boolean),
+        ])].sort().reverse();
         continue;
       }
       camera.clips = (camera.clips || []).filter(
@@ -1056,9 +1059,11 @@ class TuyaRecordingsPanel extends HTMLElement {
 
   statusText(camera, clipCount) {
     if (this.loading && !this.data) return "";
-    if (!camera) return "No camera selected";
-    const online = camera.online === true ? "online" : camera.online === false ? "offline" : "status unknown";
-    const refresh = this.data?.catalog_refresh_pending ? " • Updating recordings" : "";
+    const failed = this.data?.catalog_refresh_failed;
+    if (!camera) return failed ? "Could not refresh camera inventory" : "No camera selected";
+    const online = camera.online === true ? "online" : "status unknown";
+    const refresh = this.data?.catalog_refresh_pending ? " • Updating recordings"
+      : failed ? " • Could not refresh recordings" : "";
     return `${clipCount} recording${clipCount === 1 ? "" : "s"} • Camera ${online}${refresh}`;
   }
 

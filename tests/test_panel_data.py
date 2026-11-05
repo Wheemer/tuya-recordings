@@ -191,7 +191,8 @@ def test_build_panel_data_hides_cached_video_without_thumbnail(tmp_path):
     assert data["stats"]["latest_clip"] is None
 
 
-def test_build_panel_data_timeline_mode_exposes_ranges_without_thumbnails(tmp_path):
+@pytest.mark.parametrize("online", [True, False, None])
+def test_build_panel_data_timeline_mode_exposes_ranges_without_thumbnails(tmp_path, online):
     client = FakeClient(tmp_path)
     client.media_sync_enabled = False
     client._recordings_backend = FakePlayableBackend()
@@ -204,7 +205,7 @@ def test_build_panel_data_timeline_mode_exposes_ranges_without_thumbnails(tmp_pa
                 {
                     "devId": "camera 1",
                     "name": "Front",
-                    "online": True,
+                    "online": online,
                     "clips": [{"start": 100, "end": 130, "date": "2026-06-28"}],
                 }
             ],

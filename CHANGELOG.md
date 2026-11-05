@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.12 (2026-11-05)
+
+### Fixes
+
+- Allow on-demand SD catalog and playback access when the cached inventory
+  reports a camera offline. The inventory flag does not verify SD access.
+- Keep known recording dates visible when a catalog refresh fails, and show
+  the failure in the panel.
+- After a failed lookup, give that camera a 30-second break before another
+  day or month lookup. Other cameras can still be queried.
+
 ## Tuya Recordings v0.4.11 (2026-11-05)
 
 ### Fixes
