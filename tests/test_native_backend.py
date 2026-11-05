@@ -40,6 +40,58 @@ def test_native_playback_cancellation_maps_to_expected_camera_cancellation():
     assert isinstance(mapped, CameraWorkCancelled)
 
 
+def test_native_http_auth_failure_during_query_requests_reauthentication():
+    from custom_components.tuya_recordings.lib.native_gateway import NativeGatewayAuthError
+
+    class Session:
+        def recordings_for_day(self, day):
+            raise NativeGatewayAuthError("expired session")
+
+        def close(self):
+            pass
+
+    backend = ApkNativeRecordingBackend(NativeCameraSessionProvider(
+        session_config=session_config, open_session=lambda *args: Session()
+    ))
+    with pytest.raises(RecordingBackendAuthError, match="authorization expired"):
+        backend.recordings_for_day("camera", {}, {}, date(2026, 11, 3))
+
+
+def test_failed_cleanup_interlocks_camera_work_until_pool_is_closed(monkeypatch):
+    from unittest.mock import Mock
+    from custom_components.tuya_recordings.lib import native_backend as module
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue, CameraWorkBusy
+
+    commands = CameraCommandQueue()
+    monkeypatch.setattr(module, "CAMERA_COMMANDS", commands)
+
+    class FailedClose:
+        def recordings_for_day(self, day):
+            return []
+
+        def close(self):
+            raise RuntimeError("teardown failed")
+
+    close_pool = Mock(side_effect=RuntimeError("worker still alive"))
+    backend = ApkNativeRecordingBackend(NativeCameraSessionProvider(
+        session_config=session_config, open_session=lambda *args: FailedClose(), close=close_pool))
+    with pytest.raises(RecordingBackendUnavailable, match="cleanup did not complete"):
+        backend.recordings_for_day("camera", {}, {}, date(2026, 11, 1))
+    with pytest.raises(CameraWorkBusy, match="blocked"):
+        with commands.slot():
+            raise AssertionError("another camera command was admitted")
+    with pytest.raises(RuntimeError, match="worker still alive"):
+        backend.close()
+    commands.clear_quarantine(object())
+    with pytest.raises(CameraWorkBusy):
+        with commands.slot():
+            pass
+    close_pool.side_effect = None
+    backend.close()
+    with commands.slot():
+        pass
+
+
 def session_config(dev_id: str = "camera") -> NativeCameraSessionConfig:
     return NativeCameraSessionConfig(
         dev_id=dev_id,

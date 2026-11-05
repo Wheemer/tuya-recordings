@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import av
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -74,19 +75,23 @@ def native_browser_stream(path: Path) -> bytes:
     pcm_s16le = struct.pack("<hhhh", 0, 8192, -8192, 16384) * 16_000
     with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
         muxer.handle_event(event(NativePlaybackFrameType.STARTED))
-        muxer.handle_event(event(
-            NativePlaybackFrameType.MEDIA_CODEC,
-            path.read_bytes(),
-            {
+        with av.open(str(path), format="h264") as source:
+            packets = [bytes(packet) for packet in source.demux(video=0) if packet.size]
+        for index, packet in enumerate(packets):
+            muxer.handle_event(event(
+                NativePlaybackFrameType.MEDIA_CODEC,
+                packet,
+                {
                 "avChannel": 0,
-                "frameNo": 1,
+                "frameNo": index + 1,
                 "codecId": 27,
                 "codecName": "h264",
-                "isKeyFrame": True,
-                "timestamp": 90000,
+                "isKeyFrame": index % 15 == 0,
+                "timestamp": 90000 + index * 6000,
+                "timestampScale": 90000,
                 "frameInfoBase64": "",
-            },
-        ))
+                },
+            ))
         muxer.handle_event(event(
             NativePlaybackFrameType.MEDIA_CODEC,
             pcm_s16le,
@@ -97,6 +102,7 @@ def native_browser_stream(path: Path) -> bytes:
                 "codecName": "pcm_s16le",
                 "isKeyFrame": False,
                 "timestamp": 90000,
+                "timestampScale": 90000,
                 "sampleRate": 16000,
                 "channels": 1,
                 "frameInfoBase64": "",

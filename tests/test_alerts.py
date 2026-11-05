@@ -43,3 +43,24 @@ def test_decode_notification_message_extracts_camera_alert():
 def test_decode_notification_message_rejects_invalid_values():
     assert decode_notification_message("not base64 or json") is None
     assert decode_notification_message(base64.b64encode(b"[]").decode()) is None
+
+
+def test_notification_discovery_is_account_scoped_and_adds_late_sources(monkeypatch):
+    from types import SimpleNamespace
+    import custom_components.tuya_recordings.alerts as module
+
+    sources = ["event.first_doorbell_message", "event.other_doorbell_message"]
+    listeners, added = {}, []
+    monkeypatch.setattr(module, "tuya_camera_event_entities", lambda _: list(sources))
+    monkeypatch.setattr(module, "tuya_notification_source",
+        lambda _, entity: (entity.split('.')[1].removesuffix('_doorbell_message'), None))
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda _: None),
+        bus=SimpleNamespace(async_listen=lambda name, callback: listeners.setdefault(name, callback)))
+    entry = SimpleNamespace(data={"device_inventory": {"first": "First", "late": "Late"}},
+        async_on_unload=lambda _: None)
+    module.watch_camera_notification_sources(hass, entry, lambda *args: added.append(args))
+    assert [source[2] for source in added] == ["first"]
+    sources.append("event.late_doorbell_message")
+    listeners["entity_registry_updated"]()
+    listeners["entity_registry_updated"]()
+    assert [source[2] for source in added] == ["first", "late"]

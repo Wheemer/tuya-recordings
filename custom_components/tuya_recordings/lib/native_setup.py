@@ -58,6 +58,7 @@ def build_recordings_backend(
     runtime_pool = NativeRelayRuntimePool(
         app_session,
         media_secrets=media_secrets,
+        call_api=app_call,
     )
     return ApkNativeRecordingBackend(
         NativeCameraSessionProvider(

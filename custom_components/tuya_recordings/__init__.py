@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -241,7 +242,7 @@ def _async_scrub_legacy_entry_data(hass: HomeAssistant, entry: ConfigEntry, entr
         if key not in STALE_ENTRY_KEYS and key != CONF_THUMBNAIL_SYNC_ENABLED
     }
     if clean_data != dict(entry.data) or clean_options != dict(entry.options):
-        hass.config_entries.async_update_entry(entry, data=clean_data, options=clean_options, version=5)
+        hass.config_entries.async_update_entry(entry, data=clean_data, options=clean_options)
 
 
 def _entry_runtime_data(entry: ConfigEntry) -> dict:
@@ -346,6 +347,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _async_cancel_media_sync_schedule(entry_data)
         await hass.async_add_executor_job(entry_data["client"].close)
         await async_pause_camera_work(hass, entry.entry_id)
+        tasks = [task for key in (DATA_CAMERA_WORK_TASK, DATA_CATALOG_REFRESH_TASK)
+                 if isinstance(task := entry_data.get(key), asyncio.Task) and not task.done()]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=10)
+            if pending:
+                _LOGGER.error("Tuya Recordings unload is waiting for cancelled camera work to finish")
+                return False
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if not _configured_entries(hass):
         hass.services.async_remove(DOMAIN, SERVICE_REFRESH)
@@ -380,6 +388,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 continue
             try:
                 client = entry_data["client"]
+                entry = entry_data["entry"]
+                if CONF_NATIVE_APP_SESSION in getattr(entry, "data", {}):
+                    updates = await hass.async_add_executor_job(client.refresh_inventory, _entry_runtime_data(entry))
+                    hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
                 if client.media_sync_enabled:
                     await hass.async_add_executor_job(client.refresh_recent_recordings)
                 else:

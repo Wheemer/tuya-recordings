@@ -43,7 +43,8 @@ def test_native_transport_is_vendored_and_not_downloaded_from_pypi():
     assert (
         INTEGRATION / "vendor" / "tuya_ipc_p2p_sdk" / "LICENSE.txt"
     ).is_file()
-    assert "tuya" in dependencies
+    assert "tuya" not in dependencies
+    assert "tuya" in manifest["after_dependencies"]
     assert "ffmpeg" in dependencies
     assert "localtuya" not in dependencies
     assert "tinytuya==1.20.0" in requirements

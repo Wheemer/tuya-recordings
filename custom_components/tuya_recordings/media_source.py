@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -37,12 +36,19 @@ class TuyaRecordingsMediaSource(MediaSource):
         self.hass = hass
 
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
-        index = await self._async_load_index()
         identifier = item.identifier or ""
+        query = parse_identifier(identifier)
+        entry_id = query.get("entry_id")
+        entries = self._clients()
+        if not identifier and len(entries) > 1:
+            return self._root([self._directory(build_identifier({"entry_id": key}),
+                getattr(value.get("entry"), "title", None) or f"Account {number}")
+                for number, (key, value) in enumerate(entries.items(), 1)], {})
+        client = self._client(entry_id) if entries else None
+        index = await self._async_load_index(entry_id)
         cameras = index.get("cameras", [])
-        client = self._client() if cameras else None
 
-        if not identifier:
+        if not query.get("dev_id"):
             children = []
             if client is not None:
                 for camera in cameras:
@@ -52,13 +58,12 @@ class TuyaRecordingsMediaSource(MediaSource):
                     if has_visible:
                         children.append(
                             self._directory(
-                                build_identifier({"dev_id": camera["devId"]}),
+                                build_identifier({"dev_id": camera["devId"], **({"entry_id": entry_id} if entry_id else {})}),
                                 camera.get("name") or camera["devId"],
                             )
                         )
             return self._root(children, index)
 
-        query = parse_identifier(identifier)
         dev_id = query.get("dev_id", "")
         clip_date = query.get("date")
         start = query.get("start")
@@ -74,7 +79,7 @@ class TuyaRecordingsMediaSource(MediaSource):
             dates = sorted({clip.get("date") for clip in visible_clips if clip.get("date")}, reverse=True)
             status = camera.get("bridgeStatus") or {}
             children = [
-                self._directory(build_identifier({"dev_id": dev_id, "date": date_value}), date_value)
+                self._directory(build_identifier({"dev_id": dev_id, "date": date_value, **({"entry_id": entry_id} if entry_id else {})}), date_value)
                 for date_value in dates
             ]
             if not children:
@@ -147,7 +152,7 @@ class TuyaRecordingsMediaSource(MediaSource):
         if not dev_id or not start or not end:
             raise Unresolvable("Invalid Tuya recording clip identifier")
 
-        client = self._client()
+        client = self._client(query.get("entry_id"))
         try:
             url = await self.hass.async_add_executor_job(
                 self._resolve_clip_playback_url,
@@ -160,48 +165,34 @@ class TuyaRecordingsMediaSource(MediaSource):
             raise Unresolvable(str(exc)) from exc
         return PlayMedia(url, "video/mp4")
 
-    async def _async_load_index(self) -> dict[str, Any]:
+    async def _async_load_index(self, entry_id=None) -> dict[str, Any]:
         entries = self.hass.data.get(DOMAIN, {})
-        for entry_data in entries.values():
+        for key, entry_data in entries.items():
+            if entry_id and key != entry_id:
+                continue
             if isinstance(entry_data, dict) and (client := entry_data.get("client")):
                 return await self.hass.async_add_executor_job(client.cached_camera_index)
         return {"warning": f"{NAME} is not configured.", "cameras": []}
 
-    def _client(self) -> Any:
-        entries = self.hass.data.get(DOMAIN, {})
-        for entry_data in entries.values():
-            if isinstance(entry_data, dict) and (client := entry_data.get("client")):
-                return client
+    def _clients(self):
+        return {key: value for key, value in getattr(self.hass, "data", {}).get(DOMAIN, {}).items()
+                if isinstance(value, dict) and value.get("client") is not None}
+
+    def _client(self, entry_id=None) -> Any:
+        entries = self._clients()
+        if entry_id in entries:
+            return entries[entry_id]["client"]
+        if not entry_id and len(entries) == 1:
+            return next(iter(entries.values()))["client"]
         raise Unresolvable(f"{NAME} is not configured.")
 
     async def _async_use_12h_time(self) -> bool:
         return await self.hass.async_add_executor_job(self._use_12h_time)
 
     def _use_12h_time(self) -> bool:
-        storage = self._storage_path()
-        explicit: bool | None = None
-        language: str | None = None
-        if storage is not None:
-            for path in sorted(storage.glob("frontend.user_data_*")):
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                language_data = data.get("data", {}).get("language", {})
-                if not isinstance(language_data, dict):
-                    continue
-                time_format = str(language_data.get("time_format") or "").lower()
-                if time_format in {"12", "12h", "12_hour", "12-hour"}:
-                    explicit = True
-                    break
-                if time_format in {"24", "24h", "24_hour", "24-hour"}:
-                    explicit = False
-                    break
-                if language is None:
-                    language = str(language_data.get("language") or "").lower()
-        if explicit is not None:
-            return explicit
-        return self._language_uses_12h_time(language)
+        # Media Source does not supply a request user's frontend preferences.
+        # Use the server locale, never another user's private storage record.
+        return self._language_uses_12h_time(getattr(self.hass.config, "language", None))
 
     def _storage_path(self) -> Path | None:
         try:
@@ -372,6 +363,7 @@ class TuyaRecordingsMediaSource(MediaSource):
         return url
 
     def _clip_node(self, client: Any, clip: dict[str, Any], dev_id: str, clip_date: str, start: int, end: int, title: str) -> BrowseMediaSource:
+        account = next((key for key, value in self._clients().items() if value["client"] is client), None)
         return BrowseMediaSource(
             domain=DOMAIN,
             identifier=build_identifier(
@@ -380,6 +372,7 @@ class TuyaRecordingsMediaSource(MediaSource):
                     "date": clip_date,
                     "start": str(start),
                     "end": str(end),
+                    **({"entry_id": account} if account and len(self._clients()) > 1 else {}),
                 }
             ),
             media_class=MediaClass.VIDEO,

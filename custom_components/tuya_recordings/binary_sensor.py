@@ -22,14 +22,12 @@ from homeassistant.util import dt as dt_util
 from .alerts import (
     NOTIFICATION_STATUS_CODES,
     TUYA_HA_SIGNAL_UPDATE_ENTITY,
-    camera_name_from_event_state,
     decode_notification_message,
     matching_ipc_alert_code,
     notification_is_cleared,
     notification_metadata,
     safe_unique_fragment,
-    tuya_camera_event_entities,
-    tuya_notification_source,
+    watch_camera_notification_sources,
 )
 from .const import (
     CONF_ALERT_RESET_SECONDS,
@@ -51,13 +49,8 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up detection sensors from the official Tuya event sources."""
-    entities: list[TuyaRecordingAlertBinarySensor] = []
-    for entity_id in tuya_camera_event_entities(hass):
-        camera_name = camera_name_from_event_state(
-            hass.states.get(entity_id), entity_id
-        )
-        tuya_device_id, tuya_manager = tuya_notification_source(hass, entity_id)
-        entities.extend(
+    def add_source(entity_id, camera_name, tuya_device_id, tuya_manager):
+        async_add_entities(
             (
                 TuyaRecordingAlertBinarySensor(
                     hass=hass,
@@ -85,7 +78,7 @@ async def async_setup_entry(
                 ),
             )
         )
-    async_add_entities(entities)
+    watch_camera_notification_sources(hass, entry, add_source)
 
 
 class TuyaRecordingAlertBinarySensor(BinarySensorEntity):

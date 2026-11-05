@@ -22,8 +22,8 @@ class StreamConfig:
     """
     One ``m.ipc.v4.rtc.config.get`` result, plus the local key it does not carry.
 
-    Every asset in it is minted per fetch, so a reconnect has to fetch a new
-    one: a device does not answer an offer built from a stale session.
+    Token selection and expiry are handled by the native connection state
+    machine. This object alone is not evidence that a camera rejected a token.
     """
 
     device_id: str
@@ -38,7 +38,10 @@ class StreamConfig:
     log_config: JsonObject | None = field(default=None, repr=False)
 
     @classmethod
-    def from_json(cls, source: JsonObject, device_id: str, local_key: str) -> StreamConfig:
+    def from_json(
+        cls, source: JsonObject, device_id: str, local_key: str, *,
+        local_session: P2pSession | None = None,
+    ) -> StreamConfig:
         """Read a config fetch result, filling in the local key the caller holds."""
         p2p_config = require_object(source, "p2pConfig")
         security_level = optional_int(p2p_config, "securityLevel")
@@ -59,7 +62,7 @@ class StreamConfig:
             # The consumer app supplies its connection-optimization setting
             # to the native SDK; it does not read this from p2pConfig.
             preconnect=True,
-            p2p_session=P2pSession.from_json(require_object(p2p_config, "session")),
+            p2p_session=local_session or P2pSession.from_json(require_object(p2p_config, "session")),
             relay_token=RelayToken.from_json(require_object(p2p_config, "tcpRelay")),
             ice_servers=object_list(p2p_config, "ices"),
             log_config=optional_object(p2p_config, "log"),

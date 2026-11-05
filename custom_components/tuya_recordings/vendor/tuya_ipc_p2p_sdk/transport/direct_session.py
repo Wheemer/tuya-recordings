@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 CONTROL_CONVERSATION = 0
 VIDEO_CONVERSATION = 1
 _MAX_CONVERSATION_ID = (1 << 32) - 1
+_MAX_CONVERSATIONS = 16
 
 
 class DirectSession:
@@ -36,6 +37,8 @@ class DirectSession:
         existing = self._conversations.get(conversation_id)
         if existing is not None:
             return existing
+        if len(self._conversations) >= _MAX_CONVERSATIONS:
+            raise TuyaIpcP2pSessionError("Camera exceeded the conversation limit")
         created = KcpConversation(conversation_id, self._transmit)
         self._conversations[conversation_id] = created
         return created
@@ -48,11 +51,16 @@ class DirectSession:
 
     def input_segment(self, raw: bytes) -> None:
         """Route one authenticated KCP datagram received directly from the camera."""
+        if self._closed:
+            return
         segments = parse_segments(raw)
         if not segments:
             self._malformed_datagrams += 1
             return
         for segment in segments:
+            if segment.conversation not in self._conversations and len(self._conversations) >= _MAX_CONVERSATIONS:
+                self._malformed_datagrams += 1
+                continue
             key = (segment.conversation, segment.command)
             self._segment_counts[key] = self._segment_counts.get(key, 0) + 1
             known = segment.conversation in self._conversations
@@ -84,10 +92,18 @@ class DirectSession:
 
     async def async_close(self) -> None:
         """Close every conversation without touching any cloud relay."""
-        if self._closed:
+        if self._closed and not self._conversations:
             return
         self._closed = True
-        for conversation in self._conversations.values():
-            await conversation.async_close()
+        errors = []
+        for channel, conversation in list(self._conversations.items()):
+            try:
+                await conversation.async_close()
+            except Exception as error:
+                errors.append(error)
+            else:
+                del self._conversations[channel]
         if not self._video_ready.done():
             self._video_ready.cancel()
+        if errors:
+            raise TuyaIpcP2pSessionError("Direct conversation cleanup incomplete") from errors[0]

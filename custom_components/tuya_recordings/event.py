@@ -16,14 +16,12 @@ from homeassistant.helpers.event import async_track_state_change_event
 from .alerts import (
     NOTIFICATION_STATUS_CODES,
     TUYA_HA_SIGNAL_UPDATE_ENTITY,
-    camera_name_from_event_state,
     decode_notification_message,
     notification_event_code,
     notification_is_cleared,
     notification_metadata,
     safe_unique_fragment,
-    tuya_camera_event_entities,
-    tuya_notification_source,
+    watch_camera_notification_sources,
 )
 from .const import DOMAIN, MANUFACTURER, NAME
 
@@ -34,11 +32,8 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Tuya Recordings detection event entities."""
-    entities: list[TuyaRecordingAlertEvent] = []
-    for entity_id in tuya_camera_event_entities(hass):
-        camera_name = camera_name_from_event_state(hass.states.get(entity_id), entity_id)
-        tuya_device_id, tuya_manager = tuya_notification_source(hass, entity_id)
-        entities.append(
+    def add_source(entity_id, camera_name, tuya_device_id, tuya_manager):
+        async_add_entities([
             TuyaRecordingAlertEvent(
                 hass=hass,
                 entry=entry,
@@ -47,8 +42,8 @@ async def async_setup_entry(
                 tuya_device_id=tuya_device_id,
                 tuya_manager=tuya_manager,
             )
-        )
-    async_add_entities(entities)
+        ])
+    watch_camera_notification_sources(hass, entry, add_source)
 
 class TuyaRecordingAlertEvent(EventEntity):
     """Expose the camera's notifications as immutable Home Assistant events."""
@@ -174,4 +169,3 @@ class TuyaRecordingAlertEvent(EventEntity):
         event_type = "cleared" if notification_is_cleared(attributes) else "detected"
         self._trigger_event(event_type, {**attributes, "tuya_event_code": raw_code})
         self.async_write_ha_state()
-

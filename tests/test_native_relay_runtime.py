@@ -45,6 +45,75 @@ TOKEN = {
     "sign_key": "sign",
     "ice_token": {"servers": [{"url": "stun:example.test:3478"}]},
 }
+
+
+def test_worker_failed_cleanup_blocks_reconnect_until_explicit_disconnect():
+    from custom_components.tuya_recordings.lib.commands import CAMERA_COMMANDS, CameraWorkBusy
+
+    calls = []
+
+    class Playback:
+        async def connect(self, **kwargs):
+            calls.append("connect")
+
+        async def query_recordings(self, day):
+            raise ValueError("catalog failed")
+
+        async def close(self):
+            calls.append("close")
+            if calls.count("close") == 1:
+                raise RuntimeError("close failed")
+
+    worker = NativeRelayPlaybackWorker(
+        camera_config(), APP_SESSION, playback_factory=lambda *args: Playback()
+    )
+    try:
+        with pytest.raises(ValueError, match="catalog failed"):
+            worker.catalog([date(2026, 11, 3)], None)
+        with pytest.raises(CameraWorkBusy, match="cleanup"):
+            with CAMERA_COMMANDS.slot():
+                pytest.fail("unsafe camera command was admitted")
+        with pytest.raises(NativeRelayRuntimeError, match="did not close"):
+            worker.catalog([date(2026, 11, 3)], None)
+        assert calls.count("connect") == 1
+        worker.disconnect()
+        assert worker._unfinished_transport is None
+        with CAMERA_COMMANDS.slot():
+            pass
+    finally:
+        worker.close()
+        worker.wait_closed(2)
+        CAMERA_COMMANDS.clear_quarantine(worker)
+
+
+def test_one_shot_cleanup_failure_is_not_reported_as_closed():
+    from custom_components.tuya_recordings.lib.commands import CAMERA_COMMANDS, CameraWorkBusy
+
+    class Playback:
+        async def connect(self, **kwargs):
+            pass
+
+        async def download_thumbnail(self, **kwargs):
+            return b"jpeg"
+
+        async def close(self):
+            raise OSError("close failed")
+
+    runtime = NativeRelayRuntimeSession(
+        camera_config(), APP_SESSION, playback_factory=lambda *args: Playback()
+    )
+    try:
+        with pytest.raises(OSError, match="close failed"):
+            asyncio.run(runtime._download_thumbnail(1, 2))
+        assert runtime._unfinished_transport is not None
+        with pytest.raises(NativeRelayRuntimeError, match="cleanup incomplete"):
+            runtime.close()
+        assert not runtime._closed
+        with pytest.raises(CameraWorkBusy, match="cleanup"):
+            with CAMERA_COMMANDS.slot():
+                pytest.fail("unsafe camera command admitted")
+    finally:
+        CAMERA_COMMANDS.clear_quarantine(runtime._cleanup_owner)
 APP_SESSION = {
     "sid": "sid",
     "ecode": "ecode",
@@ -53,6 +122,48 @@ APP_SESSION = {
     "mobile_mqtts_url": "mqtt.example.test",
     "device_fingerprint": "fingerprint",
 }
+
+
+def test_pool_close_reports_unfinished_worker():
+    from unittest.mock import Mock
+
+    pool = NativeRelayRuntimePool(APP_SESSION)
+    worker = Mock()
+    worker.wait_closed.return_value = False
+    pool._workers["camera"] = worker
+    with pytest.raises(NativeRelayRuntimeError, match="did not stop"):
+        pool.close()
+    worker.close.assert_called_once()
+    assert pool._workers["camera"] is worker
+    worker.wait_closed.return_value = True
+    pool.close()
+    assert not pool._workers
+
+
+def test_pool_rejects_unimplemented_transport_before_starting_worker():
+    pool = NativeRelayRuntimePool(APP_SESSION)
+    with pytest.raises(NativeRelayRuntimeError, match="P2P type 4"):
+        pool.session(replace(camera_config(), p2p_type=8), None)
+    assert not pool._workers
+    pool.close()
+
+
+def test_month_inventory_uses_metadata_worker_without_starting_media():
+    class MonthPlayback(Playback):
+        async def query_recording_days(self, month):
+            return [month.replace(day=2), month.replace(day=28)]
+
+    playback = MonthPlayback()
+    worker = NativeRelayPlaybackWorker(camera_config(), APP_SESSION,
+        playback_factory=lambda *args, **kwargs: playback)
+    try:
+        result = worker.catalog([date(2025, 1, 1)], None, months=True)
+        assert result == [(date(2025, 1, 1), [{"date": "2025-01-02"}, {"date": "2025-01-28"}])]
+        assert playback.connect_modes == [False]
+        assert playback.start_calls == []
+    finally:
+        worker.close()
+        assert worker.wait_closed(2)
 
 
 def camera_config():
@@ -497,7 +608,7 @@ def test_worker_downloads_thumbnails_sequentially_on_one_transport():
     assert len(DirectThumbnailPlayback.instances) == 1
     playback = DirectThumbnailPlayback.instances[0]
     assert playback.connect_count == 1
-    assert playback.connect_modes == [True]
+    assert playback.connect_modes == [False]
     assert playback.start_count == 0
     assert playback.stop_count == 0
     assert playback.thumbnails == [(100, 110), (120, 130)]
@@ -543,7 +654,7 @@ def test_worker_reuses_catalog_session_for_companion_thumbnail():
     assert len(DirectThumbnailPlayback.instances) == 1
     playback = DirectThumbnailPlayback.instances[0]
     assert playback.connect_count == 1
-    assert playback.connect_modes == [True]
+    assert playback.connect_modes == [False]
     assert playback.queries == [day]
     assert playback.thumbnails == [(100, 110)]
     worker.close()
@@ -637,7 +748,7 @@ def test_worker_close_cancels_active_connect_and_drains_queued_work():
     assert playback.closed is True
 
 
-def test_worker_keeps_connected_transport_when_catalog_is_cancelled():
+def test_worker_closes_cancelled_catalog_before_next_playback():
     cancel = threading.Event()
     playbacks = []
     worker = NativeRelayPlaybackWorker(
@@ -660,8 +771,8 @@ def test_worker_keeps_connected_transport_when_catalog_is_cancelled():
         None,
     )
 
-    assert len(playbacks) == 1
-    assert playbacks[0].connect_modes == [True]
+    assert len(playbacks) == 2
+    assert playbacks[0].connect_modes == [False]
     worker.close()
 
 
@@ -682,6 +793,36 @@ def test_worker_cancels_interactive_connect_promptly():
         )
 
     worker.close()
+
+
+def test_idle_worker_queue_does_not_block_transport_loop():
+    from custom_components.tuya_recordings.lib.native_relay_runtime import _WorkerQueue
+
+    async def run():
+        work = _WorkerQueue()
+        ticks = []
+        async def heartbeat():
+            await asyncio.sleep(0.01)
+            ticks.append(True)
+            work.put("wake")
+        task = asyncio.create_task(heartbeat())
+        assert await asyncio.wait_for(work.get_async(), 0.5) == "wake"
+        await task
+        assert ticks == [True]
+    asyncio.run(run())
+
+
+def test_session_close_disconnects_once_before_releasing_ownership():
+    calls = []
+    class Worker:
+        def disconnect(self):
+            calls.append("disconnect")
+    worker = Worker()
+    session = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION,
+        command_worker=worker, playback_worker=worker)
+    session.close()
+    session.close()
+    assert calls == ["disconnect"]
 
 
 def test_pool_close_cancels_all_workers_before_waiting_for_threads():

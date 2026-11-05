@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.core import HomeAssistant, State
+from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 ALARM_MESSAGE = "alarm_message"
@@ -77,10 +78,14 @@ def notification_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def tuya_camera_event_entities(hass: HomeAssistant) -> list[str]:
     """Return the official Tuya camera notification entities."""
+    registry = er.async_get(hass)
     return sorted(
         state.entity_id
         for state in hass.states.async_all("event")
         if state.entity_id.endswith(EVENT_ENTITY_SUFFIX)
+        or ((entity := registry.async_get(state.entity_id)) is not None
+            and entity.platform == TUYA_DOMAIN
+            and entity.unique_id.endswith(EVENT_ENTITY_SUFFIX))
     )
 
 
@@ -115,6 +120,31 @@ def camera_name_from_event_state(state: State | None, entity_id: str) -> str:
     if object_id.endswith(EVENT_ENTITY_SUFFIX):
         object_id = object_id.removesuffix(EVENT_ENTITY_SUFFIX)
     return object_id.replace("_", " ").title()
+
+
+def watch_camera_notification_sources(hass, entry, add_source):
+    """Discover late-loaded official sources without duplicating account entities."""
+    seen = set()
+
+    def discover(event=None):
+        if event is not None and getattr(event, "event_type", None) == EVENT_STATE_CHANGED:
+            if not str(event.data.get("entity_id", "")).startswith("event."):
+                return
+        inventory = entry.data.get("device_inventory")
+        for entity_id in tuya_camera_event_entities(hass):
+            dev_id, manager = tuya_notification_source(hass, entity_id)
+            if not dev_id or (isinstance(inventory, dict) and dev_id not in inventory):
+                continue
+            identity = dev_id or entity_id
+            if identity in seen:
+                continue
+            seen.add(identity)
+            add_source(entity_id, camera_name_from_event_state(hass.states.get(entity_id), entity_id), dev_id, manager)
+
+    discover()
+    if hasattr(hass, "bus") and hasattr(entry, "async_on_unload"):
+        entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", discover))
+        entry.async_on_unload(hass.bus.async_listen(EVENT_STATE_CHANGED, discover))
 
 
 def safe_unique_fragment(value: str) -> str:

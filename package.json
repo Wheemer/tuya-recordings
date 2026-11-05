@@ -1,0 +1,9 @@
+{
+  "name": "tuya-recordings-vendor-tools",
+  "private": true,
+  "description": "Development-only tracking for the bundled frontend libraries",
+  "devDependencies": {
+    "plyr": "3.8.4",
+    "vis-timeline": "8.5.4"
+  }
+}

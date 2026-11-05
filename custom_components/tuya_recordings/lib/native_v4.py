@@ -74,7 +74,8 @@ class NativeV4AIDetection:
         _text("ai_detection.ai_code", self.ai_code)
         if not self.ai_code:
             raise NativeV4Error("AI detection ai_code is invalid")
-        _text("ai_detection.ai_code_icon", self.ai_code_icon)
+        if not isinstance(self.ai_code_icon, str) or "\0" in self.ai_code_icon:
+            raise NativeV4Error("ai_detection.ai_code_icon is invalid")
         return self
 
     def as_catalog_item(self) -> dict[str, Any]:

@@ -1,11 +1,9 @@
 """
-One KCP conversation on a shared relay connection.
+One KCP conversation on an authenticated transport.
 
-The relay runs over TCP, so segments arrive in order and are never lost in
-transit. What still matters on the wire is the bookkeeping the peer expects:
-every push has to be acknowledged or the device stops sending, ``una`` has to
-advance so the device can retire its send queue, and fragmented messages have
-to be rejoined.
+Direct ICE carries datagrams that may be lost or reordered. Selective ACKs
+and cumulative una are distinct; sequence counters wrap at uint32. Bound
+reassembly and retransmission state so failed peers cannot grow it forever.
 """
 
 from __future__ import annotations
@@ -34,6 +32,12 @@ _RETRANSMIT_INTERVAL_SECONDS = 0.3
 _MAX_RETRANSMITS = 8
 _MAX_SEGMENT_SIZE = 1376
 _PENDING_MESSAGE_LIMIT = 32
+_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+def _difference(left: int, right: int) -> int:
+    """Signed distance between the protocol's wrapping uint32 counters."""
+    return ((left - right + 0x80000000) & 0xFFFFFFFF) - 0x80000000
 
 
 def _now_milliseconds() -> int:
@@ -63,10 +67,14 @@ class KcpConversation:
         self._received: dict[int, KcpSegment] = {}
         self._pending: list[_PendingSegment] = []
         self._fragments: list[bytes] = []
+        self._fragment_bytes = 0
+        self._expected_fragment: int | None = None
         self._retransmit_task: asyncio.Task[None] | None = None
         self._handler: Callable[[bytes], None] | None = None
         self._pending_messages: list[bytes] = []
         self._closed = False
+        self._remote_window = _RECEIVE_WINDOW
+        self._last_probe = _now_milliseconds()
 
     def set_message_handler(self, handler: Callable[[bytes], None] | None) -> None:
         """Install the callback that receives every reassembled message."""
@@ -88,9 +96,12 @@ class KcpConversation:
         """Feed one inbound segment for this conversation."""
         if self._closed:
             return
+        self._remote_window = segment.window
         self._retire_pending(segment.unacknowledged)
         if segment.command == CMD_ACK:
-            self._retire_pending(segment.sequence + 1)
+            self._pending = [entry for entry in self._pending if entry.sequence != segment.sequence]
+            if not self._pending:
+                self._disarm_retransmit()
         elif segment.command == CMD_PUSH:
             # Deliver before acknowledging: the acknowledgement carries the
             # receive sequence the delivery advanced, which is how the device
@@ -109,6 +120,7 @@ class KcpConversation:
                     self._next_receive_sequence,
                 )
             )
+        self._flush_pending()
 
     def _acknowledge(self, segment: KcpSegment) -> None:
         """Acknowledge one received push."""
@@ -130,20 +142,29 @@ class KcpConversation:
 
         A message spans ``frg + 1`` segments, counted down to zero.
         """
-        if segment.sequence < self._next_receive_sequence:
+        if _difference(segment.sequence, self._next_receive_sequence) < 0:
             return
-        if segment.sequence >= self._next_receive_sequence + _RECEIVE_WINDOW:
+        if _difference(segment.sequence, self._next_receive_sequence) >= _RECEIVE_WINDOW:
             return
         if segment.sequence in self._received:
             return
         self._received[segment.sequence] = segment
 
         while (nxt := self._received.pop(self._next_receive_sequence, None)) is not None:
-            self._next_receive_sequence += 1
+            self._next_receive_sequence = (self._next_receive_sequence + 1) & 0xFFFFFFFF
+            if self._expected_fragment is not None and nxt.fragment != self._expected_fragment:
+                self.close()
+                raise RuntimeError("KCP fragment countdown is invalid")
+            self._fragment_bytes += len(nxt.data)
+            if self._fragment_bytes > _MAX_MESSAGE_BYTES:
+                self.close()
+                raise RuntimeError("KCP message exceeds receive limit")
+            self._expected_fragment = nxt.fragment - 1 if nxt.fragment else None
             self._fragments.append(nxt.data)
             if nxt.fragment == 0:
                 message = b"".join(self._fragments)
                 self._fragments = []
+                self._fragment_bytes = 0
                 if not message:
                     continue
                 if self._handler is not None:
@@ -159,6 +180,10 @@ class KcpConversation:
         if self._closed:
             raise RuntimeError("Failed to send: the KCP conversation is closed")
         count = max(1, -(-len(message) // _MAX_SEGMENT_SIZE))
+        if count > 256 or len(message) > _MAX_MESSAGE_BYTES:
+            raise ValueError("KCP message exceeds fragment limit")
+        if len(self._pending) + count > _RECEIVE_WINDOW:
+            raise RuntimeError("KCP send queue is full")
         for index in range(count):
             chunk = message[index * _MAX_SEGMENT_SIZE : (index + 1) * _MAX_SEGMENT_SIZE]
             raw = build_segment(
@@ -172,15 +197,27 @@ class KcpConversation:
                 chunk,
             )
             self._pending.append(
-                _PendingSegment(self._next_send_sequence, raw, _now_milliseconds(), 1)
+                _PendingSegment(self._next_send_sequence, raw, _now_milliseconds(), 0)
             )
-            self._next_send_sequence += 1
-            self._transmit(raw)
+            self._next_send_sequence = (self._next_send_sequence + 1) & 0xFFFFFFFF
+        self._flush_pending()
         self._arm_retransmit()
+
+    def _flush_pending(self) -> None:
+        if not self._pending:
+            return
+        origin = self._pending[0].sequence
+        for entry in self._pending:
+            if _difference(entry.sequence, origin) >= self._remote_window:
+                break
+            if not entry.transmits:
+                entry.sent_at = _now_milliseconds()
+                entry.transmits = 1
+                self._transmit(entry.raw)
 
     def _retire_pending(self, unacknowledged: int) -> None:
         """Drop everything the peer has acknowledged."""
-        while self._pending and self._pending[0].sequence < unacknowledged:
+        while self._pending and _difference(self._pending[0].sequence, unacknowledged) < 0:
             self._pending.pop(0)
         if not self._pending:
             self._disarm_retransmit()
@@ -212,8 +249,15 @@ class KcpConversation:
     def _retransmit_once(self) -> None:
         """Resend whatever has been waiting longer than the retransmit interval."""
         now = _now_milliseconds()
+        if self._remote_window == 0 and _difference(now, self._last_probe) >= 3000:
+            self._last_probe = now
+            self._transmit(build_segment(self.conversation, CMD_WINDOW_ASK, 0,
+                                         _RECEIVE_WINDOW, now, 0, self._next_receive_sequence))
+        self._flush_pending()
         for entry in list(self._pending):
-            if now - entry.sent_at < _RETRANSMIT_INTERVAL_SECONDS * 1000:
+            if not entry.transmits:
+                continue
+            if _difference(now, entry.sent_at) < _RETRANSMIT_INTERVAL_SECONDS * 1000:
                 continue
             if entry.transmits >= _MAX_RETRANSMITS:
                 LOGGER.warning(
@@ -236,6 +280,9 @@ class KcpConversation:
         self._received.clear()
         self._pending.clear()
         self._pending_messages.clear()
+        self._fragments.clear()
+        self._fragment_bytes = 0
+        self._expected_fragment = None
         self._handler = None
 
     async def async_close(self) -> None:

@@ -23,7 +23,12 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   let audioSampleRate = 8000;
   let audioChannels = 1;
   let audioTimestampScale = null;
+  let audioTimestampScaleHint = null;
   let firstVideoTimestamp = null;
+  let aacElement = null;
+  let aacObjectUrl = '';
+  let aacNode = null;
+  let firstAacTimestamp = null;
   let videoAudioStartTime = 0;
   const audioSources = new Set();
   let audioStalled = false;
@@ -76,6 +81,36 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     videoAudioStartTime = 0;
     audioTimestampScale = null;
   };
+  const clearAac = () => {
+    if (aacElement) {
+      aacElement.pause();
+      aacElement.removeAttribute('src');
+      aacElement.load();
+      aacElement = null;
+    }
+    aacNode?.disconnect();
+    aacNode = null;
+    if (aacObjectUrl) URL.revokeObjectURL(aacObjectUrl);
+    aacObjectUrl = '';
+    firstAacTimestamp = null;
+  };
+  const syncAac = () => {
+    if (!aacElement || firstAacTimestamp === null || firstVideoTimestamp === null) return;
+    const scale = audioTimestampScaleHint;
+    if (!scale) return;
+    const wanted = video.currentTime + (firstVideoTimestamp - firstAacTimestamp) / scale;
+    if (streamStarting || video.paused || video.readyState < 3 || wanted < 0 || audioStalled) {
+      aacElement.pause();
+      return;
+    }
+    if (aacElement.readyState < 1) return;
+    if (Math.abs(aacElement.currentTime - wanted) > 0.15) aacElement.currentTime = wanted;
+    aacElement.playbackRate = video.playbackRate;
+    if (aacElement.paused) aacElement.play().catch(error => {
+      debug('aac-play-error', { message: messageFor(error) });
+      status.textContent = 'Audio playback failed: ' + messageFor(error);
+    });
+  };
   const release = () => {
     releasing = true;
     setLoading(false);
@@ -93,6 +128,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       timelineSocket = null;
     }
     clearScheduledAudio();
+    clearAac();
     audioContext?.close().catch(() => {});
     audioContext = null;
     audioGain = null;
@@ -100,6 +136,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     audioStalled = false;
     audioSampleRate = 8000;
     audioChannels = 1;
+    audioTimestampScaleHint = null;
     audioTimestampScale = null;
     firstVideoTimestamp = null;
     videoAudioStartTime = 0;
@@ -160,6 +197,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       video.parentElement.classList.add('camera-player--switching');
       status.textContent = paused ? 'Resuming camera stream' : 'Seeking camera recording';
       setLoading(true);
+      aacElement?.pause();
       if (paused) {
         // A timeline card selection may choose a different recording while
         // the camera session is paused. Seek first, then resume, so the
@@ -243,6 +281,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           if (bodySettled) return;
           bodySettled = true;
           controller.error(error);
+          if (socket.readyState < WebSocket.CLOSING) socket.close();
         };
         const close = () => {
           if (bodySettled) return;
@@ -269,6 +308,10 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
             return;
           }
           try {
+            if (event.data.byteLength > 8 * 1024 * 1024 || controller.desiredSize < event.data.byteLength) {
+              fail(new Error('Playback receiver exceeded its media buffer limit'));
+              return;
+            }
             controller.enqueue(new Uint8Array(event.data));
           } catch (error) {
             fail(error);
@@ -281,7 +324,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         bodySettled = true;
         if (socket.readyState < WebSocket.CLOSING) socket.close();
       },
-    });
+    }, { highWaterMark: 8 * 1024 * 1024, size: chunk => chunk.byteLength });
     // Register the media listener before awaiting `open`. The server may send
     // its stream header immediately after the upgrade completes; attaching
     // afterward can lose those first bytes and leave the player connecting
@@ -320,6 +363,8 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
 
     let mediaSource = null;
     let sourceBuffer = null;
+    let aacSourceBuffer = null;
+    let aacMediaSource = null;
     let mediaEpoch = 0;
     let frameConfirmationEpoch = -1;
     let frameConfirmationTimer = null;
@@ -336,6 +381,9 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       clearScheduledAudio();
     };
     const createMediaPipeline = async () => {
+      clearAac();
+      aacSourceBuffer = null;
+      aacMediaSource = null;
       if (frameConfirmationTimer !== null) clearTimeout(frameConfirmationTimer);
       frameConfirmationTimer = null;
       frameConfirmationTimerEpoch = -1;
@@ -385,7 +433,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       ) return;
       videoPlaybackConfirmed = true;
       videoAudioStartTime = audioContext.currentTime + 0.08;
-      audioTimestampScale = inferTimestampScale(queuedAudio, audioSampleRate, audioChannels);
+      audioTimestampScale = audioTimestampScaleHint || inferTimestampScale(queuedAudio, audioSampleRate, audioChannels);
       for (const item of queuedAudio.splice(0)) {
         if (!firstVideoTimestamp || !item.timestamp || item.timestamp >= firstVideoTimestamp) {
           scheduleAudio(item.kind, item.payload, item.timestamp);
@@ -440,10 +488,17 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         });
     };
     while (true) {
+      while ((audioContext && audioNextTime - audioContext.currentTime > 5)
+        || (sourceBuffer.buffered.length && sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - video.currentTime > 30)) {
+        if (signal.aborted) throw new DOMException('Playback cancelled', 'AbortError');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
       const { value, done } = await reader.read();
       if (playbackError) throw playbackError;
       if (done) break;
       bytes = concatBytes(bytes, value);
+      parseRecords: while (true) {
+      if (bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'TRS3' && bytes.length < 16) break;
       while (bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'TRS3') {
         if (bytes.length < 16) break;
         const segmentView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -473,6 +528,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           videoPlaybackConfirmed = false;
           videoRecords = 0;
           queuedAudio.splice(0);
+          audioTimestampScaleHint = null;
           resetAudioTimeline();
           activeMediaEpoch = await createMediaPipeline();
           if (!activeMediaEpoch) return;
@@ -484,13 +540,14 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         debug('stream-header', { generation, position: segmentPosition });
       }
       if (!magicRead) {
-        if (bytes.length < 4) continue;
+        if (bytes.length < 4) break;
         if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'TRS3') {
           throw new Error('Camera stream header is invalid');
         }
-        continue;
+        break;
       }
       while (bytes.length >= 13) {
+        if (String.fromCharCode(...bytes.subarray(0, 4)) === 'TRS3') continue parseRecords;
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         const kind = view.getUint8(0);
         const timestamp = Number(view.getBigUint64(1));
@@ -502,6 +559,11 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         if (discardSegment) continue;
         if (kind === 1) {
           if (firstVideoTimestamp === null) firstVideoTimestamp = timestamp;
+          if (video.currentTime > 60 && sourceBuffer.buffered.length && sourceBuffer.buffered.start(0) < video.currentTime - 60) {
+            const removed = once(sourceBuffer, 'updateend', signal);
+            sourceBuffer.remove(0, video.currentTime - 60);
+            await removed;
+          }
           await appendBuffer(sourceBuffer, payload, signal);
           videoRecords += 1;
           const bufferedSeconds = sourceBuffer.buffered.length
@@ -510,17 +572,66 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           if (!videoStarted && (bufferedSeconds >= 2 || videoRecords >= 12)) {
             startVideoPlayback();
           }
-        } else if (kind === 2 || kind === 4) {
+        } else if (kind === 2 || kind === 4 || kind === 6) {
           if (!queuedAudio.length && !audioNextTime) debug('first-audio', { kind });
           if (videoPlaybackConfirmed && !playbackError && !video.paused) scheduleAudio(kind, payload, timestamp);
-          else queuedAudio.push({ kind, payload, timestamp });
+          else {
+            if (queuedAudio.length >= 256) throw new Error('Camera audio arrived without playable video');
+            queuedAudio.push({ kind, payload, timestamp });
+          }
         } else if (kind === 5) {
-          if (payload.length !== 5) throw new Error('Camera audio format is invalid');
+          if (payload.length !== 5 && payload.length !== 9) throw new Error('Camera audio format is invalid');
           const format = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
           audioSampleRate = format.getUint32(0);
           audioChannels = format.getUint8(4);
+          audioTimestampScaleHint = payload.length === 9 ? format.getUint32(5) : null;
+          if (audioTimestampScaleHint) audioTimestampScale = audioTimestampScaleHint;
           if (!audioSampleRate || !audioChannels) throw new Error('Camera audio format is invalid');
           debug('audio-format', { sampleRate: audioSampleRate, channels: audioChannels });
+        } else if (kind === 7) {
+          if (!audioTimestampScaleHint) throw new Error('AAC camera clock is unavailable');
+          if (!aacSourceBuffer) {
+            const audioMime = 'audio/mp4; codecs="mp4a.40.2"';
+            if (!MediaSourceType.isTypeSupported(audioMime)) throw new Error('AAC Media Source playback is unavailable');
+            firstAacTimestamp = timestamp;
+            aacMediaSource = new MediaSourceType();
+            aacObjectUrl = URL.createObjectURL(aacMediaSource);
+            aacElement = new Audio();
+            aacElement.disableRemotePlayback = true;
+            aacElement.preload = 'auto';
+            aacElement.src = aacObjectUrl;
+            aacNode = audioContext.createMediaElementSource(aacElement);
+            aacNode.connect(audioGain);
+            const audioElement = aacElement;
+            aacElement.addEventListener('canplay', () => {
+              if (aacElement === audioElement && !disposed) syncAac();
+            });
+            aacElement.addEventListener('error', () => {
+              if (aacElement !== audioElement || disposed) return;
+              status.textContent = 'Audio playback failed';
+              debug('aac-media-error', { code: aacElement?.error?.code });
+            });
+            aacElement.load();
+            await once(aacMediaSource, 'sourceopen', signal);
+            aacSourceBuffer = aacMediaSource.addSourceBuffer(audioMime);
+            aacSourceBuffer.mode = 'segments';
+          }
+          if (aacElement.currentTime > 60 && aacSourceBuffer.buffered.length &&
+              aacSourceBuffer.buffered.start(0) < aacElement.currentTime - 60) {
+            const removed = once(aacSourceBuffer, 'updateend', signal);
+            aacSourceBuffer.remove(0, aacElement.currentTime - 60);
+            await removed;
+          }
+          try {
+            await appendBuffer(aacSourceBuffer, payload, signal);
+          } catch (error) {
+            throw new Error('Browser rejected the AAC stream', { cause: error });
+          }
+          if (aacSourceBuffer.buffered.length &&
+              aacSourceBuffer.buffered.end(aacSourceBuffer.buffered.length - 1) - aacElement.currentTime > 15) {
+            throw new Error('Camera AAC exceeded its buffered audio limit');
+          }
+          syncAac();
         } else if (kind === 3) {
           streamComplete = true;
           debug('stream-complete', {
@@ -532,6 +643,9 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           if (mediaSource.readyState === 'open' && !sourceBuffer.updating) {
             mediaSource.endOfStream();
           }
+          if (aacMediaSource?.readyState === 'open' && !aacSourceBuffer.updating) {
+            aacMediaSource.endOfStream();
+          }
           if (!videoStarted && videoRecords > 0) startVideoPlayback();
           if (playbackPromise) await playbackPromise;
           if (playbackError) throw playbackError;
@@ -539,6 +653,8 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         } else {
           throw new Error(`Unknown camera stream record ${kind}`);
         }
+      }
+      break;
       }
     }
     if (!streamComplete) throw new Error('Camera stream ended before completion');
@@ -558,8 +674,12 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     if (audioGain) audioGain.gain.value = video.muted ? 0 : video.volume;
   };
   const scheduleAudio = (kind, payload, timestamp) => {
+    const sampleBytes = kind === 2 ? 2 : 1;
+    if (payload.length > sampleBytes * audioChannels * audioSampleRate * 10) {
+      throw new Error('Camera audio packet exceeds the scheduling limit');
+    }
     if (kind === 2) schedulePcm16le(payload, timestamp);
-    else scheduleMulaw(payload, timestamp);
+    else scheduleCompanded(payload, timestamp, kind === 6 ? decodeAlaw : decodeMulaw);
   };
   const schedulePcm16le = (payload, timestamp) => {
     if (!audioContext || !audioGain || payload.length < 2) return;
@@ -575,7 +695,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     }
     scheduleAudioBuffer(buffer, timestamp);
   };
-  const scheduleMulaw = (payload, timestamp) => {
+  const scheduleCompanded = (payload, timestamp, decode) => {
     if (!audioContext || !audioGain || !payload.length) return;
     const samples = Math.floor(payload.length / audioChannels);
     if (!samples) return;
@@ -583,23 +703,26 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     for (let channelIndex = 0; channelIndex < audioChannels; channelIndex++) {
       const channel = buffer.getChannelData(channelIndex);
       for (let index = 0; index < samples; index++) {
-        channel[index] = decodeMulaw(payload[index * audioChannels + channelIndex]);
+        channel[index] = decode(payload[index * audioChannels + channelIndex]);
       }
     }
     scheduleAudioBuffer(buffer, timestamp);
   };
   const scheduleAudioBuffer = (buffer, timestamp) => {
     if (audioStalled) return;
-    const source = audioContext.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioGain);
-    audioSources.add(source);
-    source.addEventListener('ended', () => audioSources.delete(source), { once: true });
     const contiguousTime = Math.max(audioNextTime, audioContext.currentTime + 0.02);
     const timestampTime = audioTimestampScale && firstVideoTimestamp !== null && timestamp
       ? videoAudioStartTime + ((timestamp - firstVideoTimestamp) / audioTimestampScale)
       : contiguousTime;
     const startTime = Math.max(contiguousTime, timestampTime);
+    if (audioSources.size >= 512 || startTime + buffer.duration - audioContext.currentTime > 15) {
+      throw new Error('Camera audio exceeded its scheduled buffer limit');
+    }
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioGain);
+    audioSources.add(source);
+    source.addEventListener('ended', () => audioSources.delete(source), { once: true });
     source.start(startTime);
     audioNextTime = startTime + buffer.duration;
   };
@@ -633,6 +756,10 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   });
   const controller = new AbortController();
   const on = (target, event, callback) => target.addEventListener(event, callback, { signal: controller.signal });
+  on(video, 'timeupdate', syncAac);
+  on(video, 'playing', syncAac);
+  on(video, 'pause', syncAac);
+  on(video, 'waiting', () => aacElement?.pause());
   if (isControlledStream) {
     Object.defineProperty(player, 'currentTime', { get: position, set: time => resume(time), configurable: true });
     on(video, 'pause', () => {
@@ -733,7 +860,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     }, 1500);
   });
   on(video, 'error', () => {
-    if (continuous && isControlledStream) {
+    if (continuous && isControlledStream && !video.error) {
       // A detached MediaSource can still dispatch its terminal error through
       // the shared video element after a newer segment is playing. Native
       // transport and SourceBuffer errors reject at their origin above; this
@@ -743,7 +870,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     }
     // Loading the fresh MediaSource during a timeline seek can emit a stale
     // error from the detached buffer. The current stream is still valid.
-    if (!video.getAttribute('src') || streamStarting) return;
+    if (!video.getAttribute('src') || (streamStarting && !video.error)) return;
     paused = true;
     release();
     status.textContent = 'Playback unavailable: ' + (video.error?.message || 'video error');
@@ -836,4 +963,12 @@ function decodeMulaw(value) {
   const mantissa = sample & 0x0f;
   const magnitude = (((mantissa << 3) + 0x84) << exponent) - 0x84;
   return Math.max(-1, Math.min(1, (sign ? -magnitude : magnitude) / 32768));
+}
+
+function decodeAlaw(value) {
+  const sample = value ^ 0x55;
+  const exponent = (sample >> 4) & 7;
+  let magnitude = ((sample & 15) << 4) + (exponent ? 0x108 : 8);
+  if (exponent > 1) magnitude <<= exponent - 1;
+  return (sample & 0x80 ? magnitude : -magnitude) / 32768;
 }

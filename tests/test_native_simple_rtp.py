@@ -8,7 +8,38 @@ from custom_components.tuya_recordings.lib.native_simple_rtp import (
     NativeSimpleMediaParser,
     NativeSimpleRtpError,
     parse_rtp_packet,
+    simple_audio_payload,
+    SIMPLE_AUDIO_CODECS,
 )
+
+
+def test_audio_dispatch_matches_native_jump_table():
+    assert SIMPLE_AUDIO_CODECS == {0: 133, 8: 132, 97: 4, 99: 0xFFFE}
+
+
+def test_unmarked_access_unit_keeps_its_own_camera_timestamp():
+    unpacker = NativeH264RtpDepacketizer()
+    assert unpacker.push(NativeRtpPacket(96, False, 1, 100, 1, b"\x61first"),
+        presentation_timestamp=1790000000000) == ()
+    assert unpacker.push(NativeRtpPacket(96, True, 2, 200, 1, b"\x61second"),
+        presentation_timestamp=1790000000200) == (b"\x00\x00\x00\x01\x61first", b"\x00\x00\x00\x01\x61second")
+    assert unpacker.completed_timestamps == (1790000000000, 1790000000200)
+
+
+def test_audio_extension_supplies_format_indices():
+    header = bytes(16) + struct.pack("<I", 1) + bytes(4)
+    extension = struct.pack("<BB3H", 0, 0, 3, 1, 1)
+    packet = NativeSimpleMediaParser().feed(header + extension + struct.pack("<I", 1) + b"x")[0]
+    assert packet.audio_format_indices == (3, 1, 1)
+
+
+def test_aac_audio_strips_sdk_au_header_without_changing_bytes():
+    payload = b"aac-packet"
+    header = b"\x00\x10" + (len(payload) << 3).to_bytes(2, "big")
+    packet = NativeRtpPacket(97, True, 1, 90000, 1, header + payload)
+    assert simple_audio_payload(packet) == payload
+    with pytest.raises(NativeSimpleRtpError, match="AU size"):
+        simple_audio_payload(NativeRtpPacket(97, True, 1, 90000, 1, header + payload + b"x"))
 
 
 def test_parses_captured_simple_media_packet_incrementally():

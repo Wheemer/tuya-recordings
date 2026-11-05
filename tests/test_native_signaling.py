@@ -2,6 +2,7 @@ import asyncio
 import json
 import ssl
 
+import pytest
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
 
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.models import (
@@ -13,6 +14,132 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import 
     relay_candidate_frame,
     relay_offer_frame,
 )
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import (
+    TuyaIpcP2pProtocolError,
+)
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.answer import (
+    parse_answer,
+)
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import (
+    encode_payload,
+)
+
+
+@pytest.mark.parametrize("version", ["2.2", "2.3"])
+def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
+    answers = []
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session",
+        local_key="0123456789abcdef", on_answer=answers.append,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        protocol_version=version,
+    )
+    header = {"type": "answer", "sessionid": "session"}
+    answer = {"header": header, "msg": {"sdp": "private-sdp"}}
+    frames = [
+        (22, answer),
+        (302, {}),
+        (302, {"header": header, "msg": {}}),
+        (302, {"header": {**header, "sessionid": "other"}, "msg": answer["msg"]}),
+        (302, {"header": {**header, "type": "private-type"}, "msg": {}}),
+        (302, answer),
+    ]
+    for sequence, (protocol, data) in enumerate(frames, 1):
+        client._consume(encode_payload(
+            b"0123456789abcdef", sequence, b"test", data, 0, protocol, version
+        ))
+    assert answers == ["private-sdp"]
+    assert "session_mismatches=1" in client.diagnostics
+    assert "answer=1,answer_without_sdp=1,invalid_shape=1,other_session_message=1,signal_query=1" in client.diagnostics
+    assert "private-" not in client.diagnostics
+
+
+def test_invalid_answer_key_is_a_protocol_error_without_key_material():
+    with pytest.raises(TuyaIpcP2pProtocolError, match="invalid AES key encoding") as err:
+        parse_answer("a=ice-ufrag:test\na=ice-pwd:test\na=aes-key:private-key")
+    assert "private-key" not in str(err.value)
+
+
+def test_mqtt_close_failure_retains_client_for_cleanup_retry():
+    class Broker:
+        attempts = 0
+
+        async def __aexit__(self, *args):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("close failed")
+
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session",
+        local_key="0123456789abcdef", on_answer=lambda _: None,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+    broker = Broker()
+    client._client = broker
+
+    async def run():
+        with pytest.raises(OSError, match="close failed"):
+            await client.async_close()
+        assert client._client is broker
+        await client.async_close()
+        assert client._client is None
+
+    asyncio.run(run())
+
+
+def test_direct_close_attempts_all_channels_and_retains_failed_channel():
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.direct_session import DirectSession
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pSessionError
+
+    class Channel:
+        def __init__(self, fails):
+            self.fails = fails
+            self.calls = 0
+
+        async def async_close(self):
+            self.calls += 1
+            if self.fails and self.calls == 1:
+                raise OSError("close failed")
+
+    async def run():
+        session = DirectSession(lambda data: None)
+        await session.control.async_close()
+        failed, healthy = Channel(True), Channel(False)
+        session._conversations = {0: failed, 1: healthy}
+        with pytest.raises(TuyaIpcP2pSessionError, match="cleanup incomplete"):
+            await session.async_close()
+        assert healthy.calls == 1
+        assert session._conversations == {0: failed}
+        await session.async_close()
+        assert session._conversations == {}
+        assert failed.calls == 2
+
+    asyncio.run(run())
+
+
+def test_signaling_reader_reports_transport_failure_without_retrying():
+    from types import SimpleNamespace
+
+    class FailedMessages:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise ConnectionError("private-broker-details")
+
+    failures = []
+    client = MotoClient(identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session", local_key="0123456789abcdef",
+        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        on_failure=failures.append)
+    client._client = SimpleNamespace(messages=FailedMessages())
+    asyncio.run(client._async_read())
+    assert failures == ["ConnectionError"]
+    assert "failure=ConnectionError" in client.diagnostics
+    assert "private-broker-details" not in client.diagnostics
+    assert "published=0" in client.diagnostics
 
 
 def test_mqtt_offer_preserves_apk_signaling_header():
@@ -132,5 +259,5 @@ def test_stream_config_uses_consumer_app_preconnect_policy():
 
 def test_signaling_tls_validates_the_broker_certificate_chain():
     """Regional hostname mismatch must not disable certificate validation."""
-    assert moto_client._BROKER_TLS.check_hostname is False
+    assert moto_client._BROKER_TLS.check_hostname is True
     assert moto_client._BROKER_TLS.verify_mode is ssl.CERT_REQUIRED

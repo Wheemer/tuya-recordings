@@ -52,8 +52,21 @@ class CameraCommandQueue:
         self._owner = None
         self._owner_cancel: threading.Event | None = None
         self._owner_playback = False
+        self._unsafe_transports = set()
         self.capacity = capacity
         self.wait_timeout = wait_timeout
+
+    def quarantine(self, owner):
+        """Block new work while an owner's transport teardown is unproven."""
+        with self._condition:
+            self._unsafe_transports.add(owner)
+            self._condition.notify_all()
+
+    def clear_quarantine(self, owner):
+        """Release the interlock only after that owner's transport is closed."""
+        with self._condition:
+            self._unsafe_transports.discard(owner)
+            self._condition.notify_all()
 
     def playback_waiting(self) -> bool:
         with self._condition:
@@ -68,6 +81,8 @@ class CameraCommandQueue:
         nested = False
         deadline = time.monotonic() + self.wait_timeout
         with self._condition:
+            if self._unsafe_transports:
+                raise CameraWorkBusy("Camera work is blocked until failed transport cleanup completes")
             if cancel_event is not None and cancel_event.is_set():
                 raise CameraWorkCancelled("Camera operation cancelled")
             if self._owner == identity:
@@ -99,6 +114,8 @@ class CameraCommandQueue:
                 self._waiting.insert(position, item)
                 try:
                     while True:
+                        if self._unsafe_transports:
+                            raise CameraWorkBusy("Camera work is blocked until failed transport cleanup completes")
                         if cancel_event is not None and cancel_event.is_set():
                             raise CameraWorkCancelled("Camera operation cancelled")
                         if self._owner is None and self._waiting[0][0] is ticket:

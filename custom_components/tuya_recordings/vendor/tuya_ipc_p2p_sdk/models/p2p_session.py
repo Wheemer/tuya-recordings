@@ -10,10 +10,10 @@ from ..json_types import JsonObject, optional_str, require_str
 @dataclass(frozen=True, slots=True)
 class P2pSession:
     """
-    The session the device pre-registers with the signaling server.
+    Session identity and local offer credentials.
 
-    Its ICE credentials and media key have to be offered verbatim: an offer
-    carrying the client's own goes unanswered.
+    An accepted app token supplies these fields. Native HTTP initialization
+    instead generates local ICE/media credentials before posting its SDP.
     """
 
     session_id: str = field(repr=False)

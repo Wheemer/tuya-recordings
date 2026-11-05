@@ -36,6 +36,8 @@ _BINDING_SUCCESS = 0x0101
 _ATTRIBUTE_XOR_MAPPED_ADDRESS = 0x0020
 _ATTRIBUTE_MESSAGE_INTEGRITY = 0x0008
 _ATTRIBUTE_FINGERPRINT = 0x8028
+_ATTRIBUTE_USERNAME = 0x0006
+_ATTRIBUTE_USE_CANDIDATE = 0x0025
 
 _FINGERPRINT_XOR = 0x5354554E
 _HOST_CANDIDATE_PRIORITY = 2130706431
@@ -130,9 +132,11 @@ class IceResponder(asyncio.DatagramProtocol):
         send_key: bytes | None = None,
         receive_key: bytes | None = None,
         on_segment: Callable[[bytes], None] | None = None,
+        local_ufrag: str | None = None,
     ) -> None:
         """Bind the responder to the session's local ICE password."""
         self._local_password = local_password
+        self._local_ufrag = local_ufrag
         self._on_candidate = on_candidate
         self._send_key = send_key
         self._receive_keys = tuple(
@@ -145,6 +149,50 @@ class IceResponder(asyncio.DatagramProtocol):
         self._received_segments = 0
         self._authentication_failures = 0
         self._nominated = asyncio.Event()
+
+    def _binding_request(self, data: bytes) -> bool | None:
+        """Authenticate a complete STUN request; return its nomination flag."""
+        if len(data) != 20 + int.from_bytes(data[2:4], "big") or len(data) % 4:
+            return None
+        offset = 20
+        username = None
+        nominated = False
+        authenticated = False
+        while offset < len(data):
+            if offset + 4 > len(data):
+                return None
+            kind = int.from_bytes(data[offset:offset + 2], "big")
+            size = int.from_bytes(data[offset + 2:offset + 4], "big")
+            end = offset + 4 + size
+            if end > len(data):
+                return None
+            value = data[offset + 4:end]
+            if kind == _ATTRIBUTE_MESSAGE_INTEGRITY:
+                if authenticated or size != 20:
+                    return None
+                prefix = bytearray(data[:offset])
+                prefix[2:4] = (end - 20).to_bytes(2, "big")
+                if not hmac.compare_digest(value, hmac_sha1(self._local_password.encode(), bytes(prefix))):
+                    return None
+                authenticated = True
+            elif kind == _ATTRIBUTE_FINGERPRINT:
+                if size != 4 or end != len(data) or int.from_bytes(value, "big") != (crc32(data[:offset]) ^ _FINGERPRINT_XOR):
+                    return None
+            elif authenticated:
+                # Unauthenticated trailing attributes cannot change the ICE role.
+                return None
+            elif kind == _ATTRIBUTE_USERNAME:
+                username = value
+            elif kind == _ATTRIBUTE_USE_CANDIDATE:
+                if size:
+                    return None
+                nominated = True
+            offset = end + (-size % 4)
+        if not authenticated or not username:
+            return None
+        if self._local_ufrag is not None and username.split(b":", 1)[0] != self._local_ufrag.encode():
+            return None
+        return nominated
 
     async def async_gather(self) -> None:
         """Bind the socket and publish the host candidate it listens on."""
@@ -167,8 +215,13 @@ class IceResponder(asyncio.DatagramProtocol):
             and int.from_bytes(data[0:2], "big") == _BINDING_REQUEST
             and int.from_bytes(data[4:8], "big") == _STUN_MAGIC_COOKIE
         ):
-            self._remote = addr
-            self._nominated.set()
+            nominated = self._binding_request(data)
+            if nominated is None:
+                self._authentication_failures += 1
+                return
+            if nominated:
+                self._remote = addr
+                self._nominated.set()
             self._binding_requests += 1
             host, port = addr[0], addr[1]
             address = host.decode() if isinstance(host, bytes) else host
@@ -180,7 +233,7 @@ class IceResponder(asyncio.DatagramProtocol):
                 addr,
             )
             return
-        if len(data) <= 20 or self._on_segment is None:
+        if len(data) <= 20 or self._on_segment is None or addr != self._remote:
             return
         segment, tag = data[:-20], data[-20:]
         if not any(

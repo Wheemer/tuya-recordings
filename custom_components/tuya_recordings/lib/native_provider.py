@@ -47,10 +47,8 @@ class NativeAppCameraConfigProvider:
     app_region: str = "us"
     app_profile_id: str = "smart_life"
     app_device_fingerprint: str = ""
-    # The APK's connectV3 trace belongs to one short-lived camera transport.
-    # Runtime workers disconnect after eight idle seconds, so this cache must
-    # expire first; otherwise a replacement worker reuses an already-consumed
-    # trace and the camera never answers its IMM offer.
+    # Keep camera bootstrap data short-lived. A new transport may need fresh
+    # credentials/configuration; a reused trace is not proven to cause #25.
     cache_ttl: float = 5.0
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _cache: dict[str, tuple[float, NativeCameraSessionConfig]] = field(

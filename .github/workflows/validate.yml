@@ -27,6 +27,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-test.txt
           python -m playwright install --with-deps chromium
+      - name: Validate pinned frontend bundles
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python tools/vendor_frontend.py
       - name: Validate Python, JSON, and tests
         env:
           PYTHONPATH: .

@@ -11,8 +11,10 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import date
+from functools import partial
 from typing import Any
 
+from .commands import CAMERA_COMMANDS
 from .native_frames import NATIVE_PLAYBACK_EVENT_VERSION, NativePlaybackEventSink
 from .native_media_crypto import (
     NativeMediaCryptoError,
@@ -36,6 +38,62 @@ _PLAYBACK_STOP_TIMEOUT_SECONDS = 5.0
 _THUMBNAIL_DEADLINE_GRACE_SECONDS = 1.0
 _STOP_WORKER = object()
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _close_worker_transport(worker, playback, *, abort=False):
+    """Retain failed transports and lock out further camera commands."""
+    owner = getattr(worker, "_cleanup_owner", worker)
+    try:
+        await (playback.abort() if abort else playback.close())
+    except BaseException:
+        worker._unfinished_transport = playback
+        CAMERA_COMMANDS.quarantine(owner)
+        raise
+    else:
+        if getattr(worker, "_unfinished_transport", None) is playback:
+            worker._unfinished_transport = None
+            CAMERA_COMMANDS.clear_quarantine(owner)
+
+
+async def _thread_job(function, *args):
+    """Keep cancellation from abandoning a still-running bounded pipe write."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await task
+        raise
+
+
+class _WorkerQueue(queue.Queue):
+    """Thread-safe submissions that wake the transport loop without blocking it."""
+
+    def __init__(self):
+        super().__init__()
+        self._loop = None
+        self._available = None
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        if self._loop is not None and self._available is not None:
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._available.set)
+
+    async def get_async(self, timeout=None):
+        if self._available is None:
+            self._loop = asyncio.get_running_loop()
+            self._available = asyncio.Event()
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    self._available.clear()
+                    try:
+                        return self.get_nowait()
+                    except queue.Empty:
+                        await self._available.wait()
+        except TimeoutError as err:
+            raise queue.Empty from err
 
 
 class _CancellationGroup:
@@ -82,6 +140,7 @@ class _CatalogWork:
     days: list[date]
     cancel_event: Any
     events: bool = False
+    months: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
     results: list[tuple[date, list[dict[str, Any]]]] | None = None
@@ -110,7 +169,7 @@ class NativeRelayStreamWorker:
         self._media_secrets = media_secrets
         self._playback_factory = playback_factory
         self._end_idle_timeout = end_idle_timeout
-        self._requests: queue.Queue[object] = queue.Queue()
+        self._requests: queue.Queue[object] = _WorkerQueue()
         self._state_lock = threading.Lock()
         self._closed = False
         self._shutdown_event = threading.Event()
@@ -169,7 +228,7 @@ class NativeRelayStreamWorker:
         if threading.current_thread() is self._thread:
             return False
         self._thread.join(max(0.0, timeout))
-        return not self._thread.is_alive()
+        return not self._thread.is_alive() and not getattr(self, "_unfinished_transport", None)
 
     def uses_config(self, config: NativeCameraSessionConfig) -> bool:
         candidate = config.validate()
@@ -184,25 +243,27 @@ class NativeRelayStreamWorker:
         while True:
             try:
                 work = (
-                    self._requests.get()
+                    await self._requests.get_async()
                     if playback is None
-                    else self._requests.get(timeout=0.5)
+                    else await self._requests.get_async(0.5)
                 )
             except queue.Empty:
                 if time.monotonic() - last_work >= _PLAYBACK_IDLE_SECONDS:
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                 continue
             if work is _STOP_WORKER:
+                playback = playback or getattr(self, "_unfinished_transport", None)
                 if playback is not None:
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                 return
             if isinstance(work, _DisconnectWork):
                 try:
+                    playback = playback or getattr(self, "_unfinished_transport", None)
                     if playback is not None:
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                         playback = None
                 except BaseException as err:  # noqa: BLE001 - cross-thread handoff
                     work.error = err
@@ -217,6 +278,8 @@ class NativeRelayStreamWorker:
                 )
                 if cancellation.is_set():
                     raise NativeRelayRuntimeError("Native playback was cancelled")
+                if getattr(self, "_unfinished_transport", None) is not None:
+                    raise NativeRelayRuntimeError("Previous native transport did not close")
                 if playback is None:
                     playback = self._playback_factory(
                         self._config,
@@ -247,11 +310,11 @@ class NativeRelayStreamWorker:
                         await playback.stop()
                     except Exception:
                         with suppress(Exception):
-                            await playback.close()
+                            await _close_worker_transport(self, playback)
                         playback = None
                 if failed and playback is not None:
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                 last_work = time.monotonic()
                 work.done.set()
@@ -276,7 +339,7 @@ class NativeRelayPlaybackWorker:
         self._playback_factory = playback_factory
         self._end_idle_timeout = end_idle_timeout
         self._command_timeout = command_timeout
-        self._requests: queue.Queue[object] = queue.Queue()
+        self._requests: queue.Queue[object] = _WorkerQueue()
         self._state_lock = threading.Lock()
         self._closed = False
         self._shutdown_event = threading.Event()
@@ -330,10 +393,10 @@ class NativeRelayPlaybackWorker:
         return work.image
 
     def catalog(
-        self, days: list[date], cancel_event: Any, *, events: bool = False
+        self, days: list[date], cancel_event: Any, *, events: bool = False, months: bool = False
     ) -> list[tuple[date, list[dict[str, Any]]]]:
         """Query recording days through the shared sequential camera session."""
-        work = _CatalogWork(days, cancel_event, events=events)
+        work = _CatalogWork(days, cancel_event, events=events, months=months)
         self._submit(work)
         work.done.wait()
         if work.error is not None:
@@ -384,7 +447,7 @@ class NativeRelayPlaybackWorker:
         if threading.current_thread() is self._thread:
             return False
         self._thread.join(max(0.0, timeout))
-        return not self._thread.is_alive()
+        return not self._thread.is_alive() and not getattr(self, "_unfinished_transport", None)
 
     def _submit(
         self,
@@ -401,9 +464,8 @@ class NativeRelayPlaybackWorker:
         # Smart Life issues the trace id with the camera configuration and then
         # passes that same value into connectV3. A worker may reuse a transport
         # while its complete configuration remains current, but it must rotate
-        # after the provider refreshes that configuration. Keeping the old
-        # trace indefinitely prevents a camera that rebooted or returned from
-        # an outage from accepting a new IMM offer.
+        # after the provider refreshes that configuration. This consistency
+        # rule is not evidence that trace reuse caused a missing IMM answer.
         return self._config == candidate
 
     def _thread_main(self) -> None:
@@ -418,9 +480,9 @@ class NativeRelayPlaybackWorker:
                 # Wake periodically only while a transport needs idle expiry.
                 # Once disconnected, block until real work or the stop marker.
                 work = (
-                    self._requests.get()
+                    await self._requests.get_async()
                     if playback is None
-                    else self._requests.get(timeout=0.5)
+                    else await self._requests.get_async(0.5)
                 )
             except queue.Empty:
                 if (
@@ -428,26 +490,28 @@ class NativeRelayPlaybackWorker:
                     and time.monotonic() - last_work >= _PLAYBACK_IDLE_SECONDS
                 ):
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                     connection_mode = None
                 elif isinstance(work, _InteractivePlaybackWork) and playback is not None:
                     # Leaving the APK viewer destroys its camera object. Keep no
                     # hidden ICE/MQTT transport after the browser session ends.
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                     connection_mode = None
                 continue
             if work is _STOP_WORKER:
+                playback = playback or getattr(self, "_unfinished_transport", None)
                 if playback is not None:
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                 return
             if isinstance(work, _DisconnectWork):
                 try:
+                    playback = playback or getattr(self, "_unfinished_transport", None)
                     if playback is not None:
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                         playback = None
                         connection_mode = None
                 except BaseException as err:  # noqa: BLE001 - cross-thread handoff
@@ -463,13 +527,12 @@ class NativeRelayPlaybackWorker:
                 failed = False
                 if self._work_cancelled(work):
                     raise NativeRelayRuntimeError("Native camera work was cancelled")
-                # Smart Life performs catalog, JPEG, and playback commands on
-                # one fully initialized camera session. Reusing that session
-                # avoids back-to-back IMM offers that cameras may reject.
-                wanted_mode = "media"
+                if getattr(self, "_unfinished_transport", None) is not None:
+                    raise NativeRelayRuntimeError("Previous native transport did not close")
+                wanted_mode = "metadata" if isinstance(work, _CatalogWork | _ThumbnailWork) else "media"
                 if playback is not None and connection_mode != wanted_mode:
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                     connection_mode = None
                 if playback is None:
@@ -481,11 +544,8 @@ class NativeRelayPlaybackWorker:
                         playback.connect(media=wanted_mode == "media"),
                         work,
                         timeout=self._command_timeout + 60,
-                        # A cancelled catalog refresh may already have opened
-                        # the camera transport that the next playback needs.
-                        # Finish only that connect; browser playback remains
-                        # promptly cancellable.
-                        cancellable=not isinstance(work, _CatalogWork),
+                        # A cancelled connect must close before priority work.
+                        cancellable=True,
                     )
                     connection_mode = wanted_mode
                 if isinstance(work, _InteractivePlaybackWork):
@@ -549,16 +609,20 @@ class NativeRelayPlaybackWorker:
                             if work.events
                             else playback.query_recordings
                         )
+                        if work.months:
+                            recorded = await self._wait_for_work(playback.query_recording_days(day), work,
+                                                                  timeout=self._command_timeout)
+                            results.append((day, [{"date": value.isoformat()} for value in recorded]))
+                            continue
                         page = await self._wait_for_work(
                             query(day),
                             work,
                             timeout=self._command_timeout,
                         )
                         if self._media_secrets is not None:
-                            self._media_secrets.prefetch(
-                                item.uuid
-                                for item in page.items
-                                if item.encrypt and item.uuid
+                            await asyncio.to_thread(
+                                self._media_secrets.prefetch,
+                                [item.uuid for item in page.items if item.encrypt and item.uuid],
                             )
                         results.append(
                             (day, [item.as_recording() for item in page.items])
@@ -581,7 +645,7 @@ class NativeRelayPlaybackWorker:
                         if callable(abort):
                             with suppress(Exception):
                                 await asyncio.wait_for(
-                                    abort(),
+                                    _close_worker_transport(self, playback, abort=True),
                                     timeout=_POOL_CLOSE_TIMEOUT_SECONDS,
                                 )
                         else:
@@ -591,7 +655,7 @@ class NativeRelayPlaybackWorker:
                             playback._playback_started = False
                             with suppress(Exception):
                                 await asyncio.wait_for(
-                                    playback.close(),
+                                    _close_worker_transport(self, playback),
                                     timeout=_POOL_CLOSE_TIMEOUT_SECONDS,
                                 )
                         playback = None
@@ -601,7 +665,7 @@ class NativeRelayPlaybackWorker:
                     # native playback transaction half-open. Do not hand that
                     # transport to the next clip.
                     with suppress(Exception):
-                        await playback.close()
+                        await _close_worker_transport(self, playback)
                     playback = None
                     connection_mode = None
                 last_work = time.monotonic()
@@ -664,9 +728,11 @@ class NativeRelayRuntimePool:
         app_session: dict[str, Any],
         *,
         media_secrets: NativeMediaSecretStore | None = None,
+        call_api: Any = None,
     ) -> None:
         self._app_session = app_session
         self._media_secrets = media_secrets
+        self._playback_factory = partial(NativeRelayPlaybackSession, call_api=call_api)
         self._workers: dict[str, NativeRelayPlaybackWorker] = {}
         self._lock = threading.Lock()
         self._closed = False
@@ -677,6 +743,8 @@ class NativeRelayRuntimePool:
         cancel_event: Any,
     ) -> NativeRelayRuntimeSession:
         config = config.validate()
+        if config.p2p_type != 4:
+            raise NativeRelayRuntimeError("Native playback currently supports P2P type 4 cameras")
         with self._lock:
             if self._closed:
                 raise NativeRelayRuntimeError("Native runtime pool is closed")
@@ -694,7 +762,7 @@ class NativeRelayRuntimePool:
                     config,
                     self._app_session,
                     media_secrets=self._media_secrets,
-                    playback_factory=NativeRelayPlaybackSession,
+                    playback_factory=self._playback_factory,
                 )
                 self._workers[config.dev_id] = worker
         return NativeRelayRuntimeSession(
@@ -709,18 +777,26 @@ class NativeRelayRuntimePool:
     def close(self) -> None:
         """Close every lazily-created camera worker."""
         with self._lock:
-            if self._closed:
+            if self._closed and not self._workers:
                 return
             self._closed = True
-            workers = tuple(self._workers.values())
-            self._workers.clear()
+            workers = tuple(self._workers.items())
         # Cancel every camera first so one slow transport cannot delay
         # cancellation of the remaining workers.
-        for worker in workers:
+        for _, worker in workers:
             worker.close()
         deadline = time.monotonic() + _POOL_CLOSE_TIMEOUT_SECONDS
-        for worker in workers:
-            worker.wait_closed(max(0.0, deadline - time.monotonic()))
+        unfinished = 0
+        for dev_id, worker in workers:
+            if not worker.wait_closed(max(0.0, deadline - time.monotonic())):
+                unfinished += 1
+            else:
+                with self._lock:
+                    self._workers.pop(dev_id, None)
+        if unfinished:
+            raise NativeRelayRuntimeError(
+                f"{unfinished} native camera worker(s) did not stop within the cleanup deadline"
+            )
 
 
 @dataclass(slots=True)
@@ -742,6 +818,8 @@ class NativeRelayRuntimeSession:
     playback_worker: NativeRelayPlaybackWorker | None = field(default=None, repr=False)
     command_worker: NativeRelayPlaybackWorker | None = field(default=None, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _unfinished_transport: Any = field(default=None, init=False, repr=False)
+    _cleanup_owner: object = field(default_factory=object, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.config = self.config.validate()
@@ -753,6 +831,15 @@ class NativeRelayRuntimeSession:
             raise NativeRelayRuntimeError("Native end idle timeout is invalid")
 
     def close(self) -> None:
+        if self._closed:
+            return
+        if self._unfinished_transport is not None:
+            raise NativeRelayRuntimeError("One-shot native transport cleanup incomplete")
+        # The backend still owns CAMERA_COMMANDS here. Release the transport
+        # before that ownership passes to another camera.
+        workers = {id(worker): worker for worker in (self.command_worker, self.playback_worker) if worker is not None}
+        for worker in workers.values():
+            worker.disconnect()
         self._closed = True
 
     def start_playback_stream(
@@ -870,6 +957,15 @@ class NativeRelayRuntimeSession:
                 f"Native catalog failed: {type(err).__name__}"
             ) from err
 
+    def recording_days_for_month(self, month: date) -> list[date]:
+        if self._closed or self._cancelled():
+            raise NativeRelayRuntimeError("Native month query was cancelled")
+        worker = self.command_worker or self.playback_worker
+        if worker is None:
+            raise NativeRelayRuntimeError("Native month query requires the serialized worker")
+        rows = worker.catalog([month], self.cancel_event, months=True)[0][1]
+        return [date.fromisoformat(row["date"]) for row in rows]
+
     def event_recordings_for_day(self, day: date) -> list[dict[str, Any]]:
         """Query the APK event timeline when the camera advertises it."""
         if self._closed:
@@ -939,8 +1035,7 @@ class NativeRelayRuntimeSession:
             )
             await self._stream_connected(playback, request, event_handler)
         finally:
-            with suppress(Exception):
-                await playback.close()
+            await _close_worker_transport(self, playback)
 
     async def _download_thumbnail(self, start: int, end: int) -> bytes:
         playback = self.playback_factory(
@@ -956,8 +1051,7 @@ class NativeRelayRuntimeSession:
                 timeout=self.signaling_timeout,
             )
         finally:
-            with suppress(Exception):
-                await playback.close()
+            await _close_worker_transport(self, playback)
 
     async def _stream_connected(
         self,
@@ -970,7 +1064,7 @@ class NativeRelayRuntimeSession:
         if request.encrypted:
             assert self.media_secrets is not None
             uuid = request.encryption_uuid.strip()
-            playback_secrets[uuid] = self.media_secrets.secret(uuid)
+            playback_secrets[uuid] = await asyncio.to_thread(self.media_secrets.secret, uuid)
         sink = NativePlaybackEventSink(event_handler, protocol=self.protocol)
         started = False
         try:
@@ -1020,7 +1114,7 @@ class NativeRelayRuntimeSession:
             request,
             play_mode_supported=self.config.playback_mode_supported,
         ).validate()
-        playback_secrets, recording_uuid = self._playback_secrets(current)
+        playback_secrets, recording_uuid = await asyncio.to_thread(self._playback_secrets, current)
         receive_task: asyncio.Task[Any] | None = None
         paused = False
         started = False
@@ -1104,7 +1198,7 @@ class NativeRelayRuntimeSession:
                         next_request,
                         play_mode_supported=self.config.playback_mode_supported,
                     ).validate()
-                    playback_secrets, recording_uuid = self._playback_secrets(current)
+                    playback_secrets, recording_uuid = await asyncio.to_thread(self._playback_secrets, current)
                     generation += 1
                     audio_codec_info = None
                     saw_audio = False
@@ -1169,7 +1263,7 @@ class NativeRelayRuntimeSession:
                     saw_audio = True
                 else:
                     saw_video = True
-                sink.frame(converted)
+                await _thread_job(sink.frame, converted)
         finally:
             if receive_task is not None:
                 receive_task.cancel()
@@ -1234,7 +1328,7 @@ class NativeRelayRuntimeSession:
         playback = self.playback_factory(self.config, self.app_session)
         try:
             await asyncio.wait_for(
-                playback.connect(media=True), timeout=self.signaling_timeout + 60
+                playback.connect(media=False), timeout=self.signaling_timeout + 60
             )
             try:
                 page = await asyncio.wait_for(
@@ -1246,13 +1340,11 @@ class NativeRelayRuntimeSession:
                     f"Native event catalog timed out ({playback.transport_diagnostics})"
                 ) from err
             if self.media_secrets is not None:
-                self.media_secrets.prefetch(
-                    item.uuid for item in page.items if item.encrypt and item.uuid
-                )
+                await asyncio.to_thread(self.media_secrets.prefetch,
+                    [item.uuid for item in page.items if item.encrypt and item.uuid])
             return [item.as_recording() for item in page.items]
         finally:
-            with suppress(Exception):
-                await playback.close()
+            await _close_worker_transport(self, playback)
 
     async def _recordings_for_days(
         self, days: list[date]
@@ -1263,7 +1355,7 @@ class NativeRelayRuntimeSession:
         )
         try:
             await asyncio.wait_for(
-                playback.connect(media=True), timeout=self.signaling_timeout + 60
+                playback.connect(media=False), timeout=self.signaling_timeout + 60
             )
             results: list[tuple[date, list[dict[str, Any]]]] = []
             for day in days:
@@ -1279,14 +1371,12 @@ class NativeRelayRuntimeSession:
                         f"Native catalog timed out ({playback.transport_diagnostics})"
                     ) from err
                 if self.media_secrets is not None:
-                    self.media_secrets.prefetch(
-                        item.uuid for item in page.items if item.encrypt and item.uuid
-                    )
+                    await asyncio.to_thread(self.media_secrets.prefetch,
+                        [item.uuid for item in page.items if item.encrypt and item.uuid])
                 results.append((day, [item.as_recording() for item in page.items]))
             return results
         finally:
-            with suppress(Exception):
-                await playback.close()
+            await _close_worker_transport(self, playback)
 
     async def _receive_media(
         self,
@@ -1345,7 +1435,7 @@ class NativeRelayRuntimeSession:
                 saw_audio = True
             else:
                 saw_video = True
-            sink.frame(converted)
+            await _thread_job(sink.frame, converted)
 
     async def _wait_cancelable(self, operation: Any, *, timeout: float) -> Any:
         """Run one camera operation while honoring a browser handoff promptly."""
