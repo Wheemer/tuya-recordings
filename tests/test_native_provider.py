@@ -52,7 +52,8 @@ def test_extract_camera_info_rejects_missing_shape():
         extract_camera_info({"result": {"not": "camera"}})
 
 
-def test_provider_uses_apk_connection_config_and_normalizes_session_config():
+@pytest.mark.parametrize(("profile", "api_version"), [("smart_life", "1.1"), ("tuya_smart", "1.0")])
+def test_provider_uses_apk_connection_config_and_normalizes_session_config(profile, api_version):
     calls = []
 
     def call_api(api, version, body, extra_params):
@@ -63,17 +64,23 @@ def test_provider_uses_apk_connection_config_and_normalizes_session_config():
         call_api=call_api,
         local_key_lookup=lambda dev_id: "local-key",
         trace_factory=lambda dev_id: "ipc_p2p_android_dev123_1234",
+        app_profile_id=profile,
+        wake_capability_lookup=lambda _: {
+            "capability": "remote", "direct": True, "sd_low_power": True,
+        },
     )
     config = provider.session_config("dev123")
     assert calls == [
         (
             APK_RTC_CONFIG_API,
-            "1.0",
+            api_version,
             {"devId": "dev123"},
             {"bizDM": "ipc", "ctId": "ipc_p2p_android_dev123_1234"},
         )
     ]
     assert config.dev_id == "dev123"
+    assert config.wake_capability == "remote"
+    assert config.sd_low_power_wake is True
     assert config.trace_id == "ipc_p2p_android_dev123_1234"
     assert config.derived_password == derive_native_password("camera-password", "local-key")
 

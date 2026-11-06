@@ -15,6 +15,16 @@ from custom_components.tuya_recordings.client import (
 from custom_components.tuya_recordings.const import DOMAIN
 
 
+def test_runtime_uses_refreshed_pv_even_with_stale_options():
+    key = "device_protocol_versions"
+    entry = SimpleNamespace(data={key: {"camera": "2.3"}}, options={key: {"camera": "2.2"}})
+    assert integration._entry_runtime_data(entry)[key] == {"camera": "2.3"}
+    entry.data[key] = {}
+    assert integration._entry_runtime_data(entry)[key] == {}
+    entry.data = {}
+    assert key not in integration._entry_runtime_data(entry)
+
+
 def test_entries_for_call_returns_all_valid_clients():
     first = {"client": TuyaRecordingsClient({})}
     second = {"client": TuyaRecordingsClient({})}
@@ -89,4 +99,3 @@ def test_setup_prefers_persisted_native_app_camera_inventory(monkeypatch, tmp_pa
         {"tuya-porch": "Porch Cam", "tuya-garage": "Garage"},
         source="native_app_inventory",
     )
-

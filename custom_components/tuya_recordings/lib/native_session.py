@@ -16,6 +16,7 @@ from typing import Any
 APK_RTC_CONFIG_API = "m.ipc.v4.rtc.config.get"
 APK_RTC_SESSION_INIT_API = "thing.m.rtc.session.init"
 APK_API_VERSION = "1.0"
+SMART_LIFE_RTC_CONFIG_VERSION = "1.1"
 APK_CAMERA_BIZ_DM = "ipc"
 APK_DEFAULT_USERNAME = "admin"
 APK_PLAYBACK_MODE_DEFAULT = 0
@@ -105,6 +106,13 @@ class NativeCameraSessionConfig:
     app_profile_id: str = "smart_life"
     app_device_fingerprint: str = field(default="", repr=False)
     mqtt_protocol_version: str = "2.2"
+    wake_capability: str = "unknown"
+    wake_direct: bool = False
+    sd_low_power_wake: bool | None = None
+    sd_status_mqtt_dp: str = ""
+    sd_status_http_dp: str = ""
+    sd_status_lan_dp: str = ""
+    sd_status_lan_error_route: str = ""
 
     @property
     def username(self) -> str:
@@ -235,7 +243,7 @@ class NativeCameraSessionConfig:
         if any((self.app_sid, self.app_ecode, self.app_uid)) and not self.has_app_session:
             raise NativeSessionError("Native app session must include sid, ecode, and uid")
         try:
-            if float(self.mqtt_protocol_version) < 1.0:
+            if self.mqtt_protocol_version != "" and not 1.0 <= float(self.mqtt_protocol_version) < float("inf"):
                 raise ValueError
         except (TypeError, ValueError) as err:
             raise NativeSessionError("Native MQTT protocol version is invalid") from err
@@ -377,14 +385,14 @@ def derive_native_password(camera_password: str, local_key: str) -> str:
 
 
 def native_session_api_request(
-    dev_id: str, *, trace_id: str
+    dev_id: str, *, trace_id: str, app_profile_id: str = "smart_life"
 ) -> tuple[str, str, dict[str, Any], dict[str, str]]:
     """Return the APK camera-config request, including URL parameters."""
     _required("dev_id", dev_id)
     _required("trace_id", trace_id)
     return (
         APK_RTC_CONFIG_API,
-        APK_API_VERSION,
+        APK_API_VERSION if app_profile_id == "tuya_smart" else SMART_LIFE_RTC_CONFIG_VERSION,
         {"devId": dev_id},
         {"bizDM": APK_CAMERA_BIZ_DM, "ctId": trace_id},
     )
@@ -417,6 +425,13 @@ def normalize_camera_info(
     app_profile_id: str = "smart_life",
     app_device_fingerprint: str = "",
     mqtt_protocol_version: str = "2.2",
+    wake_capability: str = "unknown",
+    wake_direct: bool = False,
+    sd_low_power_wake: bool | None = None,
+    sd_status_mqtt_dp: str = "",
+    sd_status_http_dp: str = "",
+    sd_status_lan_dp: str = "",
+    sd_status_lan_error_route: str = "",
 ) -> NativeCameraSessionConfig:
     """Convert the app API `CameraInfoBean` shape into native connect inputs."""
     if not isinstance(camera_info, dict):
@@ -457,6 +472,13 @@ def normalize_camera_info(
         app_profile_id=app_profile_id or "smart_life",
         app_device_fingerprint=app_device_fingerprint,
         mqtt_protocol_version=mqtt_protocol_version,
+        wake_capability=wake_capability,
+        wake_direct=wake_direct,
+        sd_low_power_wake=sd_low_power_wake,
+        sd_status_mqtt_dp=sd_status_mqtt_dp,
+        sd_status_http_dp=sd_status_http_dp,
+        sd_status_lan_dp=sd_status_lan_dp,
+        sd_status_lan_error_route=sd_status_lan_error_route,
     ).validate()
 
 

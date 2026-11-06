@@ -248,6 +248,10 @@ def _async_scrub_legacy_entry_data(hass: HomeAssistant, entry: ConfigEntry, entr
 def _entry_runtime_data(entry: ConfigEntry) -> dict:
     """Combine persisted setup and options for one runtime client."""
     runtime = {**entry.data, **entry.options}
+    # Inventory refresh owns this field; options must not resurrect old PVs.
+    runtime.pop(CONF_DEVICE_PROTOCOL_VERSIONS, None)
+    if CONF_DEVICE_PROTOCOL_VERSIONS in entry.data:
+        runtime[CONF_DEVICE_PROTOCOL_VERSIONS] = entry.data[CONF_DEVICE_PROTOCOL_VERSIONS]
     media_sync_enabled = bool(runtime.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
     runtime[CONF_THUMBNAIL_SYNC_ENABLED] = media_sync_enabled
     # Pausing camera work is meaningful in both modes. In the default

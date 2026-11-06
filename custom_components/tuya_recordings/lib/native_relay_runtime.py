@@ -14,7 +14,7 @@ from datetime import date
 from functools import partial
 from typing import Any
 
-from .commands import CAMERA_COMMANDS
+from .commands import CAMERA_COMMANDS, ON_DEMAND_DAY_CATALOG
 from .native_frames import NATIVE_PLAYBACK_EVENT_VERSION, NativePlaybackEventSink
 from .native_media_crypto import (
     NativeMediaCryptoError,
@@ -141,6 +141,7 @@ class _CatalogWork:
     cancel_event: Any
     events: bool = False
     months: bool = False
+    allow_wake: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
     results: list[tuple[date, list[dict[str, Any]]]] | None = None
@@ -396,7 +397,10 @@ class NativeRelayPlaybackWorker:
         self, days: list[date], cancel_event: Any, *, events: bool = False, months: bool = False
     ) -> list[tuple[date, list[dict[str, Any]]]]:
         """Query recording days through the shared sequential camera session."""
-        work = _CatalogWork(days, cancel_event, events=events, months=months)
+        work = _CatalogWork(
+            days, cancel_event, events=events, months=months,
+            allow_wake=not events and not months and ON_DEMAND_DAY_CATALOG.get(),
+        )
         self._submit(work)
         work.done.wait()
         if work.error is not None:
@@ -540,8 +544,9 @@ class NativeRelayPlaybackWorker:
                         self._config,
                         self._app_session,
                     )
+                    connect_options = {"allow_wake": True} if isinstance(work, _CatalogWork) and work.allow_wake else {}
                     await self._wait_for_work(
-                        playback.connect(media=wanted_mode == "media"),
+                        playback.connect(media=wanted_mode == "media", **connect_options),
                         work,
                         timeout=self._command_timeout + 60,
                         # A cancelled connect must close before priority work.
@@ -732,7 +737,9 @@ class NativeRelayRuntimePool:
     ) -> None:
         self._app_session = app_session
         self._media_secrets = media_secrets
-        self._playback_factory = partial(NativeRelayPlaybackSession, call_api=call_api)
+        self._playback_factory = partial(
+            NativeRelayPlaybackSession, call_api=call_api,
+        )
         self._workers: dict[str, NativeRelayPlaybackWorker] = {}
         self._lock = threading.Lock()
         self._closed = False
