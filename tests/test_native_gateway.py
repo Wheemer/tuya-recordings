@@ -322,6 +322,9 @@ def test_inventory_resolves_missing_wireless_schema_once_per_home(monkeypatch, p
             ]
         if api == "thing.m.device.product.ref.list":
             return []
+        if api == "thing.m.device.get":
+            assert refresh_protocols
+            return None
         assert api == "m.life.app.smart.local.device.list"
         lookups.append((version, post, extra_params))
         if not available:
@@ -386,7 +389,7 @@ def test_inventory_resolves_missing_wireless_schema_once_per_home(monkeypatch, p
 def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, profile, refresh):
     client = NativeAppGatewayClient(session=FakeSession(), app_profile_id=profile)
     requests = []
-    detail_ids = ("recovered", "missing", "wrong-device", "wrong-product", "malformed", "unavailable")
+    detail_ids = ("group", "home", "recovered", "missing", "wrong-device", "wrong-product", "malformed", "unavailable")
 
     def row(dev_id, **fields):
         return {"devId": dev_id, "localKey": "fixture-key", "category": "sp", "productId": "p1", **fields}
@@ -398,7 +401,7 @@ def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, prof
             if extra_params == {"gid": "456"}:
                 return [row("missing")]
             return [row("group", pv="2.2"), row("home"),
-                    {**row("plug"), "category": "cz"}, *(row(dev_id) for dev_id in detail_ids)]
+                    {**row("plug"), "category": "cz"}, *(row(dev_id) for dev_id in detail_ids[2:])]
         if api == "thing.m.device.product.ref.list":
             return []
         if api == "m.life.app.smart.local.device.list":
@@ -407,6 +410,12 @@ def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, prof
         assert (version, extra_params, app_session.sid) == ("4.1", {"gid": "123"}, "sid")
         dev_id = post["devId"]
         requests.append(dev_id)
+        if dev_id in {"group", "home"}:
+            return row(
+                dev_id, pv="2.1",
+                communication={"communicationNode": dev_id if dev_id == "group" else "hub"},
+                skills={"p2pType": 2}, dataPointInfo={"dps": {"149": False}},
+            )
         if dev_id == "unavailable":
             raise NativeGatewayError("optional detail unavailable")
         if dev_id == "malformed":
@@ -421,12 +430,16 @@ def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, prof
         return row(dev_id, communication={"communicationModes": [{"type": 1, "pv": "2.3"}]})
 
     monkeypatch.setattr(NativeAppGatewayClient, "call", fake_call)
-    _, protocols, _ = client.device_connection_inventory_data({
+    _, protocols, inventory = client.device_connection_inventory_data({
         "sid": "sid", "ecode": "ecode", "uid": "uid", "partner_identity": "partner",
         "mobile_mqtts_url": "mqtt.example.test", "device_fingerprint": "fingerprint",
     }, refresh_protocols=refresh)
     assert requests == (list(detail_ids) if refresh else [])
     assert protocols == {"group": "2.2", "home": "2.3", **({"recovered": "2.3"} if refresh else {})}
+    evidence = {item["devId"]: (item.get("wakeDirect"), item.get("sdLowPowerWake")) for item in inventory}
+    assert evidence["group"] == ((True, True) if refresh else (None, None))
+    assert evidence["home"] == ((False, False) if refresh else (None, None))
+    assert evidence["missing"] == (None, None)
 
 
 @pytest.mark.parametrize("homes", [None, {}, "invalid"])
