@@ -246,7 +246,7 @@ class NativeAppGatewayClient:
         protocol_versions: dict[str, str] = {}
         inventory: list[dict[str, Any]] = []
         home_rows: dict[int, list[dict[str, Any]]] = {}
-        camera_details: dict[str, tuple[int, str]] = {}
+        camera_details: dict[str, tuple[int, dict[str, Any]]] = {}
         seen: set[int] = set()
         for home in homes:
             if not isinstance(home, dict) or type(home.get("gid")) is not int:
@@ -308,7 +308,7 @@ class NativeAppGatewayClient:
                     if product_id:
                         home_rows.setdefault(gid, []).append(row)
                     if refresh_protocols:
-                        camera_details.setdefault(dev_id, (gid, product_id))
+                        camera_details.setdefault(dev_id, (gid, row))
         product_ids = {row["productId"] for row in inventory if row["productId"]}
         references = self._product_wake_capabilities(product_ids, app_session)
         for row in inventory:
@@ -316,6 +316,7 @@ class NativeAppGatewayClient:
                 wake != "none" or row.get("wakeCapability") in (None, "none")
             ):
                 row["wakeCapability"] = wake
+        home_products: dict[int, dict[str, dict[str, Any]]] = {}
         for gid, rows in home_rows.items():
             unresolved = [
                 row for row in rows
@@ -327,9 +328,11 @@ class NativeAppGatewayClient:
                     and not {"sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp"} & row.keys())
             ]
             if unresolved:
-                self._enrich_camera_wake_from_home(gid, unresolved, app_session, protocol_versions)
-        for dev_id, (gid, product_id) in camera_details.items():
-            if dev_id in protocol_versions:
+                home_products[gid] = self._enrich_camera_wake_from_home(
+                    gid, unresolved, app_session, protocol_versions,
+                )
+        for dev_id, (gid, row) in camera_details.items():
+            if dev_id in protocol_versions and "sdLowPowerWake" in row:
                 continue
             try:
                 detail = self.call(
@@ -341,17 +344,20 @@ class NativeAppGatewayClient:
                 continue
             if not isinstance(detail, dict) or detail.get("devId") != dev_id:
                 continue
+            product_id = row["productId"]
             detail_product = detail.get("productId")
             if product_id and detail_product and detail_product != product_id:
                 continue
-            if pv := _device_mqtt_protocol_version(detail):
+            if dev_id not in protocol_versions and (pv := _device_mqtt_protocol_version(detail)):
                 protocol_versions[dev_id] = pv
+            product = home_products.get(gid, {}).get(product_id)
+            _apply_sd_wake_metadata(row, {**detail, "productBean": product} if product else detail, dev_id)
         return found, protocol_versions, inventory
 
     def _enrich_camera_wake_from_home(
         self, gid: int, rows: list[dict[str, Any]], app_session: NativeAppSession,
         protocol_versions: dict[str, str],
-    ) -> None:
+    ) -> dict[str, dict[str, Any]]:
         """Join the app's separately cached device, product and reference records."""
         try:
             result = self.call(
@@ -359,9 +365,9 @@ class NativeAppGatewayClient:
                 {"homeId": gid, "groupType": "homeGroup"}, app_session,
             )
         except NativeGatewayError:
-            return
+            return {}
         if not isinstance(result, dict):
-            return
+            return {}
 
         def index(field: str, key: str) -> dict[str, dict[str, Any]]:
             records = result.get(field)
@@ -382,31 +388,16 @@ class NativeAppGatewayClient:
                 continue
             if pv := _device_mqtt_protocol_version(device):
                 protocol_versions[dev_id] = pv
-            communication = device.get("communication")
-            target = communication.get("communicationNode") if isinstance(communication, dict) else None
-            if isinstance(target, str) and target:
-                row["wakeDirect"] = target == dev_id
             product = products.get(product_id)
             resolved = {**device, "productBean": product}
-            if (eligible := _sd_low_power_wake(resolved, dev_id)) is not None:
-                row["sdLowPowerWake"] = eligible
-            if eligible and (dp := _sd_status_mqtt_dp(resolved)):
-                row.pop("sdStatusHttpDp", None)
-                row["sdStatusMqttDp"] = dp
-            elif eligible and (dp := _sd_status_http_dp(resolved)):
-                row.pop("sdStatusMqttDp", None)
-                row["sdStatusHttpDp"] = dp
-            if eligible and (dp := _sd_status_lan_dp(resolved)):
-                row["sdStatusLanDp"] = dp
-                row.pop("sdStatusLanErrorRoute", None)
-                if route := _sd_status_lan_error_route(resolved):
-                    row["sdStatusLanErrorRoute"] = route
+            _apply_sd_wake_metadata(row, resolved, dev_id)
             wake = _product_wake_capability(references.get(product_id))
             if wake not in (None, "none"):
                 row["wakeCapability"] = wake
             elif row.get("wakeCapability") in (None, "none"):
                 if _supports_direct_wireless_wake(resolved, dev_id):
                     row["wakeCapability"] = "wireless"
+        return products
 
     def _product_wake_capabilities(
         self, product_ids: set[str], app_session: NativeAppSession,
@@ -504,6 +495,32 @@ def _supports_direct_wireless_wake(device: dict[str, Any], dev_id: str) -> bool:
         isinstance(product, dict) and _is_provider_two(device, dev_id) is True
         and any(entry.get("code") == "wireless_awake" for entry in _product_schema(product))
     )
+
+
+def _apply_sd_wake_metadata(row: dict[str, Any], device: dict[str, Any], dev_id: str) -> None:
+    communication = device.get("communication")
+    target = communication.get("communicationNode") if isinstance(communication, dict) else device.get("communicationId")
+    if isinstance(target, str) and target:
+        row["wakeDirect"] = target == dev_id
+    eligible = _sd_low_power_wake(device, dev_id)
+    if eligible is None:
+        return
+    row["sdLowPowerWake"] = eligible
+    if not eligible:
+        for key in ("sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp", "sdStatusLanErrorRoute"):
+            row.pop(key, None)
+        return
+    if dp := _sd_status_mqtt_dp(device):
+        row.pop("sdStatusHttpDp", None)
+        row["sdStatusMqttDp"] = dp
+    elif dp := _sd_status_http_dp(device):
+        row.pop("sdStatusMqttDp", None)
+        row["sdStatusHttpDp"] = dp
+    if dp := _sd_status_lan_dp(device):
+        row["sdStatusLanDp"] = dp
+        row.pop("sdStatusLanErrorRoute", None)
+        if route := _sd_status_lan_error_route(device):
+            row["sdStatusLanErrorRoute"] = route
 
 
 def _is_provider_two(device: dict[str, Any], dev_id: str) -> bool | None:

@@ -84,10 +84,16 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
-@pytest.mark.parametrize("outcome", ["home", "resend", "silent"])
+@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "no_card"])
 def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monkeypatch, outcome):
     from custom_components.tuya_recordings.client import TuyaRecordingsClient
-    from custom_components.tuya_recordings.lib.commands import on_demand_offer_retries
+    from zlib import crc32
+
+    from custom_components.tuya_recordings.lib.commands import (
+        ON_DEMAND_DAY_CATALOG,
+        CameraCommandQueue,
+        on_demand_offer_retries,
+    )
     from custom_components.tuya_recordings.lib.native_gateway import NativeAppGatewayClient
     from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
     from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import (
@@ -104,6 +110,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     refreshed_offers = []
     events = []
     detail_lookup = outcome != "home"
+    wake = outcome in {"wake", "no_card"}
     day = date(2026, 9, 15)
     clip_start, clip_end = 1789459300, 1789459310
     key = config.local_key.encode()
@@ -113,14 +120,23 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
         if api == "tuya.m.location.list":
             return [{"gid": 1}]
         if api == "tuya.m.my.group.device.list":
+            pv = {"pv": "2.3"} if wake else {} if detail_lookup else {"pv": "2.2"}
             return [{"devId": dev, "localKey": config.local_key, "category": "sp",
-                     "productId": "fixture-product", **({} if detail_lookup else {"pv": "2.2"})}]
+                     "productId": "fixture-product", **pv}]
         if api == "thing.m.device.product.ref.list":
             return []
         detail = {"devId": dev, "productId": "fixture-product",
-                  "communication": {"communicationModes": [{"type": 1, "pv": "2.3"}]}}
+                  "communication": {"communicationNode": dev, "dataModel": 1,
+                                    "communicationModes": [{"type": 1, "pv": "2.3"}]},
+                  "skills": {"p2pType": 2}, "dataPointInfo": {"dps": {"149": False} if wake else {}},
+                  "gatewayVerCAD": "1.0.2", "cloudOnline": True}
         if api == "m.life.app.smart.local.device.list":
-            return {"deviceList": [] if detail_lookup else [detail]}
+            return {
+                "deviceList": [] if detail_lookup else [detail],
+                "productList": [{"id": "fixture-product", "schemaInfo": {
+                    "schema": '[{"id":"110","code":"sd_status"}]',
+                }}],
+            }
         assert detail_lookup
         assert (api, version, post, extra_params) == (
             "thing.m.device.get", "4.1", {"devId": dev}, {"gid": "1"},
@@ -141,9 +157,26 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
             assert (topic, qos) == (f"smart/mb/in/{dev}", 1)
             return (1,)
 
-        async def publish(self, topic, payload, *, qos):
-            assert (topic, qos) == (f"smart/mb/out/{dev}", 0)
+        async def publish(self, topic, payload, *, qos, **kwargs):
+            if topic == f"m/w/{dev}":
+                assert wake and qos == 0 and kwargs["retain"] is False
+                assert payload == crc32(key).to_bytes(4, "big")
+                events.append("wake")
+                return
+            assert topic == f"smart/mb/out/{dev}"
             protocol, body = decode_payload(key, payload)
+            if protocol == 5:
+                assert wake and qos == 1 and payload[:3] == b"2.3"
+                assert body["dps"] == {"110": None}
+                assert events == ["wake"]
+                events.append("sd-query")
+                reply = encode_payload(
+                    key, 1, b"test", {"devId": dev, "dps": {"110": 5 if outcome == "no_card" else 1}},
+                    0, 4, "2.3",
+                )
+                self.inbound.put_nowait(SimpleNamespace(topic=f"smart/mb/in/{dev}", payload=reply))
+                return
+            assert qos == 0
             assert protocol == 302
             header = body["header"]
             if header["type"] == "disconnect":
@@ -154,7 +187,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
             if payload[:3] != b"2.3":
                 return
             refreshed_offers.append(body)
-            if outcome == "home" or (outcome == "resend" and len(refreshed_offers) == 2):
+            if outcome in {"home", "wake"} or (outcome == "resend" and len(refreshed_offers) == 2):
                 reply = encode_payload(
                     key, 1, b"test",
                     {"header": {"type": "answer", "sessionid": header["sessionid"]},
@@ -222,6 +255,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
     monkeypatch.setattr(relay_module, "IceResponder", Ice)
     monkeypatch.setattr(relay_module, "DirectSession", Direct)
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
     monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS", (0.03, 0.06, 0.12, 0.24))
     monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.32)
     entry_data = {
@@ -246,16 +280,25 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     assert client.refresh_inventory(entry_data)["device_protocol_versions"] == {dev: "2.3"}
     events.clear()
     backend = client._recordings_backend
+    token = ON_DEMAND_DAY_CATALOG.set(wake)
     try:
         with on_demand_offer_retries():
             if outcome == "silent":
                 with pytest.raises(NativeRelayPlaybackError, match="Timed out waiting") as exc:
                     backend.recordings_for_day(dev, {}, {}, day)
+            elif outcome == "no_card":
+                with pytest.raises(NativeRelayPlaybackError, match="report_no_card"):
+                    backend.recordings_for_day(dev, {}, {}, day)
             else:
                 clips = backend.recordings_for_day(dev, {}, {}, day)
     finally:
+        ON_DEMAND_DAY_CATALOG.reset(token)
         backend.close()
-    count = {"home": 1, "resend": 2, "silent": 5}[outcome]
+    if outcome == "no_card":
+        assert offers == [b"2.2"]
+        assert events == ["wake", "sd-query", "broker-closed"]
+        return
+    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1}[outcome]
     assert offers == [b"2.2"] + [b"2.3"] * count
     assert refreshed_offers == [refreshed_offers[0]] * count
     if outcome == "silent":
@@ -263,7 +306,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
         assert "received=0" in str(exc.value)
         assert events == ["offer"] * count + ["direct-closed", "broker-closed"]
     else:
-        assert events == ["offer"] * count + ["answer", "nominated", "catalog", "direct-closed", "broker-closed"]
+        prefix = ["wake", "sd-query"] if wake else []
+        assert events == prefix + ["offer"] * count + ["answer", "nominated", "catalog", "direct-closed", "broker-closed"]
         assert [(clip["start"], clip["end"]) for clip in clips] == [(clip_start, clip_end)]
 
 

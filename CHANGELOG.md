@@ -1,5 +1,12 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-3 (unreleased)
+
+### Fixes
+
+- Manual refresh now checks camera details when SD playback wake eligibility is unknown, even if the MQTT protocol version is already known.
+- Use the matching product schema to query SD card status after waking an eligible camera. A no-card report stops the request before a playback offer is sent.
+
 ## Tuya Recordings v0.4.13-2 (unreleased)
 
 ### Fixes
