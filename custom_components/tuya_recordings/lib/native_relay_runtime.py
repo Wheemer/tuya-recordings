@@ -14,7 +14,7 @@ from datetime import date
 from functools import partial
 from typing import Any
 
-from .commands import CAMERA_COMMANDS, ON_DEMAND_DAY_CATALOG
+from .commands import CAMERA_COMMANDS, ON_DEMAND_DAY_CATALOG, ON_DEMAND_OFFER_RETRIES
 from .native_frames import NATIVE_PLAYBACK_EVENT_VERSION, NativePlaybackEventSink
 from .native_media_crypto import (
     NativeMediaCryptoError,
@@ -106,11 +106,16 @@ class _CancellationGroup:
         return any(event is not None and event.is_set() for event in self._events)
 
 
+def _offer_retry_options(enabled: bool) -> dict[str, bool]:
+    return {"retry_offer": True} if enabled else {}
+
+
 @dataclass(slots=True)
 class _PlaybackWork:
     request: NativePlaybackRequest
     event_handler: Callable[[dict[str, Any]], None]
     cancel_event: Any
+    retry_offer: bool = field(default_factory=ON_DEMAND_OFFER_RETRIES.get)
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
 
@@ -121,6 +126,7 @@ class _InteractivePlaybackWork:
     event_handler: Callable[[dict[str, Any]], None]
     commands: queue.Queue[tuple[str, NativePlaybackRequest | None]]
     cancel_event: Any
+    retry_offer: bool = field(default_factory=ON_DEMAND_OFFER_RETRIES.get)
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
 
@@ -142,6 +148,7 @@ class _CatalogWork:
     events: bool = False
     months: bool = False
     allow_wake: bool = False
+    retry_offer: bool = field(default_factory=ON_DEMAND_OFFER_RETRIES.get)
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
     results: list[tuple[date, list[dict[str, Any]]]] | None = None
@@ -286,7 +293,7 @@ class NativeRelayStreamWorker:
                         self._config,
                         self._app_session,
                     )
-                    await playback.connect()
+                    await playback.connect(**_offer_retry_options(work.retry_offer))
                 runtime = NativeRelayRuntimeSession(
                     self._config,
                     app_session=self._app_session,
@@ -545,6 +552,8 @@ class NativeRelayPlaybackWorker:
                         self._app_session,
                     )
                     connect_options = {"allow_wake": True} if isinstance(work, _CatalogWork) and work.allow_wake else {}
+                    if not isinstance(work, _ThumbnailWork):
+                        connect_options.update(_offer_retry_options(work.retry_offer))
                     await self._wait_for_work(
                         playback.connect(media=wanted_mode == "media", **connect_options),
                         work,
@@ -1038,7 +1047,8 @@ class NativeRelayRuntimeSession:
         )
         try:
             await self._wait_cancelable(
-                playback.connect(media=True), timeout=self.signaling_timeout + 60
+                playback.connect(media=True, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60,
             )
             await self._stream_connected(playback, request, event_handler)
         finally:
@@ -1335,7 +1345,8 @@ class NativeRelayRuntimeSession:
         playback = self.playback_factory(self.config, self.app_session)
         try:
             await asyncio.wait_for(
-                playback.connect(media=False), timeout=self.signaling_timeout + 60
+                playback.connect(media=False, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60,
             )
             try:
                 page = await asyncio.wait_for(
@@ -1362,7 +1373,8 @@ class NativeRelayRuntimeSession:
         )
         try:
             await asyncio.wait_for(
-                playback.connect(media=False), timeout=self.signaling_timeout + 60
+                playback.connect(media=False, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60,
             )
             results: list[tuple[date, list[dict[str, Any]]]] = []
             for day in days:

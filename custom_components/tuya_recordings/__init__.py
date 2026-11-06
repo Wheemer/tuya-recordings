@@ -52,7 +52,7 @@ from .http import (
     TuyaRecordingsThumbnailView,
     TuyaRecordingsTimelineView,
 )
-from .lib.commands import CameraWorkBusy, CameraWorkCancelled
+from .lib.commands import CameraWorkBusy, CameraWorkCancelled, on_demand_offer_retries
 from .lib.native_setup import NativeBackendSetupError, native_app_session
 
 CONF_ENTRY_ID = "entry_id"
@@ -397,7 +397,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     updates = await hass.async_add_executor_job(client.refresh_inventory, _entry_runtime_data(entry))
                     hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
                 if client.media_sync_enabled:
-                    await hass.async_add_executor_job(client.refresh_recent_recordings)
+                    await hass.async_add_executor_job(on_demand_offer_retries()(client.refresh_recent_recordings))
                 else:
                     await _async_request_catalog_refresh(
                         hass, entry_data["entry"].entry_id, "service", wait=True
@@ -575,9 +575,10 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
     try:
         if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:
             return
-        result = await hass.async_add_executor_job(
-            client.refresh_background_catalog, CATALOG_SYNC_DAYS_PER_PASS
-        )
+        refresh = client.refresh_background_catalog
+        if reason == "service":
+            refresh = on_demand_offer_retries()(refresh)
+        result = await hass.async_add_executor_job(refresh, CATALOG_SYNC_DAYS_PER_PASS)
         _LOGGER.info("Tuya Recordings catalog refresh result for %s via %s: %s", entry_id, reason, result)
         if not client.cloud_activity_paused:
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)

@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-2 (unreleased)
+
+### Fixes
+
+- The **Refresh recordings** button now refreshes camera inventory before refreshing the SD card catalog.
+- When inventory doesn't report a camera's MQTT protocol version, an explicit refresh checks that camera's device details using the lookup found in Smart Life and Tuya Smart. The integration doesn't guess a version if it's still missing.
+- Extend bounded, same-session MQTT offer resends to on-demand playback and manual catalog requests. Scheduled refreshes and background sync are unchanged.
+
 ## Tuya Recordings v0.4.13-1 (2026-11-06)
 
 ### Fixes

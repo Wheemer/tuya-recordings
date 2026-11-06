@@ -84,9 +84,10 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
-def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monkeypatch):
+@pytest.mark.parametrize("outcome", ["home", "resend", "silent"])
+def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monkeypatch, outcome):
     from custom_components.tuya_recordings.client import TuyaRecordingsClient
-    from custom_components.tuya_recordings.lib.commands import ON_DEMAND_DAY_CATALOG
+    from custom_components.tuya_recordings.lib.commands import on_demand_offer_retries
     from custom_components.tuya_recordings.lib.native_gateway import NativeAppGatewayClient
     from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
     from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import (
@@ -100,7 +101,9 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
         **json.loads(config.config_json), "p2pSpecifiedType": 4, "p2pPolicy": 0, "skill": "{}",
     }
     offers = []
+    refreshed_offers = []
     events = []
+    detail_lookup = outcome != "home"
     day = date(2026, 9, 15)
     clip_start, clip_end = 1789459300, 1789459310
     key = config.local_key.encode()
@@ -111,12 +114,18 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
             return [{"gid": 1}]
         if api == "tuya.m.my.group.device.list":
             return [{"devId": dev, "localKey": config.local_key, "category": "sp",
-                     "productId": "fixture-product", "pv": "2.2"}]
+                     "productId": "fixture-product", **({} if detail_lookup else {"pv": "2.2"})}]
         if api == "thing.m.device.product.ref.list":
             return []
-        assert api == "m.life.app.smart.local.device.list"
-        return {"deviceList": [{"devId": dev, "productId": "fixture-product",
-                                "communication": {"communicationModes": [{"type": 1, "pv": "2.3"}]}}]}
+        detail = {"devId": dev, "productId": "fixture-product",
+                  "communication": {"communicationModes": [{"type": 1, "pv": "2.3"}]}}
+        if api == "m.life.app.smart.local.device.list":
+            return {"deviceList": [] if detail_lookup else [detail]}
+        assert detail_lookup
+        assert (api, version, post, extra_params) == (
+            "thing.m.device.get", "4.1", {"devId": dev}, {"gid": "1"},
+        )
+        return detail
 
     class Broker:
         def __init__(self, **_kwargs):
@@ -142,7 +151,10 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
             assert header["type"] == "offer"
             offers.append(payload[:3])
             events.append("offer")
-            if payload[:3] == b"2.3":
+            if payload[:3] != b"2.3":
+                return
+            refreshed_offers.append(body)
+            if outcome == "home" or (outcome == "resend" and len(refreshed_offers) == 2):
                 reply = encode_payload(
                     key, 1, b"test",
                     {"header": {"type": "answer", "sessionid": header["sessionid"]},
@@ -210,6 +222,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
     monkeypatch.setattr(relay_module, "IceResponder", Ice)
     monkeypatch.setattr(relay_module, "DirectSession", Direct)
+    monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS", (0.03, 0.06, 0.12, 0.24))
+    monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.32)
     entry_data = {
         "_native_app_call": lambda *_: bootstrap,
         "native_app_session": APP_SESSION,
@@ -231,16 +245,26 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     assert offers == [b"2.2"]
     assert client.refresh_inventory(entry_data)["device_protocol_versions"] == {dev: "2.3"}
     events.clear()
-    token = ON_DEMAND_DAY_CATALOG.set(True)
     backend = client._recordings_backend
     try:
-        clips = backend.recordings_for_day(dev, {}, {}, day)
+        with on_demand_offer_retries():
+            if outcome == "silent":
+                with pytest.raises(NativeRelayPlaybackError, match="Timed out waiting") as exc:
+                    backend.recordings_for_day(dev, {}, {}, day)
+            else:
+                clips = backend.recordings_for_day(dev, {}, {}, day)
     finally:
-        ON_DEMAND_DAY_CATALOG.reset(token)
         backend.close()
-    assert offers == [b"2.2", b"2.3"]
-    assert events == ["offer", "answer", "nominated", "catalog", "direct-closed", "broker-closed"]
-    assert [(clip["start"], clip["end"]) for clip in clips] == [(clip_start, clip_end)]
+    count = {"home": 1, "resend": 2, "silent": 5}[outcome]
+    assert offers == [b"2.2"] + [b"2.3"] * count
+    assert refreshed_offers == [refreshed_offers[0]] * count
+    if outcome == "silent":
+        assert "offer_retries=4" in str(exc.value)
+        assert "received=0" in str(exc.value)
+        assert events == ["offer"] * count + ["direct-closed", "broker-closed"]
+    else:
+        assert events == ["offer"] * count + ["answer", "nominated", "catalog", "direct-closed", "broker-closed"]
+        assert [(clip["start"], clip["end"]) for clip in clips] == [(clip_start, clip_end)]
 
 
 @pytest.mark.asyncio
@@ -593,8 +617,9 @@ async def test_sd_catalog_suppresses_hub_dp_wake(capability):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize("outcome", ["answer", "disconnect", "timeout", "cancel", "publish_error"])
-async def test_offer_retries_without_wake_reuse_payload_and_stop(monkeypatch, outcome):
+async def test_offer_retries_without_wake_reuse_payload_and_stop(monkeypatch, manual, outcome):
     from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import (
         TuyaIpcP2pError,
     )
@@ -603,7 +628,8 @@ async def test_offer_retries_without_wake_reuse_payload_and_stop(monkeypatch, ou
     playback = session()
     playback._answer = loop.create_future()
     playback._ended = loop.create_future()
-    playback._on_demand_catalog = True
+    playback._on_demand_catalog = not manual
+    playback._retry_mqtt_offer = manual
     offers = []
     answer = object()
 

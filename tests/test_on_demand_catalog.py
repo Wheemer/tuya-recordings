@@ -182,10 +182,13 @@ def test_failed_day_does_not_erase_known_recordings(tmp_path):
 
 
 def test_month_bitmap_is_cached_without_querying_daily_clips(tmp_path):
+    from custom_components.tuya_recordings.lib.commands import ON_DEMAND_OFFER_RETRIES
+
     class MonthBackend(DayCatalogBackend):
         def recording_days_for_month(self, dev_id, month, *, cancel_event=None):
             self.queries.append((dev_id, month))
             assert not cancel_event.is_set()
+            assert ON_DEMAND_OFFER_RETRIES.get()
             return [date(2025, 1, 2), date(2025, 1, 28)]
 
     backend = MonthBackend([])
@@ -194,6 +197,7 @@ def test_month_bitmap_is_cached_without_querying_daily_clips(tmp_path):
     month = date(2025, 1, 1)
     client.browse_recording_month("camera", month)
     index = client.browse_recording_month("camera", month)
+    assert not ON_DEMAND_OFFER_RETRIES.get()
     assert backend.queries == [("camera", month)]
     assert index["cameras"][0]["recordingMonths"]["2025-01"] == ["2025-01-02", "2025-01-28"]
 

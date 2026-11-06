@@ -186,6 +186,7 @@ class NativeRelayPlaybackSession:
         self._connect_mode = "unknown"
         self._token_route = "not_selected"
         self._on_demand_catalog = False
+        self._retry_mqtt_offer = False
         self._wake_status = "not_requested"
         self._sd_status_query = "not_requested"
         self._session: DirectSession | None = None
@@ -306,12 +307,15 @@ class NativeRelayPlaybackSession:
             f"sd_status_query={self._sd_status_query}"
         )
 
-    async def connect(self, *, media: bool = True, allow_wake: bool = False) -> None:
+    async def connect(
+        self, *, media: bool = True, allow_wake: bool = False, retry_offer: bool = False,
+    ) -> None:
         """Negotiate LAN-first, then require direct LAN media."""
         if self._closed or self._moto is not None:
             raise NativeRelayPlaybackError("Playback session cannot be connected")
         self._connect_started = time.monotonic()
         self._on_demand_catalog = allow_wake and not media
+        self._retry_mqtt_offer = retry_offer
         self._connect_mode = "media" if media else "metadata"
         self._connect_phase = "select_transport"
         loop = asyncio.get_running_loop()
@@ -497,7 +501,7 @@ class NativeRelayPlaybackSession:
                 f"Native MQTT offer publish failed ({self.transport_diagnostics})"
             ) from err
         self._offer_status = "published"
-        if self._on_demand_catalog:
+        if self._on_demand_catalog or self._retry_mqtt_offer:
             self._retry_offer = (started, send_offer)
 
     async def _close_failed_lan(self, lan: Lan302Client) -> None:
