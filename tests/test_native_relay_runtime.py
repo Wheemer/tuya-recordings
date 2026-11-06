@@ -4,6 +4,7 @@ import queue
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import date
 
@@ -45,6 +46,45 @@ TOKEN = {
     "sign_key": "sign",
     "ice_token": {"servers": [{"url": "stun:example.test:3478"}]},
 }
+
+
+@pytest.mark.parametrize("kind", ["clip", "timeline", "day", "month", "events", "thumbnail"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manual):
+    from custom_components.tuya_recordings.lib.commands import on_demand_offer_retries
+
+    calls = []
+
+    class Playback:
+        async def connect(self, **kwargs):
+            calls.append(kwargs)
+            raise ValueError("fixture stops after connect")
+
+        async def close(self):
+            pass
+
+    worker = NativeRelayPlaybackWorker(
+        camera_config(), APP_SESSION, playback_factory=lambda *args: Playback()
+    )
+    request = NativePlaybackRequest(start=100, end=110)
+    try:
+        with on_demand_offer_retries() if manual else nullcontext():
+            with pytest.raises(ValueError, match="fixture stops after connect"):
+                if kind == "clip":
+                    worker.stream(request, lambda _: None, None)
+                elif kind == "timeline":
+                    worker.interactive_stream(request, lambda _: None, queue.Queue(), None)
+                elif kind == "thumbnail":
+                    worker.thumbnail(100, 110, None)
+                else:
+                    worker.catalog([date(2026, 11, 3)], None, events=kind == "events", months=kind == "month")
+        assert calls == [{
+            "media": kind in {"clip", "timeline"},
+            **({"retry_offer": True} if manual and kind != "thumbnail" else {}),
+        }]
+    finally:
+        worker.close()
+        assert worker.wait_closed(2)
 
 
 def test_worker_failed_cleanup_blocks_reconnect_until_explicit_disconnect():

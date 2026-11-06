@@ -246,6 +246,7 @@ class NativeAppGatewayClient:
         protocol_versions: dict[str, str] = {}
         inventory: list[dict[str, Any]] = []
         home_rows: dict[int, list[dict[str, Any]]] = {}
+        camera_details: dict[str, tuple[int, str]] = {}
         seen: set[int] = set()
         for home in homes:
             if not isinstance(home, dict) or type(home.get("gid")) is not int:
@@ -303,8 +304,11 @@ class NativeAppGatewayClient:
                     if route := _sd_status_lan_error_route(device):
                         row["sdStatusLanErrorRoute"] = route
                 inventory.append(row)
-                if product_id and is_camera_inventory_record(row["category"], row["name"], product_id):
-                    home_rows.setdefault(gid, []).append(row)
+                if is_camera_inventory_record(row["category"], row["name"], product_id):
+                    if product_id:
+                        home_rows.setdefault(gid, []).append(row)
+                    if refresh_protocols:
+                        camera_details.setdefault(dev_id, (gid, product_id))
         product_ids = {row["productId"] for row in inventory if row["productId"]}
         references = self._product_wake_capabilities(product_ids, app_session)
         for row in inventory:
@@ -324,6 +328,24 @@ class NativeAppGatewayClient:
             ]
             if unresolved:
                 self._enrich_camera_wake_from_home(gid, unresolved, app_session, protocol_versions)
+        for dev_id, (gid, product_id) in camera_details.items():
+            if dev_id in protocol_versions:
+                continue
+            try:
+                detail = self.call(
+                    "thing.m.device.get", "4.1", {"devId": dev_id}, app_session, {"gid": str(gid)}
+                )
+            except NativeGatewayAuthError:
+                raise
+            except NativeGatewayError:
+                continue
+            if not isinstance(detail, dict) or detail.get("devId") != dev_id:
+                continue
+            detail_product = detail.get("productId")
+            if product_id and detail_product and detail_product != product_id:
+                continue
+            if pv := _device_mqtt_protocol_version(detail):
+                protocol_versions[dev_id] = pv
         return found, protocol_versions, inventory
 
     def _enrich_camera_wake_from_home(

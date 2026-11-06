@@ -33,6 +33,17 @@ class Deadline:
 
 _WORK_CANCEL = ContextVar("tuya_camera_work_cancel", default=None)
 ON_DEMAND_DAY_CATALOG = ContextVar("tuya_on_demand_day_catalog", default=False)
+ON_DEMAND_OFFER_RETRIES = ContextVar("tuya_on_demand_offer_retries", default=False)
+
+
+@contextmanager
+def on_demand_offer_retries():
+    """Opt a foreground request into same-session MQTT offer resends."""
+    token = ON_DEMAND_OFFER_RETRIES.set(True)
+    try:
+        yield
+    finally:
+        ON_DEMAND_OFFER_RETRIES.reset(token)
 
 
 @contextmanager

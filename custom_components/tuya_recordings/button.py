@@ -3,13 +3,11 @@ from __future__ import annotations
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .client import TuyaRecordingsAuthError
-from .const import DOMAIN, LOGGER, MANUFACTURER, NAME, SIGNAL_RECORDINGS_UPDATED
+from . import CONF_ENTRY_ID, SERVICE_REFRESH
+from .const import DOMAIN, LOGGER, MANUFACTURER, NAME
 
 
 async def async_setup_entry(
@@ -23,7 +21,7 @@ async def async_setup_entry(
 
 
 class TuyaRecordingsRefreshButton(ButtonEntity):
-    """Refresh the cached Tuya recordings index."""
+    """Refresh camera inventory and the Tuya recordings catalog."""
 
     _attr_has_entity_name = True
     _attr_name = "Refresh recordings"
@@ -41,17 +39,7 @@ class TuyaRecordingsRefreshButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """Refresh the cached recording index."""
-        entry_data = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
-        if not isinstance(entry_data, dict) or not entry_data.get("client"):
-            return
-        if getattr(entry_data["client"], "cloud_activity_paused", False):
-            LOGGER.info("Skipping Tuya Recordings manual refresh because camera activity is paused")
-            return
-
-        try:
-            await self.hass.async_add_executor_job(entry_data["client"].camera_index, True)
-        except TuyaRecordingsAuthError as exc:
-            self.entry.async_start_reauth(self.hass)
-            raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
-        async_dispatcher_send(self.hass, SIGNAL_RECORDINGS_UPDATED, self.entry.entry_id)
+        """Run the same entry-scoped refresh as the manual action."""
+        await self.hass.services.async_call(
+            DOMAIN, SERVICE_REFRESH, {CONF_ENTRY_ID: self.entry.entry_id}, blocking=True,
+        )

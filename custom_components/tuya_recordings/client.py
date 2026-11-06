@@ -68,6 +68,7 @@ from .lib.commands import (
     Deadline,
     camera_work_scope,
     ON_DEMAND_DAY_CATALOG,
+    on_demand_offer_retries,
 )
 from .lib.native_backend import RecordingBackend, RecordingBackendAuthError
 from .lib.native_playback import native_playback_request
@@ -489,7 +490,7 @@ class TuyaRecordingsClient:
             self._browse_months[key] = time.monotonic() + 30
             if len(self._browse_months) > 64:
                 self._browse_months.pop(next(iter(self._browse_months)))
-            with self._browse_camera_query(dev_id):
+            with self._browse_camera_query(dev_id), on_demand_offer_retries():
                 days = self._recordings_backend.recording_days_for_month(dev_id, month, cancel_event=cancellation)
             months = dict(camera.get("recordingMonths") or {})
             months[key[1]] = [value.isoformat() for value in days]
@@ -1023,7 +1024,9 @@ class TuyaRecordingsClient:
         cancel_event: threading.Event | None = None,
         log_traceback: bool = True,
     ) -> None:
-        with camera_work_scope(Cancellation(self._cloud_pause_event, cancel_event)) as cancellation:
+        with on_demand_offer_retries(), camera_work_scope(
+            Cancellation(self._cloud_pause_event, cancel_event)
+        ) as cancellation:
             self._stream_clip(
                 dev_id,
                 start,
@@ -1104,7 +1107,7 @@ class TuyaRecordingsClient:
         cancel_event: threading.Event | None = None,
     ) -> None:
         """Run one persistent APK-style SD-card timeline session."""
-        with camera_work_scope(
+        with on_demand_offer_retries(), camera_work_scope(
             Cancellation(self._cloud_pause_event, cancel_event)
         ) as cancellation:
             self._raise_if_cloud_paused()

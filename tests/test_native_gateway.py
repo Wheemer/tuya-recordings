@@ -381,6 +381,54 @@ def test_inventory_resolves_missing_wireless_schema_once_per_home(monkeypatch, p
     )
 
 
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+@pytest.mark.parametrize("refresh", [False, True])
+def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, profile, refresh):
+    client = NativeAppGatewayClient(session=FakeSession(), app_profile_id=profile)
+    requests = []
+    detail_ids = ("recovered", "missing", "wrong-device", "wrong-product", "malformed", "unavailable")
+
+    def row(dev_id, **fields):
+        return {"devId": dev_id, "localKey": "fixture-key", "category": "sp", "productId": "p1", **fields}
+
+    def fake_call(self, api, version, post, app_session=None, extra_params=None):
+        if api == "tuya.m.location.list":
+            return [{"gid": 123}, {"gid": 456}]
+        if api == "tuya.m.my.group.device.list":
+            if extra_params == {"gid": "456"}:
+                return [row("missing")]
+            return [row("group", pv="2.2"), row("home"),
+                    {**row("plug"), "category": "cz"}, *(row(dev_id) for dev_id in detail_ids)]
+        if api == "thing.m.device.product.ref.list":
+            return []
+        if api == "m.life.app.smart.local.device.list":
+            return {"deviceList": [row("home", pv="2.3")]}
+        assert api == "thing.m.device.get"
+        assert (version, extra_params, app_session.sid) == ("4.1", {"gid": "123"}, "sid")
+        dev_id = post["devId"]
+        requests.append(dev_id)
+        if dev_id == "unavailable":
+            raise NativeGatewayError("optional detail unavailable")
+        if dev_id == "malformed":
+            return []
+        if dev_id == "wrong-device":
+            return row("other-device", pv="2.3")
+        if dev_id == "wrong-product":
+            return {**row(dev_id, pv="2.3"), "productId": "p2"}
+        if dev_id == "missing":
+            return row(dev_id, communication={"communicationModes": [{"type": 0, "pv": "3.5"}]})
+        assert dev_id == "recovered"
+        return row(dev_id, communication={"communicationModes": [{"type": 1, "pv": "2.3"}]})
+
+    monkeypatch.setattr(NativeAppGatewayClient, "call", fake_call)
+    _, protocols, _ = client.device_connection_inventory_data({
+        "sid": "sid", "ecode": "ecode", "uid": "uid", "partner_identity": "partner",
+        "mobile_mqtts_url": "mqtt.example.test", "device_fingerprint": "fingerprint",
+    }, refresh_protocols=refresh)
+    assert requests == (list(detail_ids) if refresh else [])
+    assert protocols == {"group": "2.2", "home": "2.3", **({"recovered": "2.3"} if refresh else {})}
+
+
 @pytest.mark.parametrize("homes", [None, {}, "invalid"])
 def test_device_local_keys_rejects_malformed_home_list(monkeypatch, homes):
     client = NativeAppGatewayClient(session=FakeSession())
