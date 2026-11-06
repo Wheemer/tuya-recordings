@@ -23,6 +23,19 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .native_auth import NativeAppSession
 
+KNOWN_CAMERA_CATEGORIES = {"sp", "dghsxj"}
+KNOWN_CAMERA_CATEGORY_HINTS = ("camera", "ipc", "cam", "doorbell")
+CAMERA_NAME_HINTS = ("camera", "doorbell", "lobby", "ipc", "ip camera")
+
+
+def is_camera_inventory_record(category: str, name: str, product_id: str) -> bool:
+    category = category.strip().lower()
+    return (
+        category in KNOWN_CAMERA_CATEGORIES
+        or any(hint in category for hint in KNOWN_CAMERA_CATEGORY_HINTS)
+        or any(hint in value.lower() for value in (name, product_id) for hint in CAMERA_NAME_HINTS)
+    )
+
 @dataclass(frozen=True, slots=True)
 class NativeAppProfile:
     """APK-derived mobile gateway identity for one Tuya consumer app."""
@@ -222,7 +235,7 @@ class NativeAppGatewayClient:
         return local_keys, protocol_versions
 
     def device_connection_inventory_data(
-        self, saved: Any
+        self, saved: Any, *, refresh_protocols: bool = False,
     ) -> tuple[dict[str, str], dict[str, str], list[dict[str, Any]]]:
         """Capture the APK-native account inventory at setup or reauthorization."""
         app_session = _saved_session(saved)
@@ -232,6 +245,7 @@ class NativeAppGatewayClient:
         found: dict[str, str] = {}
         protocol_versions: dict[str, str] = {}
         inventory: list[dict[str, Any]] = []
+        home_rows: dict[int, list[dict[str, Any]]] = {}
         seen: set[int] = set()
         for home in homes:
             if not isinstance(home, dict) or type(home.get("gid")) is not int:
@@ -260,14 +274,139 @@ class NativeAppGatewayClient:
                 protocol_version = _device_mqtt_protocol_version(device)
                 if protocol_version is not None:
                     protocol_versions[dev_id] = protocol_version
-                inventory.append({
+                product_id = str(device.get("productId") or device.get("product_id") or "")
+                wake = _product_wake_capability(device.get("productRefBean"))
+                row = {
                     "devId": dev_id,
                     "name": str(device.get("name") or device.get("deviceName") or dev_id),
                     "category": str(device.get("category") or ""),
-                    "productId": str(device.get("productId") or device.get("product_id") or ""),
+                    "productId": product_id,
                     "online": device.get("online"),
-                })
+                }
+                if wake is not None:
+                    row["wakeCapability"] = wake
+                communication = device.get("communication")
+                if isinstance(communication, dict):
+                    row["wakeDirect"] = communication.get("communicationNode") in (None, "", dev_id)
+                elif isinstance(device.get("communicationId"), str):
+                    row["wakeDirect"] = device["communicationId"] == dev_id
+                if wake in (None, "none") and _supports_direct_wireless_wake(device, dev_id):
+                    row["wakeCapability"] = "wireless"
+                if (eligible := _sd_low_power_wake(device, dev_id)) is not None:
+                    row["sdLowPowerWake"] = eligible
+                if eligible and (dp := _sd_status_mqtt_dp(device)):
+                    row["sdStatusMqttDp"] = dp
+                elif eligible and (dp := _sd_status_http_dp(device)):
+                    row["sdStatusHttpDp"] = dp
+                if eligible and (dp := _sd_status_lan_dp(device)):
+                    row["sdStatusLanDp"] = dp
+                    if route := _sd_status_lan_error_route(device):
+                        row["sdStatusLanErrorRoute"] = route
+                inventory.append(row)
+                if product_id and is_camera_inventory_record(row["category"], row["name"], product_id):
+                    home_rows.setdefault(gid, []).append(row)
+        product_ids = {row["productId"] for row in inventory if row["productId"]}
+        references = self._product_wake_capabilities(product_ids, app_session)
+        for row in inventory:
+            if (wake := references.get(row["productId"])) is not None and (
+                wake != "none" or row.get("wakeCapability") in (None, "none")
+            ):
+                row["wakeCapability"] = wake
+        for gid, rows in home_rows.items():
+            unresolved = [
+                row for row in rows
+                if row.get("wakeCapability") in (None, "none") or "wakeDirect" not in row
+                or refresh_protocols
+                or row["devId"] not in protocol_versions
+                or "sdLowPowerWake" not in row
+                or (row.get("sdLowPowerWake") is True
+                    and not {"sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp"} & row.keys())
+            ]
+            if unresolved:
+                self._enrich_camera_wake_from_home(gid, unresolved, app_session, protocol_versions)
         return found, protocol_versions, inventory
+
+    def _enrich_camera_wake_from_home(
+        self, gid: int, rows: list[dict[str, Any]], app_session: NativeAppSession,
+        protocol_versions: dict[str, str],
+    ) -> None:
+        """Join the app's separately cached device, product and reference records."""
+        try:
+            result = self.call(
+                "m.life.app.smart.local.device.list", "1.1",
+                {"homeId": gid, "groupType": "homeGroup"}, app_session,
+            )
+        except NativeGatewayError:
+            return
+        if not isinstance(result, dict):
+            return
+
+        def index(field: str, key: str) -> dict[str, dict[str, Any]]:
+            records = result.get(field)
+            if not isinstance(records, list):
+                return {}
+            return {
+                identifier: record for record in records
+                if isinstance(record, dict) and (identifier := _optional_str(record, key))
+            }
+
+        devices = index("deviceList", "devId")
+        products = index("productList", "id")
+        references = index("productExtList", "productId")
+        for row in rows:
+            dev_id, product_id = row["devId"], row["productId"]
+            device = devices.get(dev_id)
+            if device is None or device.get("productId") != product_id:
+                continue
+            if pv := _device_mqtt_protocol_version(device):
+                protocol_versions[dev_id] = pv
+            communication = device.get("communication")
+            target = communication.get("communicationNode") if isinstance(communication, dict) else None
+            if isinstance(target, str) and target:
+                row["wakeDirect"] = target == dev_id
+            product = products.get(product_id)
+            resolved = {**device, "productBean": product}
+            if (eligible := _sd_low_power_wake(resolved, dev_id)) is not None:
+                row["sdLowPowerWake"] = eligible
+            if eligible and (dp := _sd_status_mqtt_dp(resolved)):
+                row.pop("sdStatusHttpDp", None)
+                row["sdStatusMqttDp"] = dp
+            elif eligible and (dp := _sd_status_http_dp(resolved)):
+                row.pop("sdStatusMqttDp", None)
+                row["sdStatusHttpDp"] = dp
+            if eligible and (dp := _sd_status_lan_dp(resolved)):
+                row["sdStatusLanDp"] = dp
+                row.pop("sdStatusLanErrorRoute", None)
+                if route := _sd_status_lan_error_route(resolved):
+                    row["sdStatusLanErrorRoute"] = route
+            wake = _product_wake_capability(references.get(product_id))
+            if wake not in (None, "none"):
+                row["wakeCapability"] = wake
+            elif row.get("wakeCapability") in (None, "none"):
+                if _supports_direct_wireless_wake(resolved, dev_id):
+                    row["wakeCapability"] = "wireless"
+
+    def _product_wake_capabilities(
+        self, product_ids: set[str], app_session: NativeAppSession,
+    ) -> dict[str, str]:
+        if not product_ids:
+            return {}
+        try:
+            references = self.call(
+                "thing.m.device.product.ref.list", "1.0",
+                {"productIds": _dump_json(sorted(product_ids)).decode("utf-8")},
+                app_session,
+            )
+        except NativeGatewayError:
+            # Optional diagnostics must not block inventory or authorization.
+            return {}
+        if not isinstance(references, list):
+            return {}
+        return {
+            pid: wake for ref in references if isinstance(ref, dict)
+            if (pid := _optional_str(ref, "productId")) in product_ids
+            and (wake := _product_wake_capability(ref)) is not None
+        }
 
     def _build_params(
         self,
@@ -336,14 +475,162 @@ class NativeAppGatewayClient:
         return result
 
 
+def _supports_direct_wireless_wake(device: dict[str, Any], dev_id: str) -> bool:
+    """Recognize the APK provider-2 fallback from a resolved product schema."""
+    product = device.get("productBean")
+    return (
+        isinstance(product, dict) and _is_provider_two(device, dev_id) is True
+        and any(entry.get("code") == "wireless_awake" for entry in _product_schema(product))
+    )
+
+
+def _is_provider_two(device: dict[str, Any], dev_id: str) -> bool | None:
+    communication = device.get("communication")
+    target = (
+        communication.get("communicationNode")
+        if isinstance(communication, dict) else device.get("communicationId")
+    )
+    if not target:
+        return None
+    if target != dev_id or device.get("virtual"):
+        return False
+    product = device.get("productBean")
+    skills = device.get("skills")
+    if skills is None:
+        meta = device.get("meta")
+        if isinstance(meta, dict) and "isSupportDirectlyDevice" in meta:
+            return True
+        return product.get("category") != "sp" if isinstance(product, dict) else None
+    p2p_type = skills.get("p2pType") if isinstance(skills, dict) else None
+    return (
+        type(p2p_type) in (int, float) and (p2p_type < 1 or p2p_type >= 2)
+        and device.get("uiName") != "singleHalfFisheyeCamera"
+    )
+
+
+def _sd_low_power_wake(device: dict[str, Any], dev_id: str) -> bool | None:
+    """Match the SD presenter's built-in provider-2 and DP-149 predicate."""
+    provider = _is_provider_two(device, dev_id)
+    if provider is not True:
+        return provider
+    info = device.get("dataPointInfo")
+    dps = info.get("dps") if isinstance(info, dict) else device.get("dps")
+    return "149" in dps if isinstance(dps, dict) else None
+
+
+def _product_schema(product: dict[str, Any]) -> list[dict[str, Any]]:
+    schema_info = product.get("schemaInfo")
+    schema = schema_info.get("schema") if isinstance(schema_info, dict) else None
+    if not isinstance(schema, str):
+        return []
+    try:
+        entries = json.loads(schema)
+    except ValueError:
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+def _sd_status_mqtt_dp(device: dict[str, Any]) -> str:
+    """Select modern MQTT when no higher-priority route is advertised."""
+    communication = device.get("communication")
+    product = device.get("productBean")
+    if not isinstance(communication, dict) or not isinstance(product, dict):
+        return ""
+    modes = _sd_status_modes(communication)
+    if (8 in modes or 1 not in modes or device.get("cloudOnline") is not True
+            or _device_mqtt_protocol_version(device) == "1.1"):
+        return ""
+    return _sd_status_schema_id(product) if _modern_dp_payload(device) else ""
+
+
+def _modern_dp_payload(device: dict[str, Any]) -> bool:
+    cadv = device.get("gatewayVerCAD") or device.get("cadv")
+    if not isinstance(cadv, str):
+        return False
+    try:
+        return tuple(int(part) for part in cadv.split(".")) >= (1, 0, 2)
+    except ValueError:
+        return False
+
+
+def _sd_status_lan_error_route(device: dict[str, Any]) -> str:
+    """The LAN error callback enters sendCommand, not initial route selection."""
+    pv = _device_mqtt_protocol_version(device)
+    if pv == "1.0":
+        return "http"
+    if pv in {"2.0", "2.1", "2.2", "2.3"} and _modern_dp_payload(device):
+        return "mqtt"
+    return ""
+
+
+def _sd_status_http_dp(device: dict[str, Any]) -> str:
+    """Recognize a DP device with no advertised LAN, Matter or MQTT route."""
+    communication = device.get("communication")
+    product = device.get("productBean")
+    if not isinstance(communication, dict) or not isinstance(product, dict):
+        return ""
+    modes = _sd_status_modes(communication)
+    if 8 in modes or 2 not in modes or (1 in modes and device.get("cloudOnline") is not False):
+        return ""
+    return _sd_status_schema_id(product)
+
+
+def _sd_status_lan_dp(device: dict[str, Any]) -> str:
+    communication, product = device.get("communication"), device.get("productBean")
+    if isinstance(communication, dict) and isinstance(product, dict):
+        if 0 in _sd_status_modes(communication):
+            return _sd_status_schema_id(product)
+    return ""
+
+
+def _sd_status_modes(communication: dict[str, Any]) -> set[int]:
+    modes = communication.get("communicationModes")
+    if type(communication.get("dataModel")) is not int or communication["dataModel"] != 1:
+        return set()
+    if not isinstance(modes, list) or not modes or any(
+        not isinstance(mode, dict) or type(mode.get("type")) is not int or mode["type"] not in (0, 1, 2, 8)
+        for mode in modes
+    ):
+        return set()
+    return {mode["type"] for mode in modes}
+
+
+def _sd_status_schema_id(product: dict[str, Any]) -> str:
+    matches = [entry.get("id") for entry in _product_schema(product) if entry.get("code") == "sd_status"]
+    dp = matches[0] if len(matches) == 1 else None
+    return dp if isinstance(dp, str) and dp.isascii() and dp.isdecimal() else ""
+
+
+def _product_wake_capability(reference: Any) -> str | None:
+    metadata = reference.get("configMetas") if isinstance(reference, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    low_power = "low_power_wakeup" in metadata
+    remote = "remote_wakeup" in metadata
+    if low_power and remote:
+        return "low_power_and_remote"
+    return "low_power" if low_power else "remote" if remote else "none"
+
+
 def _device_mqtt_protocol_version(device: dict[str, Any]) -> str | None:
     """Extract an explicit APK DeviceBean MQTT protocol version."""
     version = device.get("pv")
+    if version is None or version == "":
+        communication = device.get("communication")
+        modes = communication.get("communicationModes") if isinstance(communication, dict) else None
+        if isinstance(modes, list):
+            for mode in modes:
+                if not isinstance(mode, dict):
+                    continue
+                kind = mode.get("type")
+                # Both APKs populate DeviceBean.pv in this order-sensitive loop.
+                if type(kind) is int and (kind == 1 or (kind in {2, 3} and not version)):
+                    version = mode.get("pv")
     if not isinstance(version, str | int | float):
         return None
     normalized = str(version).strip()
     try:
-        if not normalized or float(normalized) < 1.0:
+        if not normalized or not 1.0 <= float(normalized) < float("inf"):
             return None
     except ValueError:
         return None

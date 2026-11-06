@@ -18,6 +18,7 @@ from .const import (
     CONF_APP_PROFILE,
     CONF_CATALOG_SYNC_MINUTES,
     CONF_DEVICE_INVENTORY,
+    CONF_DEVICE_WAKE_CAPABILITIES,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_LOOKBACK_DAYS,
@@ -39,7 +40,7 @@ from .const import (
     MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS,
     REGION_LABELS,
 )
-from .client import camera_inventory_from_native_devices
+from .client import camera_inventory_from_native_devices, camera_wake_capabilities_from_native_devices
 from .lib.native_auth import NativeAuthorizationError, NativeQrAuthorization
 from .lib.native_gateway import (
     NativeAppGatewayClient,
@@ -152,6 +153,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_DEVICE_LOCAL_KEYS: device_local_keys,
             CONF_DEVICE_PROTOCOL_VERSIONS: device_protocol_versions,
             CONF_DEVICE_INVENTORY: camera_inventory_from_native_devices(native_devices),
+            CONF_DEVICE_WAKE_CAPABILITIES: camera_wake_capabilities_from_native_devices(native_devices),
         }
         self._native_gateway = None
         if self._reauth_entry is not None:
@@ -164,6 +166,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_DEVICE_PROTOCOL_VERSIONS
                     ],
                     CONF_DEVICE_INVENTORY: entry_data[CONF_DEVICE_INVENTORY],
+                    CONF_DEVICE_WAKE_CAPABILITIES: entry_data[CONF_DEVICE_WAKE_CAPABILITIES],
                 },
             )
         await self.async_set_unique_id(f"{DOMAIN}_{saved_session['uid']}")

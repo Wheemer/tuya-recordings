@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Any
 
+from ..const import WAKE_CAPABILITIES
+
 from .native_session import (
     APK_RTC_CONFIG_API,
     NativeCameraSessionConfig,
@@ -39,6 +41,9 @@ class NativeAppCameraConfigProvider:
     local_key_lookup: Callable[[str], str] = field(repr=False)
     protocol_version_lookup: Callable[[str], str] = field(
         default=lambda dev_id: "2.2", repr=False
+    )
+    wake_capability_lookup: Callable[[str], Any] = field(
+        default=lambda dev_id: None, repr=False
     )
     trace_factory: Callable[[str], str] = field(
         default=lambda dev_id: _apk_trace_id(dev_id), repr=False
@@ -73,11 +78,21 @@ class NativeAppCameraConfigProvider:
         # sends it as ApiParams.ctId, then passes it as connectV3.trace_id.
         trace_id = self.trace_factory(dev_id)
         api, version, body, extra_params = native_session_api_request(
-            dev_id, trace_id=trace_id
+            dev_id, trace_id=trace_id, app_profile_id=self.app_profile_id
         )
+        context = f"app_profile={self.app_profile_id}, bootstrap_api_version={version}"
         try:
             result = self.call_api(api, version, body, extra_params)
             camera_info = extract_camera_info(result)
+            wake = self.wake_capability_lookup(dev_id)
+            direct = isinstance(wake, dict) and wake.get("direct") is True
+            sd_low_power = wake.get("sd_low_power") if isinstance(wake, dict) else None
+            sd_status_dp = wake.get("sd_status_mqtt_dp") if isinstance(wake, dict) else None
+            sd_status_http_dp = wake.get("sd_status_http_dp") if isinstance(wake, dict) else None
+            sd_status_lan_dp = wake.get("sd_status_lan_dp") if isinstance(wake, dict) else None
+            lan_error_route = wake.get("sd_status_lan_error_route") if isinstance(wake, dict) else None
+            if isinstance(wake, dict):
+                wake = wake.get("capability")
             config = normalize_camera_info(
                 dev_id,
                 camera_info,
@@ -88,20 +103,28 @@ class NativeAppCameraConfigProvider:
                 app_profile_id=self.app_profile_id,
                 app_device_fingerprint=self.app_device_fingerprint,
                 mqtt_protocol_version=self.protocol_version_lookup(dev_id),
+                wake_capability=wake if isinstance(wake, str) and wake in WAKE_CAPABILITIES else "unknown",
+                wake_direct=direct,
+                sd_low_power_wake=sd_low_power if type(sd_low_power) is bool else None,
+                sd_status_mqtt_dp=sd_status_dp if isinstance(sd_status_dp, str) else "",
+                sd_status_http_dp=sd_status_http_dp if isinstance(sd_status_http_dp, str) else "",
+                sd_status_lan_dp=sd_status_lan_dp if isinstance(sd_status_lan_dp, str) else "",
+                sd_status_lan_error_route=lan_error_route if isinstance(lan_error_route, str) else "",
             )
         except NativeGatewayAuthError as err:
             raise NativeCameraConfigAuthError(
-                "Smart Life app-session authorization expired"
+                f"Smart Life app-session authorization expired ({context})"
             ) from err
         except NativeSessionError as err:
             raise NativeCameraConfigError(
-                "APK camera config is not compatible with native playback"
+                f"APK camera config is not compatible with native playback ({context})"
             ) from err
-        except NativeCameraConfigError:
+        except NativeCameraConfigError as err:
+            err.add_note(f"Native SD bootstrap: {context}")
             raise
         except Exception as err:
             raise NativeCameraConfigError(
-                f"APK camera config request failed for {dev_id}: {type(err).__name__}"
+                f"APK camera config request failed for {dev_id}: {type(err).__name__} ({context})"
             ) from err
         with self._cache_lock:
             self._cache[dev_id] = (now + self.cache_ttl, config)

@@ -109,7 +109,7 @@ def test_inventory_refresh_rotates_backend_once_and_closes_gateway(monkeypatch):
 
     gateway = Mock()
     gateway.device_connection_inventory_data.return_value = (
-        {"new-camera": "new-key"}, {"new-camera": "3.5"},
+        {"new-camera": "new-key"}, {"new-camera": "2.3"},
         [{"devId": "new-camera", "category": "sp", "name": "Camera"}],
     )
     factory = Mock(return_value=gateway)
@@ -119,8 +119,12 @@ def test_inventory_refresh_rotates_backend_once_and_closes_gateway(monkeypatch):
     monkeypatch.setattr(module, "build_recordings_backend", build)
     client = TuyaRecordingsClient({"cloud_activity_paused": False}, recordings_backend=old)
     session = {"device_fingerprint": "fingerprint"}
-    updates = client.refresh_inventory({"native_app_session": session})
-    gateway.device_connection_inventory_data.assert_called_once_with(session)
+    updates = client.refresh_inventory({
+        "native_app_session": session, "device_protocol_versions": {"new-camera": "2.2", "removed": "2.1"},
+    })
+    gateway.device_connection_inventory_data.assert_called_once_with(session, refresh_protocols=True)
+    assert updates["device_protocol_versions"] == {"new-camera": "2.3"}
+    assert build.call_args.args[0]["device_protocol_versions"] == {"new-camera": "2.3"}
     gateway.session.close.assert_called_once()
     old.close.assert_called_once()
     assert client._recordings_backend is new

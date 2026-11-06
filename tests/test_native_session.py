@@ -79,7 +79,7 @@ def test_native_api_request_matches_apk_overloads():
         "dev123", trace_id="ipc_p2p_android_dev123_1234"
     ) == (
         APK_RTC_CONFIG_API,
-        APK_API_VERSION,
+        "1.1",
         {"devId": "dev123"},
         {"bizDM": "ipc", "ctId": "ipc_p2p_android_dev123_1234"},
     )

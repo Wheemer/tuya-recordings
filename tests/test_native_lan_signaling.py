@@ -61,6 +61,38 @@ class FakeTinyTuya:
 
 
 @pytest.mark.asyncio
+async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch):
+    replies = iter([
+        {},
+        {"devId": "other", "dps": {"110": 8}},
+        {"dps": {"110": True}},
+        {"data": {"devId": "camera", "dps": {"110": 0}}},
+    ])
+
+    class Device(FakeDevice):
+        def receive(self):
+            return next(replies)
+
+    monkeypatch.setattr(lan_module, "tinytuya", FakeTinyTuya)
+    monkeypatch.setattr(FakeTinyTuya, "Device", Device)
+    lan = Lan302Client(
+        uid="account", device_id="camera", session_id="session", local_key="0123456789abcdef",
+        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        preconnect=False, security_level=3,
+    )
+    await lan.async_connect()
+    try:
+        assert await asyncio.wait_for(lan.async_query_direct_dp("110"), 1) == 0
+        (command, payload), = lan._device.sent
+        assert command == 7
+        message = json.loads(payload)
+        assert type(message.pop("t")) is int
+        assert message == {"devId": "camera", "uid": "account", "dps": {"110": None}}
+    finally:
+        await lan.async_close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_offer_cannot_close_socket_under_running_send():
     started, release = threading.Event(), threading.Event()
     events = []

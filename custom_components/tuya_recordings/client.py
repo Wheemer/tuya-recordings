@@ -17,6 +17,8 @@ from .const import (
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_DEVICE_INVENTORY,
+    CONF_DEVICE_WAKE_CAPABILITIES,
+    WAKE_CAPABILITIES,
     CONF_CATALOG_SYNC_MINUTES,
     CONF_CLOUD_ACTIVITY_PAUSED,
     CONF_LOOKBACK_DAYS,
@@ -65,13 +67,21 @@ from .lib.commands import (
     Cancellation,
     Deadline,
     camera_work_scope,
+    ON_DEMAND_DAY_CATALOG,
 )
 from .lib.native_backend import RecordingBackend, RecordingBackendAuthError
 from .lib.native_playback import native_playback_request
 from .lib.native_session import NativePlaybackRequest
 from .lib.native_setup import build_recordings_backend
 from .lib.storage import write_catalog
-from .lib.native_gateway import NativeAppGatewayClient, NativeGatewayAuthError
+from .lib.native_gateway import (
+    CAMERA_NAME_HINTS,
+    KNOWN_CAMERA_CATEGORIES,
+    KNOWN_CAMERA_CATEGORY_HINTS,
+    NativeAppGatewayClient,
+    NativeGatewayAuthError,
+    is_camera_inventory_record,
+)
 
 CACHE_TTL = timedelta(minutes=10)
 RECORDING_SCAN_MAX_DAYS = 31
@@ -90,9 +100,6 @@ THUMBNAIL_AUTOFILL_LIMIT = 10
 THUMBNAIL_AUTOFILL_COOLDOWN = 45
 INDEX_SOURCE = "tuya_apk_native_recordings"
 CATALOG_DAYS_PER_SESSION = 2
-KNOWN_CAMERA_CATEGORIES = {"sp", "dghsxj"}
-KNOWN_CAMERA_CATEGORY_HINTS = ("camera", "ipc", "cam", "doorbell")
-CAMERA_NAME_HINTS = ("camera", "doorbell", "lobby", "ipc", "ip camera")
 
 TuyaRecordingsAuthError = RecordingBackendAuthError
 TuyaRecordingsApiError = RuntimeError
@@ -108,17 +115,29 @@ def camera_inventory_from_native_devices(devices: list[dict[str, Any]]) -> dict[
         category = str(device.get("category") or "").strip().lower()
         name = str(device.get("name") or device.get("deviceName") or dev_id).strip()
         product = str(device.get("productId") or device.get("product_id") or "").strip()
-        category_match = category in KNOWN_CAMERA_CATEGORIES or any(
-            hint in category for hint in KNOWN_CAMERA_CATEGORY_HINTS
-        )
-        name_match = any(
-            hint in value.lower()
-            for value in (name, product)
-            for hint in CAMERA_NAME_HINTS
-        )
-        if category_match or name_match:
+        if is_camera_inventory_record(category, name, product):
             cameras[dev_id] = name or dev_id
     return cameras
+
+
+def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    cameras = camera_inventory_from_native_devices(devices)
+    return {
+        dev_id: {
+            "capability": wake if isinstance(wake := device.get("wakeCapability"), str)
+            and wake in WAKE_CAPABILITIES else "unknown",
+            "direct": device.get("wakeDirect") is True,
+            **({"sd_low_power": eligible} if type(eligible) is bool else {}),
+            **({"sd_status_mqtt_dp": dp} if isinstance(dp := device.get("sdStatusMqttDp"), str) else {}),
+            **({"sd_status_http_dp": dp} if isinstance(dp := device.get("sdStatusHttpDp"), str) else {}),
+            **({"sd_status_lan_dp": dp} if isinstance(dp := device.get("sdStatusLanDp"), str) else {}),
+            **({"sd_status_lan_error_route": route}
+               if isinstance(route := device.get("sdStatusLanErrorRoute"), str) else {}),
+        } for device in devices
+        if isinstance(dev_id := device.get("devId"), str) and dev_id in cameras
+        and (type(eligible := device.get("sdLowPowerWake")) is bool
+             or isinstance(device.get("wakeCapability"), str))
+    }
 
 
 class TuyaRecordingsClient:
@@ -131,6 +150,7 @@ class TuyaRecordingsClient:
         hass: Any | None = None,
     ) -> None:
         self._closed = False
+        self._hass = hass
         self._camera_inventory: dict[str, str] | None = None
         self._camera_inventory_source = "unconfigured"
         self._lifecycle_lock = threading.RLock()
@@ -160,7 +180,10 @@ class TuyaRecordingsClient:
         self._thumbnail_camera_failures: dict[str, float] = {}
         self._media_failures: dict[tuple[str, int, int], float] = {}
         self._media_sync_status = MediaSyncStatus()
-        self._backend = recordings_backend or build_recordings_backend(entry_data)
+        self._backend = recordings_backend or self._build_backend(entry_data)
+
+    def _build_backend(self, entry_data: dict[str, Any]) -> RecordingBackend:
+        return build_recordings_backend(entry_data)
 
     @property
     def _recordings_backend(self) -> RecordingBackend:
@@ -534,7 +557,11 @@ class TuyaRecordingsClient:
                     if len(self._browse_days) > 64:
                         self._browse_days.pop(next(iter(self._browse_days)))
                     with self._browse_camera_query(dev_id):
-                        clips = self._recordings_for_day(dev_id, day)
+                        wake_scope = ON_DEMAND_DAY_CATALOG.set(True)
+                        try:
+                            clips = self._recordings_for_day(dev_id, day)
+                        finally:
+                            ON_DEMAND_DAY_CATALOG.reset(wake_scope)
                     previous_clips = list(camera.get("clips", []))
                     camera["clips"] = self._reconcile_catalog(dev_id, clips, previous_clips, [day.isoformat()])
                     refreshed_at = datetime.now(timezone.utc).isoformat()
@@ -1596,7 +1623,9 @@ class TuyaRecordingsClient:
                 app_profile_id=entry_data.get(CONF_APP_PROFILE, "smart_life"),
                 device_fingerprint=session["device_fingerprint"])
             try:
-                keys, protocols, devices = gateway.device_connection_inventory_data(session)
+                keys, protocols, devices = gateway.device_connection_inventory_data(
+                    session, refresh_protocols=True,
+                )
             except NativeGatewayAuthError as err:
                 raise RecordingBackendAuthError("Camera account authorization expired") from err
             finally:
@@ -1604,8 +1633,9 @@ class TuyaRecordingsClient:
             if cancellation.is_set():
                 raise CameraWorkCancelled("Inventory refresh cancelled")
             updates = {CONF_DEVICE_LOCAL_KEYS: keys, CONF_DEVICE_PROTOCOL_VERSIONS: protocols,
-                       CONF_DEVICE_INVENTORY: camera_inventory_from_native_devices(devices)}
-            replacement = build_recordings_backend({**entry_data, **updates})
+                       CONF_DEVICE_INVENTORY: camera_inventory_from_native_devices(devices),
+                       CONF_DEVICE_WAKE_CAPABILITIES: camera_wake_capabilities_from_native_devices(devices)}
+            replacement = self._build_backend({**entry_data, **updates})
             try:
                 self._recordings_backend.close()
             except BaseException:

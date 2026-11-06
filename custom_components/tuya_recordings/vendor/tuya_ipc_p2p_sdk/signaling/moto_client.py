@@ -9,22 +9,32 @@ import ssl
 import time
 from collections import Counter
 from typing import TYPE_CHECKING
+from zlib import crc32
 
 import aiomqtt
 
 from ..const import LOGGER
 from ..exceptions import TuyaIpcP2pConnectionError, TuyaIpcP2pError
 from ..json_types import JsonObject, JsonValue, optional_int, optional_str
-from .envelope import SESSION_PROTOCOL, SIG_QUERY_PROTOCOL, decode_payload, encode_payload
+from .envelope import (
+    SESSION_PROTOCOL,
+    SIG_QUERY_PROTOCOL,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    decode_payload,
+    encode_payload,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from ..models import MqttIdentity
 
 _CONNECT_TIMEOUT_SECONDS = 15
 _KEEPALIVE_SECONDS = 60
 _SOURCE_LENGTH = 4
+_DP_REPORT_PROTOCOL = 4
+_DP_QUERY_PROTOCOL = 5
+_DP_REPORT_TIMEOUT_SECONDS = 30
 
 _BROKER_TLS = ssl.create_default_context()
 
@@ -55,7 +65,7 @@ class MotoClient:
         on_failure: Callable[[str], None] | None = None,
     ) -> None:
         """Bind the client to one device, one session and the callbacks that consume it."""
-        if protocol_version not in {"2.2", "2.3"}:
+        if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError(
                 f"Unsupported signaling protocol version: {protocol_version}"
             )
@@ -84,19 +94,25 @@ class MotoClient:
         self._sequence = 2
         self._client: aiomqtt.Client | None = None
         self._reader: asyncio.Task[None] | None = None
+        self._dp_query: tuple[str, asyncio.Future[int]] | None = None
         self._received = 0
         self._decode_failures = 0
         self._session_mismatches = 0
         self._inbound: Counter[str] = Counter()
         self._published = 0
+        self._outbound: Counter[str] = Counter()
+        self._broker_status = "not_connected"
+        self._subscription = "not_attempted"
         self._reader_failure = "none"
 
     @property
     def diagnostics(self) -> str:
         inbound = ",".join(f"{kind}={count}" for kind, count in sorted(self._inbound.items()))
+        outbound = ",".join(f"{kind}={count}" for kind, count in sorted(self._outbound.items()))
         return (f"published={self._published}, received={self._received}, decode_failures={self._decode_failures}, "
-                f"session_mismatches={self._session_mismatches}, "
-                f"inbound={inbound or 'none'}, "
+                f"session_mismatches={self._session_mismatches}, subscription={self._subscription}, "
+                f"envelope_pv={self._protocol_version}, session_publish_qos=0, "
+                f"broker={self._broker_status}, outbound={outbound or 'none'}, inbound={inbound or 'none'}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
 
     async def async_connect(self) -> None:
@@ -111,15 +127,34 @@ class MotoClient:
             tls_context=_BROKER_TLS,
             clean_session=True,
         )
+        self._broker_status = "connecting"
         try:
             async with asyncio.timeout(_CONNECT_TIMEOUT_SECONDS):
                 await client.__aenter__()
         except (TimeoutError, aiomqtt.MqttError, OSError) as exception:
+            self._broker_status = "connect_failed"
             raise TuyaIpcP2pConnectionError(
-                f"Failed to connect the signaling broker: {exception}"
+                f"Failed to connect the signaling broker: {type(exception).__name__}"
             ) from exception
         self._client = client
-        await client.subscribe(self._subscribe_topic, qos=1)
+        self._broker_status = "connected"
+        self._subscription = "pending"
+        try:
+            granted = await client.subscribe(
+                self._subscribe_topic, qos=1, timeout=_CONNECT_TIMEOUT_SECONDS,
+            )
+        except aiomqtt.MqttError as error:
+            self._subscription = "failed"
+            raise TuyaIpcP2pConnectionError(
+                "Failed to subscribe to native MQTT camera replies"
+            ) from error
+        codes = tuple(getattr(item, "value", item) for item in granted)
+        if codes not in {(0,), (1,)}:
+            self._subscription = "rejected"
+            raise TuyaIpcP2pConnectionError(
+                "Broker rejected the native MQTT camera reply subscription"
+            )
+        self._subscription = f"granted_qos_{codes[0]}"
         self._reader = asyncio.create_task(self._async_read())
 
     async def _async_read(self) -> None:
@@ -129,9 +164,16 @@ class MotoClient:
             return
         try:
             async for message in client.messages:
+                if str(message.topic) != self._subscribe_topic:
+                    self._received += 1
+                    self._inbound["topic_mismatch"] += 1
+                    continue
                 payload = message.payload
                 if isinstance(payload, bytes):
                     self._consume(payload)
+                else:
+                    self._received += 1
+                    self._inbound["non_binary"] += 1
         except asyncio.CancelledError:
             raise
         except Exception as exception:
@@ -139,17 +181,39 @@ class MotoClient:
             LOGGER.debug("Signaling reader stopped: %s", self._reader_failure)
         else:
             self._reader_failure = "stream_ended"
+        if self._dp_query is not None:
+            _, reply = self._dp_query
+            if not reply.done():
+                reply.set_exception(TuyaIpcP2pConnectionError("Device DP report channel stopped"))
         if self._on_failure is not None:
             self._on_failure(self._reader_failure)
 
     def _consume(self, payload: bytes) -> None:
         """Decode one payload and dispatch it to the session."""
         self._received += 1
+        versions = (b"2.0", b"1.1") if self._protocol_version == "2.0" else (
+            self._protocol_version.encode("ascii"),
+        )
+        wire_version = payload[:3]
+        alternate_modern = (
+            wire_version not in versions
+            and wire_version in {b"2.2", b"2.3"}
+            and self._protocol_version in {"2.2", "2.3"}
+        )
+        if wire_version not in versions and not alternate_modern:
+            self._inbound["version_mismatch"] += 1
+            return
         try:
             protocol, data = decode_payload(self._key, payload)
         except TuyaIpcP2pError as exception:
             self._decode_failures += 1
-            LOGGER.debug("Discarded an undecodable signaling payload: %s", exception)
+            LOGGER.debug("Discarded an undecodable signaling payload: %s", type(exception).__name__)
+            return
+        if protocol == _DP_REPORT_PROTOCOL:
+            if alternate_modern:
+                self._inbound["version_mismatch"] += 1
+                return
+            self._consume_dp_report(data)
             return
         if protocol != SESSION_PROTOCOL:
             self._inbound["signal_query" if protocol == SIG_QUERY_PROTOCOL else "other_protocol"] += 1
@@ -160,10 +224,49 @@ class MotoClient:
             self._inbound["invalid_shape"] += 1
             return
         session_id = optional_str(header, "sessionid")
-        if session_id and session_id != self._session_id:
+        if (session_id or alternate_modern) and session_id != self._session_id:
             self._session_mismatches += 1
             return
         self._dispatch(optional_str(header, "type"), message)
+
+    def _consume_dp_report(self, data: JsonObject) -> None:
+        if self._dp_query is None:
+            return
+        dp_id, reply = self._dp_query
+        if (reply.done() or data.get("devId") not in (None, "", self._device_id)
+                or data.get("cid") not in (None, "")):
+            return
+        dps = data.get("dps")
+        value = dps.get(dp_id) if isinstance(dps, dict) else None
+        if type(value) is int:
+            reply.set_result(value)
+
+    async def async_query_direct_dp(self, dp_id: str) -> int:
+        """Query one schema DP and wait for a report, not the publish acknowledgement."""
+        if self._protocol_version == "1.1":
+            raise TuyaIpcP2pConnectionError("PV 1.1 does not serialize a null DP query")
+        return await self.async_wait_for_dp_report(
+            dp_id, lambda: self._async_publish(_DP_QUERY_PROTOCOL, {"dps": {dp_id: None}}),
+        )
+
+    async def async_wait_for_dp_report(
+        self, dp_id: str, send: Callable[[], Awaitable[None]],
+    ) -> int:
+        """Register the device report listener before dispatching the request."""
+        if self._dp_query is not None:
+            raise TuyaIpcP2pConnectionError("A device DP query is already pending")
+        if self._reader_failure != "none":
+            raise TuyaIpcP2pConnectionError("Device DP report channel stopped")
+        reply = asyncio.get_running_loop().create_future()
+        self._dp_query = (dp_id, reply)
+        try:
+            async with asyncio.timeout(_DP_REPORT_TIMEOUT_SECONDS):
+                await send()
+                return await reply
+        finally:
+            self._dp_query = None
+            if not reply.cancel() and not reply.cancelled():
+                reply.exception()
 
     def _dispatch(self, message_type: str | None, message: JsonObject) -> None:
         """Hand one decoded message to the callback that owns it."""
@@ -186,6 +289,18 @@ class MotoClient:
     async def async_send_sig_query(self) -> None:
         """Send the signal query that precedes the offer."""
         await self._async_publish(SIG_QUERY_PROTOCOL, {"reqType": "sigQry"})
+
+    async def async_send_wake(self) -> None:
+        """Send one APK low-power wake to the verified direct target."""
+        if self._client is None or self._subscription not in {"granted_qos_0", "granted_qos_1"}:
+            raise TuyaIpcP2pConnectionError("MQTT is not ready for a camera wake")
+        try:
+            await self._client.publish(
+                f"m/w/{self._device_id}", crc32(self._key).to_bytes(4, "big"),
+                qos=0, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
+            )
+        except aiomqtt.MqttError as error:
+            raise TuyaIpcP2pConnectionError("Native camera wake send failed") from error
 
     def configure_offer_metadata(self, *, moto_id: str, security_level: int) -> None:
         """Apply an HTTP token result without dropping the subscribed reader."""
@@ -211,19 +326,13 @@ class MotoClient:
                 "security_level": self._security_level,
             }
         )
-        await self._async_publish(
-            SESSION_PROTOCOL,
-            {
-                "header": header,
-                "msg": {
-                    "sdp": sdp,
-                    "preconnect": self._preconnect,
-                    "token": ice_servers,
-                    "tcp_token": tcp_token,
-                    "log": log_config,
-                },
-            },
-        )
+        msg: JsonObject = {"sdp": sdp, "preconnect": self._preconnect}
+        for key, value in (
+            ("token", ice_servers), ("tcp_token", tcp_token), ("log", log_config),
+        ):
+            if value:
+                msg[key] = value
+        await self._async_publish(SESSION_PROTOCOL, {"header": header, "msg": msg})
 
     async def async_send_candidate(self, candidate: str) -> None:
         """Trickle one local ICE candidate."""
@@ -239,6 +348,8 @@ class MotoClient:
         Without this the device holds the session open and refuses the next
         offer until its own timer fires.
         """
+        if self._subscription in {"pending", "failed", "rejected"}:
+            return
         await self._async_publish(
             SESSION_PROTOCOL,
             {
@@ -277,10 +388,17 @@ class MotoClient:
             int(time.time()),
             protocol,
             self._protocol_version,
+            device_id=self._device_id,
         )
         try:
-            await client.publish(self._publish_topic, payload, qos=1)
+            # Both consumer APKs use QoS 0 for native protocol 302.
+            await client.publish(
+                self._publish_topic, payload, qos=0 if protocol == SESSION_PROTOCOL else 1,
+            )
             self._published += 1
+            header = data.get("header") if isinstance(data, dict) else None
+            kind = optional_str(header, "type") if isinstance(header, dict) else None
+            self._outbound[kind if kind in {"offer", "candidate", "disconnect"} else "other"] += 1
         except aiomqtt.MqttError as exception:
             raise TuyaIpcP2pConnectionError(f"Failed to publish: {exception}") from exception
 

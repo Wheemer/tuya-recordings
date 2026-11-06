@@ -1,6 +1,7 @@
 import asyncio
 import json
 import ssl
+from types import SimpleNamespace
 
 import pytest
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
@@ -15,17 +16,251 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import 
     relay_offer_frame,
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import (
+    TuyaIpcP2pConnectionError,
     TuyaIpcP2pProtocolError,
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.answer import (
     parse_answer,
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import (
+    decode_payload,
     encode_payload,
 )
 
 
-@pytest.mark.parametrize("version", ["2.2", "2.3"])
+@pytest.mark.parametrize(("version", "frame"), [
+    ("1.1", bytes.fromhex(
+        "312e3160f1c19600000003616263647b2264617461223a7b22647073223a7b7d7d"
+        "2c2270726f746f636f6c223a352c2274223a3132337d"
+    )),
+    ("2.1", b"2.1dca139974ea33ce88BUw7PgybcQiSqScYaWvdlqlEvsoL5ZBj+J9Asj7hyzWmhkyJPzvk1+"
+     b"8fkKhieGBe6ccirFX+vLcRueuSuyOXw=="),
+])
+def test_legacy_mqtt_envelope_matches_independent_vector(version, frame):
+    key = b"0123456789abcdef"
+    data = {"dps": {"110": None}}
+    assert encode_payload(key, 3, b"abcd", data, 123, 5, version) == frame
+    assert decode_payload(key, frame) == (5, {"dps": {}} if version == "1.1" else data)
+    with pytest.raises(TuyaIpcP2pProtocolError, match="invalid"):
+        decode_payload(key, frame[:3] + bytes([frame[3] ^ 1]) + frame[4:])
+
+
+def test_pv20_uses_signed_json_for_send_and_keyed_crc_for_receive():
+    key = b"0123456789abcdef"
+    outbound = encode_payload(
+        key, 3, b"abcd", {"dps": {"110": None}}, 123, 5, "2.0", device_id="camera",
+    )
+    assert json.loads(outbound) == {
+        "data": "2055842A689C2D8AA7096C746BF29657D0FE8315E8352360AAE299B79563441C",
+        "gwId": "camera", "protocol": 5, "pv": "2.0", "t": 123,
+        "sign": "ebf929c02827cb4db858354cfb9e5e2e",
+    }
+    answers = []
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session", local_key=key.decode(),
+        on_answer=answers.append, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        protocol_version="2.0",
+    )
+    data = {"header": {"type": "answer", "sessionid": "session"}, "msg": {"sdp": "answer"}}
+    inbound = encode_payload(key, 3, b"abcd", data, 123, 302, "1.1")
+    client._consume(b"2.0" + inbound[3:])
+    assert answers == ["answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["report", "timeout", "cancel", "reader_stopped"])
+async def test_direct_dp_query_waits_for_matching_report(monkeypatch, outcome):
+    key = b"0123456789abcdef"
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="account", device_id="camera", session_id="session", local_key=key.decode(),
+        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+    sent = asyncio.Event()
+
+    async def publish(protocol, data):
+        assert (protocol, data) == (5, {"dps": {"110": None}})
+        sent.set()
+
+    def receive(protocol, data):
+        client._consume(encode_payload(key, 3, b"abcd", data, 1, protocol))
+
+    assert moto_client._DP_REPORT_TIMEOUT_SECONDS == 30
+    monkeypatch.setattr(moto_client, "_DP_REPORT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(client, "_async_publish", publish)
+    task = asyncio.create_task(client.async_query_direct_dp("110"))
+    await sent.wait()
+    receive(5, {"dps": {"110": 1}})
+    receive(4, {"devId": "other-camera", "dps": {"110": 1}})
+    receive(4, {"cid": "child", "dps": {"110": 1}})
+    receive(4, {"dps": {"111": 1, "110": True}})
+    assert client._dp_query is not None and not client._dp_query[1].done()
+    if outcome == "report":
+        receive(4, {"devId": "camera", "dps": {"110": 0}})
+        assert await task == 0
+    elif outcome == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif outcome == "reader_stopped":
+        async def messages():
+            if False:
+                yield None
+
+        client._client = SimpleNamespace(messages=messages())
+        await client._async_read()
+        with pytest.raises(TuyaIpcP2pConnectionError, match="DP report channel stopped"):
+            await task
+        with pytest.raises(TuyaIpcP2pConnectionError, match="DP report channel stopped"):
+            await client.async_query_direct_dp("110")
+    else:
+        with pytest.raises(TimeoutError):
+            await task
+    assert client._dp_query is None
+
+
+@pytest.mark.asyncio
+async def test_wake_matches_apk_wire_format():
+    sent = []
+
+    async def publish(topic, payload, **options):
+        sent.append((topic, payload, options))
+
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session",
+        local_key="123456789", on_answer=lambda _: None,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+    client._client = SimpleNamespace(publish=publish)
+    with pytest.raises(TuyaIpcP2pConnectionError, match="not ready"):
+        await client.async_send_wake()
+    client._subscription = "granted_qos_1"
+    await client.async_send_wake()
+    assert sent == [
+        ("m/w/camera", bytes.fromhex("cbf43926"), {"qos": 0, "retain": False, "timeout": 15}),
+    ]
+
+
+@pytest.mark.parametrize("suback", [(0,), [SimpleNamespace(value=1)], (128,), []])
+def test_native_mqtt_checks_suback_before_publishing_apk_qos(monkeypatch, suback):
+    calls = []
+
+    class Broker:
+        def __init__(self, **kwargs):
+            assert (kwargs["hostname"], kwargs["port"]) == ("mqtt.example.test", 8883)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            calls.append("closed")
+
+        async def subscribe(self, topic, *, qos, timeout):
+            calls.append(("subscribe", topic, qos))
+            assert timeout > 0
+            return suback
+
+        async def publish(self, topic, payload, *, qos):
+            calls.append(("publish", topic, qos))
+
+        @property
+        async def messages(self):
+            await asyncio.Event().wait()
+            yield None
+
+    monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session",
+        local_key="0123456789abcdef", on_answer=lambda _: None,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+
+    async def run():
+        try:
+            await client.async_connect()
+            await client.async_send_offer("sdp", [], "trace", {}, {})
+        finally:
+            if not suback or suback == (128,):
+                await client.async_send_disconnect()
+            await client.async_close()
+
+    if not suback or suback == (128,):
+        with pytest.raises(TuyaIpcP2pConnectionError, match="rejected"):
+            asyncio.run(run())
+        assert "subscription=rejected" in client.diagnostics
+        assert calls == [("subscribe", "smart/mb/in/camera", 1), "closed"]
+    else:
+        asyncio.run(run())
+        assert "subscription=granted_qos_" in client.diagnostics
+        assert "broker=connected, outbound=offer=1" in client.diagnostics
+        assert calls == [
+            ("subscribe", "smart/mb/in/camera", 1),
+            ("publish", "smart/mb/out/camera", 0),
+            "closed",
+        ]
+
+
+def test_mqtt_reader_only_routes_exact_device_reply_topic():
+    answers = []
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session",
+        local_key="0123456789abcdef", on_answer=answers.append,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+    payload = encode_payload(
+        b"0123456789abcdef", 1, b"test",
+        {"header": {"type": "answer", "sessionid": "session"}, "msg": {"sdp": "answer"}},
+        0, 302, "2.2",
+    )
+
+    async def messages():
+        for topic in ("smart/mb/in/another-camera", "smart/mb/out/camera", "smart/mb/in/camera"):
+            yield SimpleNamespace(topic=topic, payload=payload)
+
+    client._client = SimpleNamespace(messages=messages())
+    asyncio.run(client._async_read())
+    assert answers == ["answer"]
+    assert "received=3, decode_failures=0" in client.diagnostics
+    assert "topic_mismatch=2" in client.diagnostics
+    assert "another-camera" not in client.diagnostics
+
+
+@pytest.mark.parametrize(("sent_pv", "reply_pv"), [("2.2", "2.3"), ("2.3", "2.2")])
+def test_mqtt_modern_reply_uses_wire_pv_and_requires_matching_session(sent_pv, reply_pv):
+    answers = []
+    key = b"0123456789abcdef"
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session", local_key=key.decode(),
+        protocol_version=sent_pv, on_answer=answers.append,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+
+    def frame(session_id):
+        header = {"type": "answer"}
+        if session_id is not None:
+            header["sessionid"] = session_id
+        return encode_payload(
+            key, 1, b"test", {"header": header, "msg": {"sdp": "answer"}},
+            0, 302, reply_pv,
+        )
+
+    client._consume(frame(None))
+    client._consume(frame("another-session"))
+    valid = frame("session")
+    client._consume(valid[:-1] + bytes([valid[-1] ^ 1]))
+    assert answers == []
+    client._consume(valid)
+    assert answers == ["answer"]
+    assert "decode_failures=1, session_mismatches=2" in client.diagnostics
+    assert client._protocol_version == sent_pv
+
+
+@pytest.mark.parametrize("version", ["1.1", "2.1", "2.2", "2.3"])
 def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
     answers = []
     client = MotoClient(
@@ -37,6 +272,9 @@ def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
     )
     header = {"type": "answer", "sessionid": "session"}
     answer = {"header": header, "msg": {"sdp": "private-sdp"}}
+    mismatched = "1.1" if version != "1.1" else "2.1"
+    client._consume(encode_payload(b"0123456789abcdef", 1, b"test", answer, 0, 302, mismatched))
+    assert answers == []
     frames = [
         (22, answer),
         (302, {}),
@@ -51,7 +289,7 @@ def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
         ))
     assert answers == ["private-sdp"]
     assert "session_mismatches=1" in client.diagnostics
-    assert "answer=1,answer_without_sdp=1,invalid_shape=1,other_session_message=1,signal_query=1" in client.diagnostics
+    assert "answer=1,answer_without_sdp=1,invalid_shape=1,other_session_message=1,signal_query=1,version_mismatch=1" in client.diagnostics
     assert "private-" not in client.diagnostics
 
 
@@ -142,7 +380,36 @@ def test_signaling_reader_reports_transport_failure_without_retrying():
     assert "published=0" in client.diagnostics
 
 
-def test_mqtt_offer_preserves_apk_signaling_header():
+@pytest.mark.parametrize(("version", "wire_hex"), [
+    (
+        "2.2",
+        "322e32c3b773a30102030489abcdef6d91e50bf1cc7865a74577284a9ee9a3f"
+        "4993974c362d1c591e4417eee97165aeda1c29613a5df7c77da4aebba181bdbc5"
+        "bb170f5941d75d8ca59e79a0eae7d10e09874dfb6e77397931d975a323ba64",
+    ),
+    (
+        "2.3",
+        "322e330102030489abcdef00000102030405060708090a0b861da07c6a15190c"
+        "93046f7fa1ffd55f22ed2cd873ca3a2e5553c89c89cdce1e7c6ae2c2d29eeaa"
+        "81e48c4f1124f67125350250c405379473599b8547742ef7a8033b631084101"
+        "fe70c5224f0444062c8931",
+    ),
+])
+def test_mqtt_302_matches_apk_derived_java_wire_vector(version, wire_hex):
+    # Generated with Java Cipher and CRC32 from the shared APK serializers.
+    key = b"0123456789abcdef"
+    data = {"header": {"type": "offer"}}
+    expected = bytes.fromhex(wire_hex)
+    assert encode_payload(
+        key, 0x01020304, bytes.fromhex("89abcdef"), data, 1700000000, 302, version,
+        nonce=bytes(range(12)),
+    ) == expected
+    assert decode_payload(key, expected) == (302, data)
+
+
+@pytest.mark.parametrize("version", ["2.2", "2.3"])
+@pytest.mark.parametrize("include_metadata", [False, True])
+def test_mqtt_offer_preserves_apk_signaling_header(version, include_metadata):
     published = []
     client = MotoClient(
         identity=MqttIdentity("mqtt.example.test", 8884, "client", "user", "pass"),
@@ -153,20 +420,35 @@ def test_mqtt_offer_preserves_apk_signaling_header():
         on_answer=lambda _sdp: None,
         on_candidate=lambda _candidate: None,
         on_disconnect=lambda _reason: None,
-        protocol_version="2.3",
+        protocol_version=version,
         moto_id="camera-moto-id",
     )
 
-    async def capture(protocol, data):
-        published.append((protocol, data))
+    async def capture(topic, payload, *, qos):
+        assert topic == "smart/mb/out/camera"
+        assert qos == 0
+        assert payload[:3] == version.encode()
+        published.append(decode_payload(b"0123456789abcdef", payload))
 
-    client._async_publish = capture
-    asyncio.run(client.async_send_offer("sdp", [], "trace", {}, {}))
+    client._client = SimpleNamespace(publish=capture)
+    metadata = {
+        "token": [{"urls": "stun:fixture.invalid:3478"}],
+        "tcp_token": {"sessionId": "fixture-relay"},
+        "log": {"enabled": True},
+    } if include_metadata else {}
+    asyncio.run(client.async_send_offer(
+        "sdp", metadata.get("token", []), "trace",
+        metadata.get("tcp_token", {}), metadata.get("log", {}),
+    ))
 
-    header = published[0][1]["header"]
-    assert header["moto_id"] == "camera-moto-id"
-    assert header["security_level"] == 3
-    assert published[0][1]["msg"]["preconnect"] is True
+    assert published == [(302, {
+        "header": {
+            "type": "offer", "from": "account", "to": "camera",
+            "sessionid": "session", "moto_id": "camera-moto-id", "path": "mqtt",
+            "trace_id": "trace", "is_pre": 0, "p2p_skill": 1635, "security_level": 3,
+        },
+        "msg": {"sdp": "sdp", "preconnect": True, **metadata},
+    })]
 
 
 def test_mqtt_offer_uses_camera_advertised_connection_metadata():

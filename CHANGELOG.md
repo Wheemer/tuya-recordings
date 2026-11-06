@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-1 (2026-11-06)
+
+### Fixes
+
+- Follow the Smart Life and Tuya Smart wake and SD-status routes for non-Matter cameras, with bounded offer retries.
+- Use refreshed camera MQTT protocol metadata on the next connection without restarting Home Assistant.
+- Report wake, offer, and reply progress when a camera fails to connect.
+
 ## Tuya Recordings v0.4.12 (2026-11-05)
 
 ### Fixes

@@ -9,6 +9,7 @@ from ..const import (
     CONF_APP_PROFILE,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
+    CONF_DEVICE_WAKE_CAPABILITIES,
     CONF_NATIVE_APP_SESSION,
     CONF_REGION,
 )
@@ -45,10 +46,13 @@ def build_recordings_backend(
     except NativeBackendSetupError as err:
         return NativeBackendNotConfigured(str(err))
 
+    saved_wake = entry_data.get(CONF_DEVICE_WAKE_CAPABILITIES)
+    wake_capabilities = dict(saved_wake) if isinstance(saved_wake, Mapping) else {}
     provider = NativeAppCameraConfigProvider(
         call_api=app_call,
         local_key_lookup=lambda dev_id: lookup_local_key(local_keys, dev_id),
-        protocol_version_lookup=lambda dev_id: protocol_versions.get(dev_id, "2.2"),
+        protocol_version_lookup=lambda dev_id: protocol_versions.get(dev_id, ""),
+        wake_capability_lookup=lambda dev_id: wake_capabilities.get(dev_id),
         app_session=app_session,
         app_region=str(entry_data.get(CONF_REGION) or "us"),
         app_profile_id=str(entry_data.get(CONF_APP_PROFILE) or "smart_life"),

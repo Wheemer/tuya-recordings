@@ -11,6 +11,7 @@ from typing import Any, Callable
 import tinytuya
 
 _LAN_EXT_STREAM = 0x40
+_LAN_CONTROL = 7
 _LAN_TIMEOUT_SECONDS = 5.0
 _DISCOVERY_CACHE_SECONDS = 900.0
 
@@ -21,6 +22,10 @@ class NativeLanSignalError(RuntimeError):
 
 class NativeLanUnavailableError(NativeLanSignalError):
     """The camera cannot be reached through the local network."""
+
+
+class NativeLanDpReportError(NativeLanSignalError):
+    """A dispatched LAN query lost its report channel."""
 
 
 class Lan302Client:
@@ -105,6 +110,36 @@ class Lan302Client:
         await self._async_send(message)
         if self._reader is None:
             self._reader = asyncio.create_task(self._read_messages())
+
+    async def async_query_direct_dp(self, dp: str) -> int:
+        """Send one CONTROL query on a socket not yet used for signaling."""
+        async with self._lock:
+            device = self._device
+            if device is None or self._reader is not None:
+                raise NativeLanUnavailableError("DP query needs an idle local socket")
+            await _join_device_io(self._send, device, {
+                "devId": self._device_id, "uid": self._uid,
+                "t": int(time.time()), "dps": {dp: None},
+            }, _LAN_CONTROL)
+            while not self._closed:
+                device.set_socketTimeout(0.25)
+                try:
+                    message = await _join_device_io(device.receive)
+                except OSError:
+                    # A read failure after dispatch is not a failed send.
+                    await asyncio.sleep(0.05)
+                    continue
+                if isinstance(message, dict) and message.get("devId") in (None, "", self._device_id):
+                    data = message.get("data", message)
+                    dps = data.get("dps") if (
+                        isinstance(data, dict) and not data.get("cid")
+                        and data.get("devId") in (None, "", self._device_id)
+                    ) else None
+                    value = dps.get(dp) if isinstance(dps, dict) else None
+                    if type(value) is int:
+                        return value
+                await asyncio.sleep(0.05)
+        raise NativeLanDpReportError("Local DP socket closed")
 
     async def _read_messages(self) -> None:
         while not self._closed:
@@ -225,9 +260,9 @@ class Lan302Client:
                 raise NativeLanSignalError("Local P2P signaling is not connected")
             await _join_device_io(self._send, device, message)
 
-    def _send(self, device: Any, message: dict[str, Any]) -> None:
+    def _send(self, device: Any, message: dict[str, Any], command: int = _LAN_EXT_STREAM) -> None:
         payload = tinytuya.MessagePayload(
-            _LAN_EXT_STREAM,
+            command,
             json.dumps(message, separators=(",", ":")).encode(),
         )
         try:

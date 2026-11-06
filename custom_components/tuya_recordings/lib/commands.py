@@ -32,6 +32,7 @@ class Deadline:
 
 
 _WORK_CANCEL = ContextVar("tuya_camera_work_cancel", default=None)
+ON_DEMAND_DAY_CATALOG = ContextVar("tuya_on_demand_day_catalog", default=False)
 
 
 @contextmanager
@@ -53,6 +54,8 @@ class CameraCommandQueue:
         self._owner_cancel: threading.Event | None = None
         self._owner_playback = False
         self._unsafe_transports = set()
+        self._wake_after: dict[str, float] = {}
+        self._wake_report_missing: set[str] = set()
         self.capacity = capacity
         self.wait_timeout = wait_timeout
 
@@ -71,6 +74,30 @@ class CameraCommandQueue:
     def playback_waiting(self) -> bool:
         with self._condition:
             return any(urgent for _, urgent in self._waiting)
+
+    def reserve_wake(self, device_id: str) -> bool:
+        """Allow at most one wake per device per minute across runtimes."""
+        with self._condition:
+            now = time.monotonic()
+            self._wake_after = {key: until for key, until in self._wake_after.items() if until > now}
+            self._wake_report_missing.intersection_update(self._wake_after)
+            if device_id in self._wake_after:
+                return False
+            self._wake_after[device_id] = now + 60
+            return True
+
+    def mark_wake_report_missing(self, device_id: str) -> None:
+        """Tie an unanswered status request to its existing wake cooldown."""
+        with self._condition:
+            if device_id in self._wake_after:
+                self._wake_report_missing.add(device_id)
+
+    def wake_report_on_cooldown(self, device_id: str) -> bool:
+        with self._condition:
+            return (
+                device_id in self._wake_report_missing
+                and self._wake_after.get(device_id, 0) > time.monotonic()
+            )
 
     @contextmanager
     def slot(self, cancel_event=None, *, allow_reentry=True, playback=False):

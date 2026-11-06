@@ -3,6 +3,7 @@ import json
 import struct
 from dataclasses import replace
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import (
@@ -83,6 +84,165 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
+def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monkeypatch):
+    from custom_components.tuya_recordings.client import TuyaRecordingsClient
+    from custom_components.tuya_recordings.lib.commands import ON_DEMAND_DAY_CATALOG
+    from custom_components.tuya_recordings.lib.native_gateway import NativeAppGatewayClient
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling import moto_client
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import (
+        decode_payload,
+        encode_payload,
+    )
+
+    config = camera_config()
+    dev = config.dev_id
+    bootstrap = {
+        **json.loads(config.config_json), "p2pSpecifiedType": 4, "p2pPolicy": 0, "skill": "{}",
+    }
+    offers = []
+    events = []
+    day = date(2026, 9, 15)
+    clip_start, clip_end = 1789459300, 1789459310
+    key = config.local_key.encode()
+    send_key = None
+
+    def inventory_call(self, api, version, post, app_session=None, extra_params=None):
+        if api == "tuya.m.location.list":
+            return [{"gid": 1}]
+        if api == "tuya.m.my.group.device.list":
+            return [{"devId": dev, "localKey": config.local_key, "category": "sp",
+                     "productId": "fixture-product", "pv": "2.2"}]
+        if api == "thing.m.device.product.ref.list":
+            return []
+        assert api == "m.life.app.smart.local.device.list"
+        return {"deviceList": [{"devId": dev, "productId": "fixture-product",
+                                "communication": {"communicationModes": [{"type": 1, "pv": "2.3"}]}}]}
+
+    class Broker:
+        def __init__(self, **_kwargs):
+            self.inbound = asyncio.Queue()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            events.append("broker-closed")
+
+        async def subscribe(self, topic, *, qos, timeout):
+            assert (topic, qos) == (f"smart/mb/in/{dev}", 1)
+            return (1,)
+
+        async def publish(self, topic, payload, *, qos):
+            assert (topic, qos) == (f"smart/mb/out/{dev}", 0)
+            protocol, body = decode_payload(key, payload)
+            assert protocol == 302
+            header = body["header"]
+            if header["type"] == "disconnect":
+                return
+            assert header["type"] == "offer"
+            offers.append(payload[:3])
+            events.append("offer")
+            if payload[:3] == b"2.3":
+                reply = encode_payload(
+                    key, 1, b"test",
+                    {"header": {"type": "answer", "sessionid": header["sessionid"]},
+                     "msg": {"sdp": answer_sdp()}},
+                    0, 302, "2.3",
+                )
+                self.inbound.put_nowait(SimpleNamespace(topic=f"smart/mb/in/{dev}", payload=reply))
+
+        @property
+        async def messages(self):
+            while True:
+                yield await self.inbound.get()
+
+    class Ice:
+        diagnostics = "fixture ICE"
+
+        def __init__(self, _password, _candidate, **kwargs):
+            nonlocal send_key
+            send_key = kwargs["send_key"]
+            self.receive_key = None
+
+        async def async_gather(self):
+            pass
+
+        def set_receive_key(self, value):
+            assert value == ANSWER_KEY
+            self.receive_key = value
+            events.append("answer")
+
+        async def async_wait_for_nomination(self, _timeout):
+            assert self.receive_key == ANSWER_KEY
+            events.append("nominated")
+
+        def send_segment(self, _segment):
+            pytest.fail("Fixture must not send direct network packets")
+
+        def close(self):
+            pass
+
+    class Direct:
+        diagnostics = "fixture direct transport"
+
+        def __init__(self, _transmit):
+            self.control = self
+
+        def set_message_handler(self, handler):
+            self.handler = handler
+
+        def send(self, record):
+            command = decrypt_record(send_key, record)
+            _, request, _, high, low, _ = struct.unpack_from("<IIIHHI", command)
+            if (high, low) != (3, 1):
+                return
+            assert events[-1] == "nominated"
+            assert struct.unpack_from("<4I", command, 20) == (0, day.year, day.month, day.day)
+            events.append("catalog")
+            payload = struct.pack("<9I", 0, day.year, day.month, day.day, 1, 0, clip_start, clip_end, 0)
+            reply = struct.pack("<IIIHHI", 0x12345678, request, 1, 3, 1, len(payload)) + payload
+            self.handler(encrypt_record(ANSWER_KEY, reply))
+
+        async def async_close(self):
+            events.append("direct-closed")
+
+    monkeypatch.setattr(NativeAppGatewayClient, "call", inventory_call)
+    monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
+    monkeypatch.setattr(relay_module, "IceResponder", Ice)
+    monkeypatch.setattr(relay_module, "DirectSession", Direct)
+    entry_data = {
+        "_native_app_call": lambda *_: bootstrap,
+        "native_app_session": APP_SESSION,
+        "device_local_keys": {dev: config.local_key},
+        "device_protocol_versions": {dev: "2.2"},
+    }
+    client = TuyaRecordingsClient(entry_data)
+
+    async def offer_from_current_backend():
+        resolved = client._recordings_backend._provider.session_config(dev)
+        playback = NativeRelayPlaybackSession(resolved, APP_SESSION)
+        try:
+            await playback._open_signaling("sdp", [], "trace", {}, {})
+        finally:
+            if playback._moto is not None:
+                await playback._moto.async_close()
+
+    asyncio.run(offer_from_current_backend())
+    assert offers == [b"2.2"]
+    assert client.refresh_inventory(entry_data)["device_protocol_versions"] == {dev: "2.3"}
+    events.clear()
+    token = ON_DEMAND_DAY_CATALOG.set(True)
+    backend = client._recordings_backend
+    try:
+        clips = backend.recordings_for_day(dev, {}, {}, day)
+    finally:
+        ON_DEMAND_DAY_CATALOG.reset(token)
+        backend.close()
+    assert offers == [b"2.2", b"2.3"]
+    assert events == ["offer", "answer", "nominated", "catalog", "direct-closed", "broker-closed"]
+    assert [(clip["start"], clip["end"]) for clip in clips] == [(clip_start, clip_end)]
+
+
 @pytest.mark.asyncio
 async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch):
     calls = []
@@ -125,7 +285,7 @@ async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch):
     monkeypatch.setattr(relay_module, "MotoClient", Signaling)
     playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
     await playback._open_signaling("old-sdp", [], "trace", {}, {})
-    assert calls == ["mqtt", "http", "query", "offer"]
+    assert calls == ["mqtt", "http", "offer"]
     assert captured["signaling"]["session_id"] == captured["header"]["sessionid"]
     assert captured["signaling"]["moto_id"] == "renewed-moto"
     assert playback.local_cid != camera_config().p2p_session_id
@@ -163,6 +323,344 @@ async def test_initial_http_failure_never_sends_mqtt_offer_or_retries(monkeypatc
 
 def test_current_app_token_does_not_require_http_offer():
     assert not session()._requires_http_token()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allowed", "capability", "direct", "eligible", "expected"),
+    [
+        (False, "low_power", True, True, ["subscribe", "offer"]),
+        (True, "low_power", True, None, ["subscribe", "offer"]),
+        (True, "wireless", True, False, ["subscribe", "offer"]),
+        (True, "low_power", False, True, ["subscribe", "offer"]),
+        (True, "unknown", True, True, ["subscribe", "wake", "offer"]),
+    ],
+)
+async def test_wake_only_for_confirmed_direct_on_demand_catalog(
+    monkeypatch, allowed, capability, direct, eligible, expected,
+):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+
+    class Broker:
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            calls.append("subscribe")
+
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_query_direct_dp(self, dp):
+            assert dp == "110"
+            calls.append("sd_status")
+            return 1
+
+        async def async_send_offer(self, *args):
+            calls.append("offer")
+
+    monkeypatch.setattr(relay_module, "MotoClient", Broker)
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(
+        camera_config(), wake_capability=capability, wake_direct=direct,
+        sd_low_power_wake=eligible, sd_status_mqtt_dp="110",
+    )
+    for _ in range(2):
+        playback = NativeRelayPlaybackSession(config, APP_SESSION)
+        playback._on_demand_catalog = allowed
+        await playback._open_signaling("sdp", [], "trace", {}, {})
+        assert (playback._retry_offer is not None) == allowed
+    if "wake" in expected:
+        expected = ["subscribe", "wake", "sd_status", "offer"]
+    assert calls == [*expected, "subscribe", "offer"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_device_pv_blocks_mqtt_before_broker_connection(monkeypatch):
+    def broker(**_kwargs):
+        pytest.fail("Unknown DeviceBean PV must not open MQTT signaling")
+
+    monkeypatch.setattr(relay_module, "MotoClient", broker)
+    config = replace(camera_config(), mqtt_protocol_version="")
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    with pytest.raises(NativeRelayPlaybackError, match="MQTT protocol version is unknown"):
+        await playback._connect_mqtt("fixture-session")
+    assert "mqtt_pv=unknown" in playback.transport_diagnostics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "reason"), [
+    (2, "card_error"), (4, "formatting"), (5, "no_card"),
+    (7, "loading"), (8, "unavailable"), (3, None), (None, "timeout"),
+])
+async def test_catalog_offer_respects_reported_sd_status(monkeypatch, status, reason):
+    from types import SimpleNamespace
+
+    from custom_components.tuya_recordings.lib import commands
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+    now = 100.0
+    monkeypatch.setattr(commands, "time", SimpleNamespace(monotonic=lambda: now))
+
+    class Broker:
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            pass
+
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_query_direct_dp(self, dp):
+            calls.append("query")
+            if status is None and calls.count("query") == 1:
+                raise TimeoutError
+            return 1 if status is None else status
+
+        async def async_send_offer(self, *args):
+            calls.append("offer")
+
+    monkeypatch.setattr(relay_module, "MotoClient", Broker)
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True, sd_status_mqtt_dp="110",
+    )
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._on_demand_catalog = True
+    if reason == "timeout":
+        with pytest.raises(NativeRelayPlaybackError, match="did not report SD status"):
+            await playback._open_signaling("sdp", [], "trace", {}, {})
+        assert playback._sd_status_query == "report_timeout"
+        assert playback._retry_offer is None
+        now = 159.999
+        repeated = NativeRelayPlaybackSession(config, APP_SESSION)
+        repeated._on_demand_catalog = True
+        with pytest.raises(NativeRelayPlaybackError, match="retry is on cooldown"):
+            await repeated._open_signaling("sdp", [], "trace", {}, {})
+        assert repeated._retry_offer is None
+        assert calls == ["wake", "query"]
+        now = 160.0
+        fresh = NativeRelayPlaybackSession(config, APP_SESSION)
+        fresh._on_demand_catalog = True
+        fresh._answer = asyncio.get_running_loop().create_future()
+        await fresh._open_signaling("sdp", [], "trace", {}, {})
+        assert fresh._sd_status_query == "report_received"
+        assert fresh._retry_offer is not None
+        answer = object()
+        fresh._answer.set_result(answer)
+        assert await fresh._wait_for_answer() is answer
+        assert calls == ["wake", "query", "wake", "query", "offer"]
+    elif reason:
+        with pytest.raises(NativeRelayPlaybackError, match="SD status prevents native playback"):
+            await playback._open_signaling("sdp", [], "trace", {}, {})
+        assert calls == ["wake", "query"]
+        assert playback._sd_status_query == f"report_{reason}"
+        assert playback._retry_offer is None
+    else:
+        await playback._open_signaling("sdp", [], "trace", {}, {})
+        assert calls == ["wake", "query", "offer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["report", "send_failed", "unavailable", "report_failed", "timeout", "close_failed"],
+)
+async def test_mixed_sd_status_falls_back_only_after_lan_send_failure(monkeypatch, outcome):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+
+    class Lan:
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            calls.append("lan-connect")
+            if outcome == "unavailable":
+                raise relay_module.NativeLanUnavailableError("fixture unavailable")
+
+        async def async_query_direct_dp(self, dp):
+            calls.append("lan-query")
+            if outcome in {"send_failed", "close_failed"}:
+                raise relay_module.NativeLanSignalError("fixture send failure")
+            if outcome == "report_failed":
+                raise relay_module.NativeLanDpReportError("fixture report failure")
+            if outcome == "timeout":
+                raise TimeoutError
+            return 1
+
+        async def async_close(self):
+            calls.append("lan-close")
+            if outcome == "close_failed" and calls.count("lan-close") == 1:
+                raise OSError("fixture close failure")
+
+    class Broker:
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_query_direct_dp(self, dp):
+            calls.append("mqtt-query")
+            return 1
+
+    monkeypatch.setattr(relay_module, "Lan302Client", Lan)
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True,
+        sd_status_lan_dp="110", sd_status_lan_error_route="mqtt",
+    )
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._on_demand_catalog = True
+    if outcome == "timeout":
+        with pytest.raises(NativeRelayPlaybackError, match="did not report SD status"):
+            await playback._maybe_send_wake(Broker())
+        assert calls == ["wake", "lan-connect", "lan-query", "lan-close"]
+        assert playback._sd_status_query == "report_timeout"
+        return
+    if outcome == "close_failed":
+        with pytest.raises(OSError, match="fixture close failure"):
+            await playback._maybe_send_wake(Broker())
+        assert playback._sd_status_query == "lan_cleanup_incomplete"
+        assert playback._status_lan is not None
+        assert calls == ["wake", "lan-connect", "lan-query", "lan-close"]
+        await playback.close()
+        assert calls[-2:] == ["lan-close", "lan-close"]
+        assert playback._status_lan is None
+        return
+    await playback._maybe_send_wake(Broker())
+    if outcome == "unavailable":
+        assert calls == ["wake", "lan-connect", "lan-close"]
+        assert playback._sd_status_query == "route_or_schema_unconfirmed"
+    else:
+        assert calls == ["wake", "lan-connect", "lan-query", "lan-close"] + (
+            ["mqtt-query"] if outcome == "send_failed" else []
+        )
+        assert playback._sd_status_query == {
+            "timeout": "report_timeout", "report_failed": "lan_report_failed",
+        }.get(outcome, "report_received")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_http_sd_status_after_wake_waits_for_device_report(monkeypatch, accepted):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+
+    class Broker:
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_wait_for_dp_report(self, dp, send):
+            calls.append(("waiter_registered", dp))
+            await send()
+            calls.append("report")
+            return 1
+
+    def gateway(*args):
+        calls.append(args)
+        return accepted
+
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True, sd_status_http_dp="110",
+    )
+    playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
+    playback._on_demand_catalog = True
+    await playback._maybe_send_wake(Broker())
+    assert calls[:3] == ["wake", ("waiter_registered", "110"), (
+        "thing.m.device.dp.publish", "1.0",
+        {"devId": config.dev_id, "gwId": config.dev_id, "dps": '{"110":null}'}, {},
+    )]
+    assert calls[3:] == (["report"] if accepted else [])
+    assert playback._sd_status_query == ("report_received" if accepted else "send_failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability", ["unknown", "none", "wireless", "low_power"])
+async def test_sd_catalog_suppresses_hub_dp_wake(capability):
+    def gateway(*_args):
+        pytest.fail("SD catalog must not write a hub wake DP")
+
+    config = replace(camera_config(), wake_capability=capability, wake_direct=False)
+    playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
+    playback._on_demand_catalog = True
+    await playback._maybe_send_wake(None)
+    assert playback._wake_status == "sd_low_power_unconfirmed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["answer", "disconnect", "timeout", "cancel", "publish_error"])
+async def test_offer_retries_without_wake_reuse_payload_and_stop(monkeypatch, outcome):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import (
+        TuyaIpcP2pError,
+    )
+
+    loop = asyncio.get_running_loop()
+    playback = session()
+    playback._answer = loop.create_future()
+    playback._ended = loop.create_future()
+    playback._on_demand_catalog = True
+    offers = []
+    answer = object()
+
+    class Broker:
+        async def async_send_offer(self, *args):
+            offers.append(args)
+            if len(offers) != 2:
+                return
+            if outcome == "answer":
+                playback._answer.set_result(answer)
+            elif outcome == "disconnect":
+                playback._on_signaling_failure("ConnectionError")
+            elif outcome == "publish_error":
+                raise TuyaIpcP2pError("test publish error")
+            elif outcome == "cancel":
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+
+    assert relay_module._OFFER_RETRY_OFFSETS == (1.5, 3.0, 6.0, 12.0)
+    monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS", (0.02, 0.04, 0.08, 0.16))
+    monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.22)
+    playback._moto = Broker()
+    await playback._open_signaling("sdp", [], "trace", {}, {})
+    if outcome == "answer":
+        assert await playback._wait_for_answer() is answer
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(playback._wait_for_answer())
+        assert not playback._answer.done()
+    else:
+        match = {
+            "disconnect": "MQTT signaling stopped",
+            "timeout": "Timed out waiting",
+            "publish_error": "MQTT offer retry failed",
+        }[outcome]
+        with pytest.raises(NativeRelayPlaybackError, match=match):
+            await playback._wait_for_answer()
+    expected_retries = 4 if outcome == "timeout" else 1
+    assert offers == [offers[0]] * (expected_retries + 1)
+    assert f"offer_retries={expected_retries}" in playback.transport_diagnostics
+    assert playback._retry_offer is None
+
+
+@pytest.mark.asyncio
+async def test_http_bootstrap_does_not_send_after_report_channel_failure(monkeypatch):
+    def gateway(*_args):
+        pytest.fail("Bootstrap must not send after the reply channel stops")
+
+    playback = NativeRelayPlaybackSession(camera_config(), APP_SESSION, call_api=gateway)
+    playback._ended = asyncio.get_running_loop().create_future()
+
+    async def connect(_session_id):
+        playback._on_signaling_failure("stream_ended")
+
+    monkeypatch.setattr(playback, "_connect_mqtt", connect)
+    with pytest.raises(NativeRelayPlaybackError, match="MQTT signaling stopped"):
+        await playback._initialize_http_offer("trace")
 
 
 @pytest.mark.asyncio
@@ -314,6 +812,39 @@ def test_broker_reader_failure_is_not_misreported_as_silent_camera():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wake", ["unknown", "low_power"])
+async def test_subscription_failure_has_sanitized_handshake_context(monkeypatch, wake):
+    class RejectedSubscription:
+        diagnostics = "subscription=rejected, published=0, received=0"
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_connect(self):
+            raise NativeRelayPlaybackError("Broker rejected the subscription")
+
+        async def async_send_disconnect(self):
+            pass
+
+        async def async_close(self):
+            pass
+
+    monkeypatch.setattr(relay_module, "MotoClient", RejectedSubscription)
+    monkeypatch.setattr(relay_module, "_DISCONNECT_GRACE_SECONDS", 0)
+    config = replace(camera_config(), app_profile_id="tuya_smart", wake_capability=wake)
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    with pytest.raises(NativeRelayPlaybackError, match="rejected") as failure:
+        await playback.connect(media=False)
+    note, = failure.value.__notes__
+    assert "subscription=rejected, published=0, received=0" in note
+    assert "phase=mqtt_subscribe, mode=metadata" in note
+    assert "app_profile=tuya_smart, bootstrap_api_version=1.0" in note
+    assert f"token_route=app_token, wake_capability={wake}, wake_direct=False, wake_status=not_requested" in note
+    for private in (config.local_key, config.app_uid, config.trace_id, playback.local_cid):
+        assert private not in note
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [False, True])
 async def test_signaling_prefers_lan_for_apk_local_policy(monkeypatch, expired):
     calls = []
@@ -387,12 +918,11 @@ async def test_signaling_uses_mqtt_only_after_lan_is_unavailable(monkeypatch):
         "lan-close",
         "mqtt-init",
         "mqtt-connect",
-        "mqtt-query",
         "mqtt-offer",
     ]
     assert calls[1][1]["moto_id"] == "camera-moto-id"
     assert playback._signaling_path == "mqtt"
-    assert "lan=unavailable, offer=published, answer=not_received" in playback.transport_diagnostics
+    assert "lan=unavailable, offer=published, offer_delivery=unconfirmed, answer=not_received" in playback.transport_diagnostics
 
 
 @pytest.mark.asyncio
@@ -769,7 +1299,6 @@ def test_connect_uses_mqtt_signaling_and_requires_direct_ice(monkeypatch, bootst
 
     expected = [
         "mqtt-connect",
-        "sig-query",
         "offer",
         "ice-gather",
         "direct-open",
