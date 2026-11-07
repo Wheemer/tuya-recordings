@@ -84,8 +84,13 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
-@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "no_card"])
-def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monkeypatch, outcome):
+@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "no_card", "missing", "hub"])
+@pytest.mark.parametrize("via_button", [False, True])
+def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
+    monkeypatch, tmp_path, caplog, outcome, via_button,
+):
+    import logging
+    import re
     from custom_components.tuya_recordings.client import TuyaRecordingsClient
     from zlib import crc32
 
@@ -102,6 +107,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     )
 
     config = camera_config()
+    caplog.set_level(logging.INFO, logger="custom_components.tuya_recordings")
     dev = config.dev_id
     bootstrap = {
         **json.loads(config.config_json), "p2pSpecifiedType": 4, "p2pPolicy": 0, "skill": "{}",
@@ -111,6 +117,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
     events = []
     detail_lookup = outcome != "home"
     wake = outcome in {"wake", "no_card"}
+    low_power_metadata = outcome in {"wake", "no_card", "missing", "hub"}
     day = date(2026, 9, 15)
     clip_start, clip_end = 1789459300, 1789459310
     key = config.local_key.encode()
@@ -120,16 +127,24 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
         if api == "tuya.m.location.list":
             return [{"gid": 1}]
         if api == "tuya.m.my.group.device.list":
-            pv = {"pv": "2.3"} if wake else {} if detail_lookup else {"pv": "2.2"}
+            pv = {"pv": "2.3"} if low_power_metadata else {} if detail_lookup else {"pv": "2.2"}
             return [{"devId": dev, "localKey": config.local_key, "category": "sp",
                      "productId": "fixture-product", **pv}]
         if api == "thing.m.device.product.ref.list":
-            return []
+            return [{"productId": "fixture-product", "configMetas": {"low_power_wakeup": True}}]
         detail = {"devId": dev, "productId": "fixture-product",
                   "communication": {"communicationNode": dev, "dataModel": 1,
                                     "communicationModes": [{"type": 1, "pv": "2.3"}]},
                   "skills": {"p2pType": 2}, "dataPointInfo": {"dps": {"149": False} if wake else {}},
                   "gatewayVerCAD": "1.0.2", "cloudOnline": True}
+        detail["private_payload"] = {"access_token": "secret-token-not-for-logs"}
+        if outcome == "missing":
+            detail.pop("skills")
+            detail.pop("dataPointInfo")
+            detail["communication"].pop("communicationNode")
+        elif outcome == "hub":
+            detail["communication"]["communicationNode"] = "fixture-hub"
+            detail["dataPointInfo"]["dps"]["149"] = False
         if api == "m.life.app.smart.local.device.list":
             return {
                 "deviceList": [] if detail_lookup else [detail],
@@ -187,7 +202,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
             if payload[:3] != b"2.3":
                 return
             refreshed_offers.append(body)
-            if outcome in {"home", "wake"} or (outcome == "resend" and len(refreshed_offers) == 2):
+            if outcome in {"home", "wake", "missing", "hub"} or (outcome == "resend" and len(refreshed_offers) == 2):
                 reply = encode_payload(
                     key, 1, b"test",
                     {"header": {"type": "answer", "sessionid": header["sessionid"]},
@@ -264,7 +279,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
         "device_local_keys": {dev: config.local_key},
         "device_protocol_versions": {dev: "2.2"},
     }
-    client = TuyaRecordingsClient(entry_data)
+    client = TuyaRecordingsClient(entry_data, cache_path=tmp_path / "catalog.json")
 
     async def offer_from_current_backend():
         resolved = client._recordings_backend._provider.session_config(dev)
@@ -277,33 +292,112 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(monke
 
     asyncio.run(offer_from_current_backend())
     assert offers == [b"2.2"]
-    assert client.refresh_inventory(entry_data)["device_protocol_versions"] == {dev: "2.3"}
+    if not via_button:
+        assert client.refresh_inventory(entry_data)["device_protocol_versions"] == {dev: "2.3"}
     events.clear()
-    backend = client._recordings_backend
-    token = ON_DEMAND_DAY_CATALOG.set(wake)
-    try:
-        with on_demand_offer_retries():
-            if outcome == "silent":
-                with pytest.raises(NativeRelayPlaybackError, match="Timed out waiting") as exc:
-                    backend.recordings_for_day(dev, {}, {}, day)
-            elif outcome == "no_card":
-                with pytest.raises(NativeRelayPlaybackError, match="report_no_card"):
-                    backend.recordings_for_day(dev, {}, {}, day)
-            else:
-                clips = backend.recordings_for_day(dev, {}, {}, day)
-    finally:
-        ON_DEMAND_DAY_CATALOG.reset(token)
-        backend.close()
+    error = ""
+    if via_button:
+        from unittest.mock import Mock
+        from custom_components import tuya_recordings as integration
+        from custom_components.tuya_recordings import client as client_module
+        from custom_components.tuya_recordings.button import TuyaRecordingsRefreshButton
+        from datetime import datetime, timezone
+
+        entry = SimpleNamespace(entry_id="fixture", title="Fixture", data=entry_data, options={})
+        handlers = {}
+
+        async def execute(function, *args):
+            return await asyncio.to_thread(function, *args)
+
+        async def call_service(domain, name, data, *, blocking):
+            assert blocking
+            await handlers[name](SimpleNamespace(data=data))
+
+        services = SimpleNamespace(
+            has_service=lambda *_: False,
+            async_register=lambda domain, name, handler, **kw: handlers.update({name: handler}),
+            async_call=call_service,
+        )
+        hass = SimpleNamespace(
+            services=services,
+            data={integration.DOMAIN: {"fixture": {"entry": entry, "client": client}}},
+            config_entries=SimpleNamespace(
+                async_update_entry=lambda entry, *, data: setattr(entry, "data", data),
+            ),
+            async_add_executor_job=execute, async_create_task=asyncio.create_task,
+        )
+        monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
+        monkeypatch.setattr(integration, "CATALOG_SYNC_DAYS_PER_PASS", 1)
+        monkeypatch.setattr(client_module.dt_util, "now", lambda: datetime(2026, 9, 15, tzinfo=timezone.utc))
+        integration._async_register_services(hass)
+        try:
+            asyncio.run(TuyaRecordingsRefreshButton(hass, entry).async_press())
+            assert entry.data["device_protocol_versions"] == {dev: "2.3"}
+            wake_metadata = entry.data["device_wake_capabilities"][dev]
+            if outcome == "missing":
+                assert "sd_low_power" not in wake_metadata
+                assert wake_metadata["evidence"] == {
+                    "source": "detail", "route": "missing", "provider_two": None,
+                    "dp149": "missing", "sd_status_schema": True,
+                }
+            elif outcome == "hub":
+                assert wake_metadata["sd_low_power"] is False
+                assert wake_metadata["direct"] is False
+                assert wake_metadata["evidence"]["route"] == "hub"
+            camera = client.cached_camera_index()["cameras"][0]
+            clips = camera["clips"]
+            error = camera["bridgeStatus"]["error"]
+        finally:
+            client._recordings_backend.close()
+        start = next(record.getMessage() for record in caplog.records if "manual refresh started" in record.getMessage())
+        request_id = re.search(r"request_id=([a-f0-9]{12})", start).group(1)
+        for milestone in ("refreshed SD wake metadata", "catalog query started", "manual refresh finished"):
+            assert any(milestone in record.getMessage() and f"request_id={request_id}" in record.getMessage()
+                       for record in caplog.records)
+        assert config.local_key not in caplog.text
+        assert config.camera_password not in caplog.text
+        assert "secret-token-not-for-logs" not in caplog.text
+        assert "private_payload" not in caplog.text
+        if outcome in {"silent", "no_card"}:
+            failed = next(record for record in caplog.records if "catalog query failed" in record.getMessage())
+            assert f"request_id={request_id}" in failed.getMessage()
+            assert "fresh_attempt=True" in failed.getMessage()
+            assert failed.exc_info is not None
+            assert "wake_scope_enabled=True" in caplog.text
+            assert "offer_resend_enabled=True" in caplog.text
+        if outcome == "missing":
+            assert "'route': 'missing'" in caplog.text
+            assert "'provider_two': None" in caplog.text
+            assert "'dp149': 'missing'" in caplog.text
+    else:
+        backend = client._recordings_backend
+        token = ON_DEMAND_DAY_CATALOG.set(wake)
+        try:
+            with on_demand_offer_retries():
+                if outcome == "silent":
+                    with pytest.raises(NativeRelayPlaybackError, match="Timed out waiting") as exc:
+                        backend.recordings_for_day(dev, {}, {}, day)
+                    error = str(exc.value)
+                elif outcome == "no_card":
+                    with pytest.raises(NativeRelayPlaybackError, match="report_no_card"):
+                        backend.recordings_for_day(dev, {}, {}, day)
+                else:
+                    clips = backend.recordings_for_day(dev, {}, {}, day)
+        finally:
+            ON_DEMAND_DAY_CATALOG.reset(token)
+            backend.close()
     if outcome == "no_card":
+        if via_button:
+            assert "report_no_card" in error and clips == []
         assert offers == [b"2.2"]
         assert events == ["wake", "sd-query", "broker-closed"]
         return
-    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1}[outcome]
+    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1, "missing": 1, "hub": 1}[outcome]
     assert offers == [b"2.2"] + [b"2.3"] * count
     assert refreshed_offers == [refreshed_offers[0]] * count
     if outcome == "silent":
-        assert "offer_retries=4" in str(exc.value)
-        assert "received=0" in str(exc.value)
+        assert "offer_retries=4" in error
+        assert "received=0" in error
         assert events == ["offer"] * count + ["direct-closed", "broker-closed"]
     else:
         prefix = ["wake", "sd-query"] if wake else []

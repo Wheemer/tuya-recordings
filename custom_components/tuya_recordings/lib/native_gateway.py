@@ -283,6 +283,7 @@ class NativeAppGatewayClient:
                     "category": str(device.get("category") or ""),
                     "productId": product_id,
                     "online": device.get("online"),
+                    "sdWakeEvidence": _sd_wake_evidence(device, dev_id, "group"),
                 }
                 if wake is not None:
                     row["wakeCapability"] = wake
@@ -334,6 +335,7 @@ class NativeAppGatewayClient:
         for dev_id, (gid, row) in camera_details.items():
             if dev_id in protocol_versions and "sdLowPowerWake" in row:
                 continue
+            row["sdWakeDetailLookup"] = "requested"
             try:
                 detail = self.call(
                     "thing.m.device.get", "4.1", {"devId": dev_id}, app_session, {"gid": str(gid)}
@@ -341,17 +343,23 @@ class NativeAppGatewayClient:
             except NativeGatewayAuthError:
                 raise
             except NativeGatewayError:
+                row["sdWakeDetailLookup"] = "failed"
                 continue
             if not isinstance(detail, dict) or detail.get("devId") != dev_id:
+                row["sdWakeDetailLookup"] = "invalid_device"
                 continue
             product_id = row["productId"]
             detail_product = detail.get("productId")
             if product_id and detail_product and detail_product != product_id:
+                row["sdWakeDetailLookup"] = "product_mismatch"
                 continue
             if dev_id not in protocol_versions and (pv := _device_mqtt_protocol_version(detail)):
                 protocol_versions[dev_id] = pv
             product = home_products.get(gid, {}).get(product_id)
-            _apply_sd_wake_metadata(row, {**detail, "productBean": product} if product else detail, dev_id)
+            row["sdWakeDetailLookup"] = "matched"
+            _apply_sd_wake_metadata(
+                row, {**detail, "productBean": product} if product else detail, dev_id, source="detail",
+            )
         return found, protocol_versions, inventory
 
     def _enrich_camera_wake_from_home(
@@ -365,8 +373,12 @@ class NativeAppGatewayClient:
                 {"homeId": gid, "groupType": "homeGroup"}, app_session,
             )
         except NativeGatewayError:
+            for row in rows:
+                row["sdWakeHomeLookup"] = "failed"
             return {}
         if not isinstance(result, dict):
+            for row in rows:
+                row["sdWakeHomeLookup"] = "malformed_response"
             return {}
 
         def index(field: str, key: str) -> dict[str, dict[str, Any]]:
@@ -384,8 +396,13 @@ class NativeAppGatewayClient:
         for row in rows:
             dev_id, product_id = row["devId"], row["productId"]
             device = devices.get(dev_id)
-            if device is None or device.get("productId") != product_id:
+            if device is None:
+                row["sdWakeHomeLookup"] = "device_absent"
                 continue
+            if device.get("productId") != product_id:
+                row["sdWakeHomeLookup"] = "product_mismatch"
+                continue
+            row["sdWakeHomeLookup"] = "matched"
             if pv := _device_mqtt_protocol_version(device):
                 protocol_versions[dev_id] = pv
             product = products.get(product_id)
@@ -497,7 +514,27 @@ def _supports_direct_wireless_wake(device: dict[str, Any], dev_id: str) -> bool:
     )
 
 
-def _apply_sd_wake_metadata(row: dict[str, Any], device: dict[str, Any], dev_id: str) -> None:
+def _sd_wake_evidence(device: dict[str, Any], dev_id: str, source: str) -> dict[str, Any]:
+    """Describe missing APK predicate inputs without retaining DP values or keys."""
+    communication = device.get("communication")
+    target = communication.get("communicationNode") if isinstance(communication, dict) else device.get("communicationId")
+    provider = _is_provider_two(device, dev_id)
+    info = device.get("dataPointInfo")
+    dps = info.get("dps") if isinstance(info, dict) else device.get("dps")
+    product = device.get("productBean")
+    return {
+        "source": source,
+        "route": "missing" if not isinstance(target, str) or not target else "direct" if target == dev_id else "hub",
+        "provider_two": provider,
+        "dp149": ("present" if "149" in dps else "absent") if isinstance(dps, dict) else "missing",
+        "sd_status_schema": bool(_sd_status_schema_id(product)) if isinstance(product, dict) else False,
+    }
+
+
+def _apply_sd_wake_metadata(
+    row: dict[str, Any], device: dict[str, Any], dev_id: str, *, source: str = "home",
+) -> None:
+    row["sdWakeEvidence"] = _sd_wake_evidence(device, dev_id, source)
     communication = device.get("communication")
     target = communication.get("communicationNode") if isinstance(communication, dict) else device.get("communicationId")
     if isinstance(target, str) and target:

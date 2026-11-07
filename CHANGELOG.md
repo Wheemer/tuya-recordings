@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-4 (unreleased)
+
+### Fixes
+
+- Fix the **Refresh recordings** button's catalog pass so eligible cameras can run the APK-backed wake and SD-status sequence before the MQTT offer.
+- If a scheduled catalog pass is already running, manual refresh waits for it and then runs its own pass. Scheduled wake and retry behavior is unchanged.
+- Improve diagnostics with a manual-refresh request ID, metadata lookup outcomes, missing wake inputs, and full catalog-failure tracebacks. Logs distinguish fresh attempts from retained errors and backoff skips without dumping the recording catalog or raw device responses.
+
 ## Tuya Recordings v0.4.13-3 (unreleased)
 
 ### Fixes
