@@ -552,6 +552,8 @@ class NativeRelayPlaybackWorker:
                         self._app_session,
                     )
                     connect_options = {"allow_wake": True} if isinstance(work, _CatalogWork) and work.allow_wake else {}
+                    if isinstance(work, _InteractivePlaybackWork):
+                        connect_options["allow_wake"] = True
                     if not isinstance(work, _ThumbnailWork):
                         connect_options.update(_offer_retry_options(work.retry_offer))
                     await self._wait_for_work(

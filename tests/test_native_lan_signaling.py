@@ -61,12 +61,13 @@ class FakeTinyTuya:
 
 
 @pytest.mark.asyncio
-async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch):
+@pytest.mark.parametrize("status", [0, "0"])
+async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch, status):
     replies = iter([
         {},
         {"devId": "other", "dps": {"110": 8}},
         {"dps": {"110": True}},
-        {"data": {"devId": "camera", "dps": {"110": 0}}},
+        {"data": {"devId": "camera", "dps": {"110": status}}},
     ])
 
     class Device(FakeDevice):

@@ -15,10 +15,20 @@ from custom_components.tuya_recordings.lib.native_gateway import (
     _sd_status_lan_dp,
     _sd_status_lan_error_route,
     _sd_status_mqtt_dp,
+    _sd_status_schema_id,
     _wire_api_name,
     generate_device_fingerprint,
     native_app_profile,
 )
+
+
+@pytest.mark.parametrize(("identifier", "expected"), [
+    (110, "110"), ("247", "247"), (True, ""), (None, ""), (-1, ""),
+    (1.5, ""), ("invalid", ""),
+])
+def test_sd_status_schema_id_matches_android_string_field_coercion(identifier, expected):
+    product = {"schemaInfo": {"schema": json.dumps([{"id": identifier, "code": "sd_status"}])}}
+    assert _sd_status_schema_id(product) == expected
 
 
 @pytest.mark.parametrize(("pv", "cadv", "route"), [
@@ -48,6 +58,64 @@ def test_sd_status_cloud_routes_do_not_override_lan_or_matter(modes, online, mqt
     }
     assert (_sd_status_mqtt_dp(device), _sd_status_http_dp(device)) == (mqtt, http)
     assert _sd_status_lan_dp(device) == ("110" if 0 in modes else "")
+
+
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+@pytest.mark.parametrize("result", ["matched", "wrong_version", "wrong_product", "duplicate", "malformed", "failed"])
+def test_missing_product_schema_is_versioned_bounded_and_semantic(monkeypatch, profile, result):
+    client = NativeAppGatewayClient(session=FakeSession(), app_profile_id=profile)
+    devices = []
+    for index in range(23):
+        detail = {
+            "devId": f"camera-{index}", "productId": f"product-{index}", "productVer": "3.1",
+            "communication": {"communicationNode": f"camera-{index}", "dataModel": 1,
+                              "communicationModes": [{"type": 1, "pv": "2.3"}]},
+            "cloudOnline": True, "gatewayVerCAD": "1.0.2",
+            "skills": {"p2pType": 2}, "dataPointInfo": {"dps": {"149": False}},
+        }
+        devices.append(({"devId": detail["devId"]}, detail))
+    devices.append(({"devId": "duplicate-camera"}, {**devices[0][1], "devId": "duplicate-camera",
+                    "communication": {**devices[0][1]["communication"], "communicationNode": "duplicate-camera"}}))
+    calls = []
+
+    def fake_call(self, api, version, post, app_session=None, extra_params=None):
+        assert (api, version, post["zigbeeGroup"]) == ("thing.m.device.ref.info.list", "6.1", True)
+        products = json.loads(post["productIds"])
+        calls.append(products)
+        if result == "failed":
+            raise NativeGatewayError("fixture unavailable")
+        if result == "malformed":
+            return {}
+        rows = [{
+            "id": item["pid"] if result != "wrong_product" else "different",
+            "productVer": item["ver"] if result != "wrong_version" else "other",
+            "schemaInfo": {"schema": '[{"id":"247","code":"sd_status"}]'},
+        } for item in products]
+        return rows * 2 if result == "duplicate" else rows
+
+    monkeypatch.setattr(NativeAppGatewayClient, "call", fake_call)
+    client._resolve_product_schemas(devices, None)
+    assert [len(batch) for batch in calls] == [20, 3]
+    assert len({item["pid"] for batch in calls for item in batch}) == 23
+    for row, _ in devices:
+        assert row["sdSchemaLookup"] == ("matched" if result == "matched" else "unavailable")
+        assert row.get("sdStatusMqttDp") == ("247" if result == "matched" else None)
+
+
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+def test_missing_product_version_is_not_fabricated(monkeypatch, profile):
+    client = NativeAppGatewayClient(session=FakeSession(), app_profile_id=profile)
+    calls = []
+
+    def fake_call(self, api, version, post, app_session=None, extra_params=None):
+        calls.append(json.loads(post["productIds"]))
+        return [{"id": "p1", "schemaInfo": {"schema": '[{"id":"247","code":"sd_status"}]'}}]
+
+    monkeypatch.setattr(NativeAppGatewayClient, "call", fake_call)
+    row = {"devId": "camera"}
+    client._resolve_product_schemas([(row, {"devId": "camera", "productId": "p1"})], None)
+    assert calls == [[{"pid": "p1"}]]
+    assert row["sdSchemaLookup"] == "matched"
 
 
 def test_tuya_smart_profile_uses_its_own_current_mobile_identity():
@@ -326,6 +394,8 @@ def test_inventory_resolves_missing_wireless_schema_once_per_home(monkeypatch, p
             ]
         if api == "thing.m.device.product.ref.list":
             return []
+        if api == "thing.m.device.ref.info.list":
+            return []
         if api == "thing.m.device.get":
             assert refresh_protocols
             return None
@@ -410,6 +480,8 @@ def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, prof
             return []
         if api == "m.life.app.smart.local.device.list":
             return {"deviceList": [row("home", pv="2.3")]}
+        if api == "thing.m.device.ref.info.list":
+            return []
         assert api == "thing.m.device.get"
         assert (version, extra_params, app_session.sid) == ("4.1", {"gid": "123"}, "sid")
         dev_id = post["devId"]

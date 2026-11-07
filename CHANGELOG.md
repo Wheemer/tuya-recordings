@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-5 (2026-11-07)
+
+### Fixes
+
+- Restore the eligible direct camera connector's foreground wake step, including interactive playback. Share one wake send with the SD-status step; scheduled jobs do not gain wake permission.
+- Decode authenticated inbound MQTT frames using their wire protocol version without changing the outgoing camera protocol version.
+- Accept numeric SD-status DP IDs as the Android schema model does.
+- Parse numeric-string SD-status reports on MQTT and LAN as the APK's DP helper does.
+- Fetch missing product schemas during manual inventory refresh using the product ID and version, following the schema-loading path traced in both Smart Life and Tuya Smart APKs. This allows the wake and SD-status sequence to use the camera's actual SD-status DP before sending the playback offer.
+- Match schemas by product ID and version, deduplicate lookups, and limit each request to 20 products. Scheduled work and background retries are unchanged.
+- Preserve the manual-refresh request ID through Home Assistant's executor so inventory, wake metadata, and catalog logs can be correlated.
+- Add payload-free MQTT protocol counts and DP-report classifications to help distinguish unrelated traffic from a matching SD-status report.
+
 ## Tuya Recordings v0.4.13-4 (unreleased)
 
 ### Fixes

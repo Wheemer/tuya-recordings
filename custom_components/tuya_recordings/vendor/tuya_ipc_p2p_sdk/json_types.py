@@ -70,6 +70,18 @@ def optional_int(source: JsonObject, key: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def dp_integer(value: JsonValue) -> int | None:
+    """Parse a DP value requested as Integer.class by the Android DP helper."""
+    if isinstance(value, str):
+        if len(value) > 32:
+            return None
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if type(value) is int and -(1 << 31) <= value < (1 << 31) else None
+
+
 def object_list(source: JsonObject, key: str) -> list[JsonObject]:
     """Return the objects of a list field, skipping entries of any other shape."""
     value = source.get(key)
