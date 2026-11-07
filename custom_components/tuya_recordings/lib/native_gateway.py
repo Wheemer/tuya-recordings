@@ -599,6 +599,7 @@ def _apply_sd_wake_metadata(
     if eligible is None:
         return
     row["sdLowPowerWake"] = eligible
+    row["sdStatusMqttCapable"] = bool(_sd_status_mqtt_dp({**device, "cloudOnline": True})) if eligible else False
     if not eligible:
         for key in ("sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp", "sdStatusLanErrorRoute"):
             row.pop(key, None)
@@ -702,7 +703,7 @@ def _sd_status_http_dp(device: dict[str, Any]) -> str:
     if not isinstance(communication, dict) or not isinstance(product, dict):
         return ""
     modes = _sd_status_modes(communication)
-    if 8 in modes or 2 not in modes or (1 in modes and device.get("cloudOnline") is not False):
+    if not modes or 8 in modes or (1 in modes and device.get("cloudOnline") is not False):
         return ""
     return _sd_status_schema_id(product)
 

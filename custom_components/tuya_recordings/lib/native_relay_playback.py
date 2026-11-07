@@ -87,6 +87,7 @@ from .native_simple import (
 from .native_v4 import NativeV4CatalogPage
 
 _ANSWER_TIMEOUT_SECONDS = 20.0
+_SD_STATUS_TIMEOUT_SECONDS = 30.0
 # Absolute elapsed thresholds from the APK's native connection-state timer.
 _OFFER_RETRY_OFFSETS = (1.5, 3.0, 6.0, 12.0)
 _DIRECT_NOMINATION_TIMEOUT_SECONDS = 10.0
@@ -192,8 +193,11 @@ class NativeRelayPlaybackSession:
         self._retry_mqtt_offer = False
         self._wake_status = "not_requested"
         self._sd_status_query = "not_requested"
+        self._sd_status_report_route = "none"
+        self._sd_status_deadline: float | None = None
         self._session: DirectSession | None = None
         self._ice: IceResponder | None = None
+        self._remote_candidates: list[str] = []
         self._control: KcpConversation | None = None
         self._video: KcpConversation | None = None
         self._audio: KcpConversation | None = None
@@ -309,7 +313,8 @@ class NativeRelayPlaybackSession:
             f"token_route={self._token_route}, "
             f"wake_capability={config.wake_capability}, wake_direct={config.wake_direct}, "
             f"wake_status={self._wake_status}, sd_low_power_wake={config.sd_low_power_wake}, "
-            f"sd_status_query={self._sd_status_query}, connector_wake={self._connector_wake_status}"
+            f"sd_status_query={self._sd_status_query}, connector_wake={self._connector_wake_status}, "
+            f"sd_status_report_route={self._sd_status_report_route}"
         )
 
     async def connect(
@@ -327,6 +332,12 @@ class NativeRelayPlaybackSession:
         loop = asyncio.get_running_loop()
         self._answer = loop.create_future()
         self._ended = loop.create_future()
+        if self._connector_wake_allowed and CAMERA_COMMANDS.wake_report_on_cooldown(self._native_config.dev_id):
+            self._connector_wake_status = "report_timeout_cooldown"
+            error = NativeRelayPlaybackError("Camera wake is on SD-status timeout cooldown")
+            self._annotate_connect_failure(error)
+            await self.close()
+            raise error
         if self._native_config.p2p_policy != 1:
             self._lan_status = "not_selected_by_policy"
         if self._stream_config is None:
@@ -379,6 +390,10 @@ class NativeRelayPlaybackSession:
             if self._ended.done():
                 raise self._ended.result()
             self._ice.set_receive_key(answer.aes_key)
+            self._ice.set_remote_credentials(answer.ice_ufrag, answer.ice_password)
+            for candidate in (*self._remote_candidates, *answer.candidates):
+                self._ice.add_remote_candidate(candidate)
+            self._remote_candidates.clear()
             self._connect_phase = "ice_nomination"
             await self._ice.async_wait_for_nomination(
                 _DIRECT_NOMINATION_TIMEOUT_SECONDS
@@ -538,13 +553,16 @@ class NativeRelayPlaybackSession:
             on_failure=self._on_signaling_failure,
         )
         await self._moto.async_connect()
-        await self._maybe_send_connector_wake(self._moto)
         await self._maybe_send_wake(self._moto)
+        await self._maybe_send_connector_wake(self._moto)
 
     async def _maybe_send_connector_wake(self, moto: MotoClient) -> None:
         """Match InternalThingSmartCameraP2P's pre-connect direct wake."""
         config = self._native_config
         if not self._connector_wake_allowed:
+            return
+        if self._connector_wake_sent:
+            self._connector_wake_status = "shared_sd_wake"
             return
         if config.wake_capability not in {"low_power", "remote", "low_power_and_remote", "wireless"}:
             self._connector_wake_status = "not_eligible"
@@ -569,7 +587,29 @@ class NativeRelayPlaybackSession:
 
     async def _maybe_send_wake(self, moto: MotoClient) -> None:
         config = self._native_config
-        if not self._on_demand_catalog:
+        dp = config.sd_status_lan_dp or config.sd_status_mqtt_dp or config.sd_status_http_dp
+        eligible = (
+            (self._on_demand_catalog or self._connector_wake_allowed)
+            and config.sd_low_power_wake is True and config.wake_direct
+        )
+        if eligible and dp.isascii() and dp.isdecimal():
+            # One device listener survives wake, connection, dispatch, socket
+            # teardown and fallback. Nested same-task operations borrow it.
+            self._sd_status_deadline = asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
+            try:
+                with moto.dp_report_listener(dp) as report:
+                    async with asyncio.timeout_at(self._sd_status_deadline):
+                        await self._perform_sd_wake(moto, report)
+            except TimeoutError:
+                raise self._missing_sd_status_report() from None
+            finally:
+                self._sd_status_deadline = None
+        else:
+            await self._perform_sd_wake(moto)
+
+    async def _perform_sd_wake(self, moto: MotoClient, report: asyncio.Future[int] | None = None) -> None:
+        config = self._native_config
+        if not (self._on_demand_catalog or self._connector_wake_allowed):
             return
         if CAMERA_COMMANDS.wake_report_on_cooldown(config.dev_id):
             self._wake_status = "cooldown"
@@ -598,13 +638,25 @@ class NativeRelayPlaybackSession:
         except TuyaIpcP2pError:
             self._wake_status = "send_failed"
         else:
+            self._connector_wake_sent = True
             self._wake_status = "sent_unconfirmed"
-            deadline = asyncio.get_running_loop().time() + 30
+            if report is not None and report.done():
+                self._sd_status_report_route = "mqtt"
+                self._accept_sd_status_report(report.result())
+                return
+            deadline = self._sd_status_deadline or asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
             if config.sd_status_lan_dp.isascii() and config.sd_status_lan_dp.isdecimal():
-                if await self._try_lan_sd_status(config.sd_status_lan_dp, deadline):
+                if await self._try_lan_sd_status(config.sd_status_lan_dp, deadline, moto):
+                    return
+                if report is not None and report.done():
+                    self._sd_status_report_route = "mqtt"
+                    self._accept_sd_status_report(report.result())
                     return
             dp = config.sd_status_mqtt_dp or config.sd_status_http_dp
             use_mqtt = bool(config.sd_status_mqtt_dp)
+            online = getattr(moto, "device_online", None)
+            if dp and config.sd_status_mqtt_capable and type(online) is bool:
+                use_mqtt = online
             if self._sd_status_query == "lan_send_failed":
                 route = config.sd_status_lan_error_route
                 if route not in {"mqtt", "http"}:
@@ -628,6 +680,7 @@ class NativeRelayPlaybackSession:
             except (TuyaIpcP2pError, NativeGatewayError):
                 self._sd_status_query = "send_failed"
             else:
+                self._sd_status_report_route = "mqtt"
                 self._accept_sd_status_report(status)
 
     def _accept_sd_status_report(self, status: int) -> None:
@@ -649,7 +702,7 @@ class NativeRelayPlaybackSession:
             f"Camera did not report SD status after wake ({self.transport_diagnostics})"
         )
 
-    async def _try_lan_sd_status(self, dp: str, deadline: float) -> bool:
+    async def _try_lan_sd_status(self, dp: str, deadline: float, moto: MotoClient) -> bool:
         """Return false only when LAN could not dispatch the query."""
         config = self._native_config
         lan = Lan302Client(
@@ -668,9 +721,31 @@ class NativeRelayPlaybackSession:
                 except (NativeLanUnavailableError, OSError):
                     self._sd_status_query = "lan_unavailable"
                     return False
-                status = await lan.async_query_direct_dp(dp)
-        except NativeLanDpReportError:
-            self._sd_status_query = "lan_report_failed"
+                # The APK's query listener is device-wide: LAN dispatch may
+                # produce a report on the already-subscribed MQTT channel.
+                with moto.dp_report_listener(dp) as mqtt_report:
+                    query = None if mqtt_report.done() else asyncio.create_task(lan.async_query_direct_dp(dp))
+                    try:
+                        done, _ = await asyncio.wait(
+                            (query, mqtt_report) if query is not None else (mqtt_report,),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if mqtt_report in done:
+                            status = mqtt_report.result()
+                            self._sd_status_report_route = "mqtt"
+                        else:
+                            try:
+                                status = query.result()
+                            except NativeLanDpReportError:
+                                self._sd_status_query = "lan_report_failed_waiting_mqtt"
+                                status = await mqtt_report
+                                self._sd_status_report_route = "mqtt"
+                            else:
+                                self._sd_status_report_route = "lan"
+                    finally:
+                        if query is not None:
+                            query.cancel()
+                            await asyncio.gather(query, return_exceptions=True)
         except NativeLanSignalError:
             self._sd_status_query = "lan_send_failed"
             return False
@@ -1243,7 +1318,12 @@ class NativeRelayPlaybackSession:
             pass
 
     def _on_remote_candidate(self, candidate: str) -> None:
-        del candidate
+        if self._closed or len(candidate) > 1024:
+            return
+        if self._ice is not None:
+            self._ice.add_remote_candidate(candidate)
+        elif candidate not in self._remote_candidates and len(self._remote_candidates) < 64:
+            self._remote_candidates.append(candidate)
 
     def _on_disconnect(self, close_reason: int) -> None:
         error = NativeRelayPlaybackError(

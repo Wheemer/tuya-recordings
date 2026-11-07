@@ -135,6 +135,8 @@ def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) 
             **({"schema_lookup": device["sdSchemaLookup"]} if isinstance(device.get("sdSchemaLookup"), str) else {}),
             **({"home_lookup": device["sdWakeHomeLookup"]} if isinstance(device.get("sdWakeHomeLookup"), str) else {}),
             **({"sd_low_power": eligible} if type(eligible) is bool else {}),
+            **({"sd_status_mqtt_capable": device["sdStatusMqttCapable"]}
+               if type(device.get("sdStatusMqttCapable")) is bool else {}),
             **({"sd_status_mqtt_dp": dp} if isinstance(dp := device.get("sdStatusMqttDp"), str) else {}),
             **({"sd_status_http_dp": dp} if isinstance(dp := device.get("sdStatusHttpDp"), str) else {}),
             **({"sd_status_lan_dp": dp} if isinstance(dp := device.get("sdStatusLanDp"), str) else {}),
@@ -822,6 +824,13 @@ class TuyaRecordingsClient:
                 for dev_id, day in queries:
                     if active.is_set():
                         raise CameraWorkCancelled("Recording catalog pass cancelled")
+                    if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+                        log(
+                            "Tuya Recordings catalog query skipped request_id=%s dev=%s day=%s "
+                            "reason=sd_status_timeout_cooldown fresh_attempt=False",
+                            request_id, dev_id, day.isoformat(),
+                        )
+                        continue
                     camera = by_id[dev_id]
                     log(
                         "Tuya Recordings catalog query started request_id=%s dev=%s day=%s "

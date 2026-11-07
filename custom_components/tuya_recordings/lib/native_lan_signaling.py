@@ -119,18 +119,13 @@ class Lan302Client:
             device = self._device
             if device is None or self._reader is not None:
                 raise NativeLanUnavailableError("DP query needs an idle local socket")
-            await _join_device_io(self._send, device, {
+            message = await _join_device_io(self._send_query, device, {
                 "devId": self._device_id, "uid": self._uid,
                 "t": int(time.time()), "dps": {dp: None},
-            }, _LAN_CONTROL)
+            })
             while not self._closed:
-                device.set_socketTimeout(0.25)
-                try:
-                    message = await _join_device_io(device.receive)
-                except OSError:
-                    # A read failure after dispatch is not a failed send.
-                    await asyncio.sleep(0.05)
-                    continue
+                if _is_device_error(message):
+                    raise NativeLanDpReportError("Local DP report channel failed")
                 if isinstance(message, dict) and message.get("devId") in (None, "", self._device_id):
                     data = message.get("data", message)
                     dps = data.get("dps") if (
@@ -140,6 +135,11 @@ class Lan302Client:
                     value = dp_integer(dps.get(dp)) if isinstance(dps, dict) else None
                     if value is not None:
                         return value
+                device.set_socketTimeout(0.25)
+                try:
+                    message = await _join_device_io(device.receive)
+                except OSError as error:
+                    raise NativeLanDpReportError("Local DP report channel failed") from error
                 await asyncio.sleep(0.05)
         raise NativeLanDpReportError("Local DP socket closed")
 
@@ -275,6 +275,50 @@ class Lan302Client:
         if _is_device_error(result):
             self._discovery_cache.pop(self._device_id, None)
             raise NativeLanSignalError("Local P2P signaling send failed")
+
+    def _send_query(self, device: Any, message: dict[str, Any]) -> Any:
+        """Wait for the LAN delivery result, retaining an immediate DP report."""
+        payload = tinytuya.MessagePayload(
+            _LAN_CONTROL, json.dumps(message, separators=(",", ":")).encode(),
+        )
+        device.set_socketTimeout(_LAN_TIMEOUT_SECONDS)
+        deadline = time.monotonic() + _LAN_TIMEOUT_SECONDS
+        try:
+            result = device._send_receive(payload)
+            for _ in range(32):
+                retcode = getattr(device, "cmd_retcode", None)
+                data = result.get("data", result) if isinstance(result, dict) else None
+                dps = data.get("dps") if isinstance(data, dict) else None
+                matching_report = (
+                    isinstance(result, dict) and result.get("devId") in (None, "", self._device_id)
+                    and isinstance(data, dict) and data.get("devId") in (None, "", self._device_id)
+                    and not data.get("cid") and isinstance(dps, dict)
+                    and any(dp_integer(dps.get(dp)) is not None for dp in message["dps"])
+                )
+                if _is_device_error(result) or retcode is not None or matching_report:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                device.set_socketTimeout(remaining)
+                result = device.receive()
+        except Exception as error:
+            self._discovery_cache.pop(self._device_id, None)
+            raise NativeLanSignalError("Local DP query delivery failed") from error
+        retcode = getattr(device, "cmd_retcode", None)
+        data = result.get("data", result) if isinstance(result, dict) else None
+        dps = data.get("dps") if isinstance(data, dict) else None
+        valid_report = (
+            isinstance(result, dict) and result.get("devId") in (None, "", self._device_id)
+            and isinstance(data, dict) and data.get("devId") in (None, "", self._device_id)
+            and not data.get("cid") and isinstance(dps, dict)
+            and any(dp_integer(dps.get(dp)) is not None for dp in message["dps"])
+        )
+        if (_is_device_error(result) or (type(retcode) is int and retcode != 0)
+                or (retcode is None and not valid_report)):
+            self._discovery_cache.pop(self._device_id, None)
+            raise NativeLanSignalError("Local DP query delivery failed")
+        return result
 
     def _dispatch(self, message: dict[str, Any] | None) -> bool:
         if not isinstance(message, dict):

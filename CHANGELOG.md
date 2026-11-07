@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-6 (2026-11-07)
+
+### Fixes
+
+- Keep the SD-status listener active throughout wake, LAN connection, cleanup, and fallback so early camera replies are not lost.
+- Follow the wake and SD-status ordering traced in both Smart Life and Tuya Smart APKs for foreground catalog requests and playback, with one shared 30-second SD-status deadline.
+- Require a matching LAN command result or SD-status report before accepting delivery. Unrelated packets no longer suppress the normal fallback.
+- Restore the APK's final HTTP SD-status query route and use authenticated connectivity updates when choosing MQTT or HTTP.
+- Retain remote ICE candidates from signaling and the answer, and send bounded authenticated direct UDP connectivity checks.
+- Report the SD-status reply source and skip further catalog-day requests during an SD-status timeout cooldown. Scheduled work gains no wake permission or background retries.
+
 ## Tuya Recordings v0.4.13-5 (2026-11-07)
 
 ### Fixes

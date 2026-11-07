@@ -91,6 +91,7 @@ class NativeAppCameraConfigProvider:
             sd_status_http_dp = wake.get("sd_status_http_dp") if isinstance(wake, dict) else None
             sd_status_lan_dp = wake.get("sd_status_lan_dp") if isinstance(wake, dict) else None
             lan_error_route = wake.get("sd_status_lan_error_route") if isinstance(wake, dict) else None
+            mqtt_capable = isinstance(wake, dict) and wake.get("sd_status_mqtt_capable") is True
             if isinstance(wake, dict):
                 wake = wake.get("capability")
             config = normalize_camera_info(
@@ -110,6 +111,7 @@ class NativeAppCameraConfigProvider:
                 sd_status_http_dp=sd_status_http_dp if isinstance(sd_status_http_dp, str) else "",
                 sd_status_lan_dp=sd_status_lan_dp if isinstance(sd_status_lan_dp, str) else "",
                 sd_status_lan_error_route=lan_error_route if isinstance(lan_error_route, str) else "",
+                sd_status_mqtt_capable=mqtt_capable,
             )
         except NativeGatewayAuthError as err:
             raise NativeCameraConfigAuthError(

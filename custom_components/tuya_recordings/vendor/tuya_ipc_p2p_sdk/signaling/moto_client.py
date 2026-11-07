@@ -8,6 +8,7 @@ import secrets
 import ssl
 import time
 from collections import Counter
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from zlib import crc32
 
@@ -95,6 +96,7 @@ class MotoClient:
         self._client: aiomqtt.Client | None = None
         self._reader: asyncio.Task[None] | None = None
         self._dp_query: tuple[str, asyncio.Future[int]] | None = None
+        self._dp_query_owner: asyncio.Task | None = None
         self._received = 0
         self._decode_failures = 0
         self._session_mismatches = 0
@@ -105,6 +107,7 @@ class MotoClient:
         self._broker_status = "not_connected"
         self._subscription = "not_attempted"
         self._reader_failure = "none"
+        self.device_online: bool | None = None
 
     @property
     def diagnostics(self) -> str:
@@ -211,6 +214,11 @@ class MotoClient:
         if bucket not in self._inbound_protocols and len(self._inbound_protocols) >= 16:
             bucket = "other"
         self._inbound_protocols[bucket] += 1
+        if (protocol == 1 and data.get("devId") == self._device_id
+                and data.get("cid") in (None, "") and type(data.get("online")) is bool):
+            self.device_online = data["online"]
+            self._inbound["device_online" if self.device_online else "device_offline"] += 1
+            return
         if protocol == _DP_REPORT_PROTOCOL:
             self._consume_dp_report(data)
             return
@@ -258,24 +266,35 @@ class MotoClient:
             dp_id, lambda: self._async_publish(_DP_QUERY_PROTOCOL, {"dps": {dp_id: None}}),
         )
 
-    async def async_wait_for_dp_report(
-        self, dp_id: str, send: Callable[[], Awaitable[None]],
-    ) -> int:
-        """Register the device report listener before dispatching the request."""
+    @contextmanager
+    def dp_report_listener(self, dp_id: str):
+        """Register one device-wide query listener, independent of send route."""
         if self._dp_query is not None:
+            if self._dp_query[0] == dp_id and self._dp_query_owner is asyncio.current_task():
+                yield self._dp_query[1]
+                return
             raise TuyaIpcP2pConnectionError("A device DP query is already pending")
         if self._reader_failure != "none":
             raise TuyaIpcP2pConnectionError("Device DP report channel stopped")
         reply = asyncio.get_running_loop().create_future()
         self._dp_query = (dp_id, reply)
+        self._dp_query_owner = asyncio.current_task()
         try:
+            yield reply
+        finally:
+            self._dp_query = None
+            self._dp_query_owner = None
+            if not reply.cancel() and not reply.cancelled():
+                reply.exception()
+
+    async def async_wait_for_dp_report(
+        self, dp_id: str, send: Callable[[], Awaitable[None]],
+    ) -> int:
+        """Register the device report listener before dispatching the request."""
+        with self.dp_report_listener(dp_id) as reply:
             async with asyncio.timeout(_DP_REPORT_TIMEOUT_SECONDS):
                 await send()
                 return await reply
-        finally:
-            self._dp_query = None
-            if not reply.cancel() and not reply.cancelled():
-                reply.exception()
 
     def _dispatch(self, message_type: str | None, message: JsonObject) -> None:
         """Hand one decoded message to the callback that owns it."""

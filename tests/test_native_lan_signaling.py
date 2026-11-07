@@ -40,6 +40,11 @@ class FakeDevice:
     def send(self, payload):
         self.sent.append(payload)
 
+    def _send_receive(self, payload):
+        self.sent.append(payload)
+        self.cmd_retcode = 0
+        return None
+
     def receive(self):
         return {
             "header": {"type": "answer", "sessionid": "session"},
@@ -89,6 +94,42 @@ async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch, stat
         message = json.loads(payload)
         assert type(message.pop("t")) is int
         assert message == {"devId": "camera", "uid": "account", "dps": {"110": None}}
+    finally:
+        await lan.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["immediate", "timeout", "retcode"])
+async def test_lan_query_checks_delivery_and_keeps_immediate_report(monkeypatch, outcome):
+    class Device(FakeDevice):
+        def _send_receive(self, payload):
+            self.sent.append(payload)
+            assert self.timeout == 5.0
+            assert self.retry_limit == 0
+            self.cmd_retcode = 1 if outcome == "retcode" else 0
+            return {"Error": "fixture timeout", "Err": "902"} if outcome == "timeout" else {"dps": {"110": "1"}}
+
+        def send(self, payload):
+            pytest.fail("SD query must wait for the LAN delivery response")
+
+        def receive(self):
+            pytest.fail("An immediate status report must not be discarded")
+
+    monkeypatch.setattr(lan_module, "tinytuya", FakeTinyTuya)
+    monkeypatch.setattr(FakeTinyTuya, "Device", Device)
+    lan = Lan302Client(
+        uid="account", device_id="camera", session_id="session", local_key="0123456789abcdef",
+        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        preconnect=False, security_level=3,
+    )
+    await lan.async_connect()
+    try:
+        if outcome == "immediate":
+            assert await lan.async_query_direct_dp("110") == 1
+        else:
+            with pytest.raises(NativeLanSignalError, match="delivery failed"):
+                await lan.async_query_direct_dp("110")
+        assert len(lan._device.sent) == 1
     finally:
         await lan.async_close()
 
