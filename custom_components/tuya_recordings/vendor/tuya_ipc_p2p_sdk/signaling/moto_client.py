@@ -40,6 +40,15 @@ _DP_REPORT_TIMEOUT_SECONDS = 30
 _BROKER_TLS = ssl.create_default_context()
 
 
+def _connection_timestamp(value: JsonValue) -> int | None:
+    """Read the integral Long timestamp used by the Android interceptor."""
+    if isinstance(value, str):
+        if not value.isascii() or not value.isdecimal() or len(value) > 19:
+            return None
+        value = int(value)
+    return value if type(value) is int and 0 < value < (1 << 63) else None
+
+
 class MotoClient:
     """
     Publishes and consumes the offer/answer/candidate exchange of one session.
@@ -108,6 +117,10 @@ class MotoClient:
         self._subscription = "not_attempted"
         self._reader_failure = "none"
         self.device_online: bool | None = None
+        self.low_power_connect: bool | None = None
+        self.low_power_wake_confirmed = False
+        self._low_power_change_time: int | None = None
+        self._low_power_ready = False
 
     @property
     def diagnostics(self) -> str:
@@ -119,6 +132,8 @@ class MotoClient:
                 f"envelope_pv={self._protocol_version}, session_publish_qos=0, "
                 f"broker={self._broker_status}, outbound={outbound or 'none'}, inbound={inbound or 'none'}, "
                 f"protocols={protocols or 'none'}, "
+                f"device_online={self.device_online}, low_power_connect={self.low_power_connect}, "
+                f"low_power_wake_confirmed={self.low_power_wake_confirmed}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
 
     async def async_connect(self) -> None:
@@ -214,10 +229,8 @@ class MotoClient:
         if bucket not in self._inbound_protocols and len(self._inbound_protocols) >= 16:
             bucket = "other"
         self._inbound_protocols[bucket] += 1
-        if (protocol == 1 and data.get("devId") == self._device_id
-                and data.get("cid") in (None, "") and type(data.get("online")) is bool):
-            self.device_online = data["online"]
-            self._inbound["device_online" if self.device_online else "device_offline"] += 1
+        if protocol == 1:
+            self._consume_connection_report(data)
             return
         if protocol == _DP_REPORT_PROTOCOL:
             self._consume_dp_report(data)
@@ -235,6 +248,43 @@ class MotoClient:
             self._session_mismatches += 1
             return
         self._dispatch(optional_str(header, "type"), message)
+
+    def _consume_connection_report(self, data: JsonObject) -> None:
+        """Match both APKs' protocol-1 low-power interceptor, not a DP report."""
+        if data.get("devId") != self._device_id or data.get("cid") not in (None, ""):
+            self._inbound["connection_device_mismatch"] += 1
+            return
+        online = data.get("online")
+        if type(online) is not bool:
+            self._inbound["connection_invalid_online"] += 1
+            return
+        self.device_online = online
+        self._inbound["device_online" if online else "device_offline"] += 1
+        if "lowPowerConnect" in data:
+            low_power = data["lowPowerConnect"]
+            if type(low_power) is not bool:
+                self._inbound["connection_invalid_low_power"] += 1
+                return
+            self.low_power_connect = low_power
+            self._low_power_ready = not low_power
+            self.low_power_wake_confirmed = False
+            self._inbound["low_power_connected" if low_power else "low_power_exited"] += 1
+            stamp = _connection_timestamp(data.get("lastOnlineChangeTime", data.get("lastConnectChangeTime")))
+            if stamp is None:
+                self._inbound["low_power_timestamp_missing_or_invalid"] += 1
+                return
+            if not low_power:
+                self._low_power_change_time = stamp
+                self.low_power_wake_confirmed = online
+        else:
+            stamp = _connection_timestamp(data.get("lastOnlineChangeTime"))
+            if not online:
+                self.low_power_wake_confirmed = False
+            elif (self._low_power_ready and self._low_power_change_time is not None
+                  and stamp is not None and stamp >= self._low_power_change_time):
+                self.low_power_wake_confirmed = True
+        if self.low_power_wake_confirmed:
+            self._inbound["low_power_wake_confirmed"] += 1
 
     def _consume_dp_report(self, data: JsonObject) -> None:
         if self._dp_query is None:

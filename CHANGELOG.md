@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-7 (unreleased)
+
+### Fixes
+
+- Correct LAN 3.4 and 3.5 SD-status request formatting to match the protocol-5 wrapper used by both Smart Life and Tuya Smart APKs.
+- Correct native LAN signaling to use IPC_LAN_302 and its raw signaling body rather than the unrelated extended-stream command.
+- Check SD status before foreground native LAN signaling, and reuse the completed check if the connection falls back to MQTT.
+- Keep SD-status queries active when a repeat wake is throttled or wake publication fails. Stop before sending a playback offer if the query fails or SD status cannot be verified.
+- Handle the APK's low-power connection transitions separately from SD-status reports, including timestamp checks before confirming wake.
+- Add diagnostics for the actual SD-query LAN version, request format, delivery result, and low-power connection state.
+
 ## Tuya Recordings v0.4.13-6 (2026-11-07)
 
 ### Fixes

@@ -625,7 +625,9 @@ async def test_wake_only_for_confirmed_direct_on_demand_catalog(
         assert (playback._retry_offer is not None) == allowed
     if "wake" in expected:
         expected = ["subscribe", "wake", "sd_status", "offer"]
-    assert calls == [*expected, "subscribe", "offer"]
+        assert calls == [*expected, "subscribe", "sd_status", "offer"]
+    else:
+        assert calls == [*expected, "subscribe", "offer"]
 
 
 @pytest.mark.asyncio
@@ -1044,7 +1046,11 @@ async def test_http_sd_status_after_wake_waits_for_device_report(monkeypatch, ac
     )
     playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
     playback._on_demand_catalog = True
-    await playback._maybe_send_wake(Broker())
+    if accepted:
+        await playback._maybe_send_wake(Broker())
+    else:
+        with pytest.raises(NativeRelayPlaybackError, match="SD status query failed"):
+            await playback._maybe_send_wake(Broker())
     assert calls[:3] == ["wake", ("waiter_registered", "110"), (
         "thing.m.device.dp.publish", "1.0",
         {"devId": config.dev_id, "gwId": config.dev_id, "dps": '{"110":null}'}, {},
