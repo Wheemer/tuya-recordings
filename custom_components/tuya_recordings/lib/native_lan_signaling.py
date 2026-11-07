@@ -1,4 +1,4 @@
-"""APK-equivalent local P2P signaling over Tuya's extended-stream frame."""
+"""APK local P2P signaling over Tuya's IPC_LAN_302 frame."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import tinytuya
 
 from ..vendor.tuya_ipc_p2p_sdk.json_types import dp_integer
 
-_LAN_EXT_STREAM = 0x40
+_LAN_IPC_302 = 32
 _LAN_CONTROL = 7
 _LAN_TIMEOUT_SECONDS = 5.0
 _DISCOVERY_CACHE_SECONDS = 900.0
@@ -35,7 +35,7 @@ class Lan302Client:
 
     The Android SDK sends the native P2P offer through ``lan302Publish`` when
     the camera is locally reachable and its ``p2pPolicy`` permits LAN.  The
-    underlying LAN command is ``FRM_LAN_EXT_STREAM`` (0x40); its payload is the
+    underlying LAN command is ``IPC_LAN_302`` (32); its payload is the
     same JSON signaling object that would otherwise travel through MQTT.
     """
 
@@ -68,6 +68,14 @@ class Lan302Client:
         self._reader: asyncio.Task | None = None
         self._closed = False
         self._offer_attempted = False
+        self._query_state = "not_sent"
+        self._query_protocol = "unselected"
+
+    @property
+    def diagnostics(self) -> str:
+        """Describe the local query without keys, addresses or DP values."""
+        version = getattr(self._device, "version", "unknown")
+        return f"version={version}, query_protocol={self._query_protocol}, query_state={self._query_state}"
 
     async def async_connect(self) -> None:
         """Discover the single configured device and open one local socket."""
@@ -134,6 +142,7 @@ class Lan302Client:
                     ) else None
                     value = dp_integer(dps.get(dp)) if isinstance(dps, dict) else None
                     if value is not None:
+                        self._query_state = "report_received"
                         return value
                 device.set_socketTimeout(0.25)
                 try:
@@ -262,24 +271,40 @@ class Lan302Client:
                 raise NativeLanSignalError("Local P2P signaling is not connected")
             await _join_device_io(self._send, device, message)
 
-    def _send(self, device: Any, message: dict[str, Any], command: int = _LAN_EXT_STREAM) -> None:
+    def _send(self, device: Any, message: dict[str, Any], command: int = _LAN_IPC_302) -> None:
         payload = tinytuya.MessagePayload(
             command,
             json.dumps(message, separators=(",", ":")).encode(),
         )
+        header = getattr(device, "version_header", None)
         try:
+            # lan302Publish uses normalControl, not the versioned DP-control
+            # serializer. Change only this locked device for this one send.
+            if command == _LAN_IPC_302 and isinstance(header, bytes):
+                device.version_header = b""
             result = device.send(payload)
         except Exception as err:
             self._discovery_cache.pop(self._device_id, None)
             raise NativeLanSignalError("Local P2P signaling transport failed") from err
+        finally:
+            if command == _LAN_IPC_302 and isinstance(header, bytes):
+                device.version_header = header
         if _is_device_error(result):
             self._discovery_cache.pop(self._device_id, None)
             raise NativeLanSignalError("Local P2P signaling send failed")
 
     def _send_query(self, device: Any, message: dict[str, Any]) -> Any:
         """Wait for the LAN delivery result, retaining an immediate DP report."""
+        # LocalControl3_4 in both APKs wraps the same CONTROL data in
+        # protocol 5; TinyTuya's raw MessagePayload bypasses that conversion.
+        body = (
+            {"protocol": 5, "t": message["t"], "data": message}
+            if getattr(device, "version", 0) >= 3.4 else message
+        )
+        self._query_protocol = "5" if getattr(device, "version", 0) >= 3.4 else "legacy"
+        self._query_state = "waiting_delivery"
         payload = tinytuya.MessagePayload(
-            _LAN_CONTROL, json.dumps(message, separators=(",", ":")).encode(),
+            _LAN_CONTROL, json.dumps(body, separators=(",", ":")).encode(),
         )
         device.set_socketTimeout(_LAN_TIMEOUT_SECONDS)
         deadline = time.monotonic() + _LAN_TIMEOUT_SECONDS
@@ -303,6 +328,7 @@ class Lan302Client:
                 device.set_socketTimeout(remaining)
                 result = device.receive()
         except Exception as error:
+            self._query_state = "delivery_failed"
             self._discovery_cache.pop(self._device_id, None)
             raise NativeLanSignalError("Local DP query delivery failed") from error
         retcode = getattr(device, "cmd_retcode", None)
@@ -316,8 +342,10 @@ class Lan302Client:
         )
         if (_is_device_error(result) or (type(retcode) is int and retcode != 0)
                 or (retcode is None and not valid_report)):
+            self._query_state = "delivery_failed"
             self._discovery_cache.pop(self._device_id, None)
             raise NativeLanSignalError("Local DP query delivery failed")
+        self._query_state = "report_received" if valid_report else "acknowledged"
         return result
 
     def _dispatch(self, message: dict[str, Any] | None) -> bool:

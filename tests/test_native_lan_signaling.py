@@ -17,6 +17,7 @@ class FakeDevice:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.version = kwargs.get("version", 3.3)
         self.sent = []
         self.closed = False
 
@@ -92,6 +93,9 @@ async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch, stat
         (command, payload), = lan._device.sent
         assert command == 7
         message = json.loads(payload)
+        assert message["protocol"] == 5
+        assert type(message["t"]) is int
+        message = message["data"]
         assert type(message.pop("t")) is int
         assert message == {"devId": "camera", "uid": "account", "dps": {"110": None}}
     finally:
@@ -173,7 +177,7 @@ async def test_cancelled_offer_cannot_close_socket_under_running_send():
     assert events == ["sent", "closed"]
 
 
-def test_lan_offer_uses_extended_stream_and_apk_lan_header(monkeypatch):
+def test_lan_offer_uses_ipc_lan_302_and_apk_lan_header(monkeypatch):
     monkeypatch.setattr(lan_module, "tinytuya", FakeTinyTuya)
     Lan302Client._discovery_cache.clear()
     answers = []
@@ -204,7 +208,7 @@ def test_lan_offer_uses_extended_stream_and_apk_lan_header(monkeypatch):
 
     assert answers == ["answer-sdp"]
     command, raw = client_sent[0]
-    assert command == 0x40
+    assert command == 32
     payload = json.loads(raw)
     assert payload["header"]["path"] == "lan"
     assert payload["header"]["security_level"] == 4
