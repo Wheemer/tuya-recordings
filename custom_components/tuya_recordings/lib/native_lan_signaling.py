@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 import tinytuya
 
+from ..vendor.tuya_ipc_p2p_sdk.json_types import dp_integer
+
 _LAN_EXT_STREAM = 0x40
 _LAN_CONTROL = 7
 _LAN_TIMEOUT_SECONDS = 5.0
@@ -135,8 +137,8 @@ class Lan302Client:
                         isinstance(data, dict) and not data.get("cid")
                         and data.get("devId") in (None, "", self._device_id)
                     ) else None
-                    value = dps.get(dp) if isinstance(dps, dict) else None
-                    if type(value) is int:
+                    value = dp_integer(dps.get(dp)) if isinstance(dps, dict) else None
+                    if value is not None:
                         return value
                 await asyncio.sleep(0.05)
         raise NativeLanDpReportError("Local DP socket closed")

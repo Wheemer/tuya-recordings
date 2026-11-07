@@ -186,6 +186,9 @@ class NativeRelayPlaybackSession:
         self._connect_mode = "unknown"
         self._token_route = "not_selected"
         self._on_demand_catalog = False
+        self._connector_wake_allowed = False
+        self._connector_wake_sent = False
+        self._connector_wake_status = "not_requested"
         self._retry_mqtt_offer = False
         self._wake_status = "not_requested"
         self._sd_status_query = "not_requested"
@@ -306,7 +309,7 @@ class NativeRelayPlaybackSession:
             f"token_route={self._token_route}, "
             f"wake_capability={config.wake_capability}, wake_direct={config.wake_direct}, "
             f"wake_status={self._wake_status}, sd_low_power_wake={config.sd_low_power_wake}, "
-            f"sd_status_query={self._sd_status_query}"
+            f"sd_status_query={self._sd_status_query}, connector_wake={self._connector_wake_status}"
         )
 
     async def connect(
@@ -317,6 +320,7 @@ class NativeRelayPlaybackSession:
             raise NativeRelayPlaybackError("Playback session cannot be connected")
         self._connect_started = time.monotonic()
         self._on_demand_catalog = allow_wake and not media
+        self._connector_wake_allowed = allow_wake or retry_offer
         self._retry_mqtt_offer = retry_offer
         self._connect_mode = "media" if media else "metadata"
         self._connect_phase = "select_transport"
@@ -534,7 +538,34 @@ class NativeRelayPlaybackSession:
             on_failure=self._on_signaling_failure,
         )
         await self._moto.async_connect()
+        await self._maybe_send_connector_wake(self._moto)
         await self._maybe_send_wake(self._moto)
+
+    async def _maybe_send_connector_wake(self, moto: MotoClient) -> None:
+        """Match InternalThingSmartCameraP2P's pre-connect direct wake."""
+        config = self._native_config
+        if not self._connector_wake_allowed:
+            return
+        if config.wake_capability not in {"low_power", "remote", "low_power_and_remote", "wireless"}:
+            self._connector_wake_status = "not_eligible"
+            return
+        if not config.wake_direct:
+            self._connector_wake_status = "target_unconfirmed"
+            return
+        if CAMERA_COMMANDS.wake_report_on_cooldown(config.dev_id):
+            self._connector_wake_status = "report_timeout_cooldown"
+            raise NativeRelayPlaybackError("Camera wake is on SD-status timeout cooldown")
+        if not CAMERA_COMMANDS.reserve_wake(config.dev_id):
+            self._connector_wake_status = "cooldown"
+            return
+        self._connect_phase = "connector_wake"
+        try:
+            await moto.async_send_wake()
+        except TuyaIpcP2pError:
+            self._connector_wake_status = "send_failed"
+        else:
+            self._connector_wake_sent = True
+            self._connector_wake_status = "sent_unconfirmed"
 
     async def _maybe_send_wake(self, moto: MotoClient) -> None:
         config = self._native_config
@@ -556,13 +587,14 @@ class NativeRelayPlaybackSession:
         if not config.wake_direct:
             self._wake_status = "direct_target_unconfirmed"
             return
-        if not CAMERA_COMMANDS.reserve_wake(config.dev_id):
+        if not self._connector_wake_sent and not CAMERA_COMMANDS.reserve_wake(config.dev_id):
             self._wake_status = "cooldown"
             return
         self._connect_phase = "mqtt_wake"
         self._wake_status = "sending"
         try:
-            await moto.async_send_wake()
+            if not self._connector_wake_sent:
+                await moto.async_send_wake()
         except TuyaIpcP2pError:
             self._wake_status = "send_failed"
         else:

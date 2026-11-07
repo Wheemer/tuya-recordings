@@ -132,6 +132,7 @@ def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) 
             "direct": device.get("wakeDirect") is True,
             **({"evidence": device["sdWakeEvidence"]} if isinstance(device.get("sdWakeEvidence"), dict) else {}),
             **({"detail_lookup": device["sdWakeDetailLookup"]} if isinstance(device.get("sdWakeDetailLookup"), str) else {}),
+            **({"schema_lookup": device["sdSchemaLookup"]} if isinstance(device.get("sdSchemaLookup"), str) else {}),
             **({"home_lookup": device["sdWakeHomeLookup"]} if isinstance(device.get("sdWakeHomeLookup"), str) else {}),
             **({"sd_low_power": eligible} if type(eligible) is bool else {}),
             **({"sd_status_mqtt_dp": dp} if isinstance(dp := device.get("sdStatusMqttDp"), str) else {}),
@@ -1695,10 +1696,11 @@ class TuyaRecordingsClient:
             for dev_id, wake in updates[CONF_DEVICE_WAKE_CAPABILITIES].items():
                 LOGGER.info(
                     "Tuya Recordings refreshed SD wake metadata request_id=%s dev=%s mqtt_pv=%s "
-                    "eligible=%s direct=%s home_lookup=%s detail_lookup=%s evidence=%s",
+                    "eligible=%s direct=%s home_lookup=%s detail_lookup=%s schema_lookup=%s evidence=%s",
                     MANUAL_REFRESH_ID.get(), dev_id, protocols.get(dev_id, "unknown"),
                     wake.get("sd_low_power"), wake["direct"], wake.get("home_lookup", "not_needed"),
-                    wake.get("detail_lookup", "not_needed"), wake.get("evidence", {}),
+                    wake.get("detail_lookup", "not_needed"), wake.get("schema_lookup", "not_needed"),
+                    wake.get("evidence", {}),
                 )
             return updates
 

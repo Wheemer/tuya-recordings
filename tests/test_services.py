@@ -44,7 +44,7 @@ def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch, media_
         calls.append("catalog")
 
     async def execute(function, *args):
-        return await asyncio.to_thread(function, *args)
+        return await asyncio.get_running_loop().run_in_executor(None, function, *args)
 
     services = SimpleNamespace(has_service=Mock(return_value=False), async_register=Mock())
 
@@ -81,7 +81,7 @@ def test_only_manual_catalog_service_enables_offer_resends(monkeypatch):
         return {}
 
     async def execute(function, *args):
-        return await asyncio.to_thread(function, *args)
+        return await asyncio.get_running_loop().run_in_executor(None, function, *args)
 
     monkeypatch.setattr(client, "refresh_background_catalog", refresh)
     monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
@@ -116,7 +116,7 @@ def test_manual_catalog_waits_for_scheduled_pass_then_runs_with_its_own_scope(mo
             return {}
 
         async def execute(function, *args):
-            return await asyncio.to_thread(function, *args)
+            return await asyncio.get_running_loop().run_in_executor(None, function, *args)
 
         monkeypatch.setattr(client, "refresh_background_catalog", refresh)
         hass = SimpleNamespace(

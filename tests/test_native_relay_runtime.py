@@ -80,6 +80,7 @@ def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manu
                     worker.catalog([date(2026, 11, 3)], None, events=kind == "events", months=kind == "month")
         assert calls == [{
             "media": kind in {"clip", "timeline"},
+            **({"allow_wake": True} if kind == "timeline" else {}),
             **({"retry_offer": True} if manual and kind != "thumbnail" else {}),
         }]
     finally:
@@ -263,7 +264,7 @@ class Playback:
         self.thumbnails = []
         self.connect_modes = []
 
-    async def connect(self, *, media=True):
+    async def connect(self, *, media=True, allow_wake=False):
         self.connected = True
         self.connect_modes.append(media)
 
@@ -328,7 +329,7 @@ class ReusablePlayback(Playback):
         self.start_count = 0
         type(self).instances.append(self)
 
-    async def connect(self, *, media=True):
+    async def connect(self, *, media=True, allow_wake=False):
         self.connect_count += 1
         self.connect_modes.append(media)
 
@@ -342,7 +343,7 @@ class ReusablePlayback(Playback):
 
 
 class FailedConnectPlayback(ReusablePlayback):
-    async def connect(self, *, media=True):
+    async def connect(self, *, media=True, allow_wake=False):
         self.connect_count += 1
         self.connect_modes.append(media)
         raise RuntimeError("no answer")
@@ -391,7 +392,7 @@ class BlockingConnectPlayback(Playback):
         super().__init__()
         self.connect_started = threading.Event()
 
-    async def connect(self, *, media=True):
+    async def connect(self, *, media=True, allow_wake=False):
         self.connect_started.set()
         self.connect_modes.append(media)
         await asyncio.Event().wait()
@@ -402,7 +403,7 @@ class CancelDuringConnectPlayback(Playback):
         super().__init__()
         self.cancel = cancel
 
-    async def connect(self, *, media=True):
+    async def connect(self, *, media=True, allow_wake=False):
         self.connect_modes.append(media)
         self.cancel.set()
         await asyncio.sleep(0.2)

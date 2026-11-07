@@ -332,8 +332,11 @@ class NativeAppGatewayClient:
                 home_products[gid] = self._enrich_camera_wake_from_home(
                     gid, unresolved, app_session, protocol_versions,
                 )
+        schema_details: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for dev_id, (gid, row) in camera_details.items():
-            if dev_id in protocol_versions and "sdLowPowerWake" in row:
+            if (dev_id in protocol_versions and "sdLowPowerWake" in row
+                    and (row["sdLowPowerWake"] is not True
+                         or {"sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp"} & row.keys())):
                 continue
             row["sdWakeDetailLookup"] = "requested"
             try:
@@ -356,11 +359,62 @@ class NativeAppGatewayClient:
             if dev_id not in protocol_versions and (pv := _device_mqtt_protocol_version(detail)):
                 protocol_versions[dev_id] = pv
             product = home_products.get(gid, {}).get(product_id)
+            if product and _optional_str(product, "productVer") != _optional_str(detail, "productVer"):
+                product = None
             row["sdWakeDetailLookup"] = "matched"
             _apply_sd_wake_metadata(
                 row, {**detail, "productBean": product} if product else detail, dev_id, source="detail",
             )
+            if not _product_schema(product or {}):
+                schema_details.append((row, detail))
+        if schema_details:
+            self._resolve_product_schemas(schema_details, app_session)
         return found, protocol_versions, inventory
+
+    def _resolve_product_schemas(
+        self, devices: list[tuple[dict[str, Any], dict[str, Any]]],
+        app_session: NativeAppSession,
+    ) -> None:
+        """Load missing product schemas using the APK's versioned product lookup."""
+        requests: dict[tuple[str, str | None], dict[str, str]] = {}
+        for row, detail in devices:
+            pid = _optional_str(detail, "productId")
+            ver = _optional_str(detail, "productVer") or None
+            if pid:
+                requests.setdefault((pid, ver), {"pid": pid, **({"ver": ver} if ver else {})})
+                row["sdSchemaLookup"] = "requested"
+        keys = list(requests)
+        for offset in range(0, len(keys), 20):
+            batch = keys[offset:offset + 20]
+            try:
+                products = self.call(
+                    "thing.m.device.ref.info.list", "6.1",
+                    {"productIds": _dump_json([requests[key] for key in batch]).decode("utf-8"),
+                     "zigbeeGroup": True},
+                    app_session,
+                )
+            except NativeGatewayAuthError:
+                raise
+            except NativeGatewayError:
+                products = None
+            for row, detail in devices:
+                key = (_optional_str(detail, "productId"), _optional_str(detail, "productVer") or None)
+                if key not in batch:
+                    continue
+                row["sdSchemaLookup"] = "unavailable"
+                if not isinstance(products, list):
+                    continue
+                matches = [
+                    product for product in products
+                    if isinstance(product, dict) and product.get("id") == key[0]
+                    and (_optional_str(product, "productVer") or None) == key[1]
+                ]
+                if len(matches) != 1 or not _product_schema(matches[0]):
+                    continue
+                row["sdSchemaLookup"] = "matched"
+                _apply_sd_wake_metadata(
+                    row, {**detail, "productBean": matches[0]}, row["devId"], source="detail",
+                )
 
     def _enrich_camera_wake_from_home(
         self, gid: int, rows: list[dict[str, Any]], app_session: NativeAppSession,
@@ -406,6 +460,8 @@ class NativeAppGatewayClient:
             if pv := _device_mqtt_protocol_version(device):
                 protocol_versions[dev_id] = pv
             product = products.get(product_id)
+            if product and _optional_str(product, "productVer") != _optional_str(device, "productVer"):
+                product = None
             resolved = {**device, "productBean": product}
             _apply_sd_wake_metadata(row, resolved, dev_id)
             wake = _product_wake_capability(references.get(product_id))
@@ -674,6 +730,8 @@ def _sd_status_modes(communication: dict[str, Any]) -> set[int]:
 def _sd_status_schema_id(product: dict[str, Any]) -> str:
     matches = [entry.get("id") for entry in _product_schema(product) if entry.get("code") == "sd_status"]
     dp = matches[0] if len(matches) == 1 else None
+    if type(dp) is int and dp > 0:
+        dp = str(dp)
     return dp if isinstance(dp, str) and dp.isascii() and dp.isdecimal() else ""
 
 

@@ -45,6 +45,25 @@ def test_legacy_mqtt_envelope_matches_independent_vector(version, frame):
         decode_payload(key, frame[:3] + bytes([frame[3] ^ 1]) + frame[4:])
 
 
+def test_inbound_protocol_histogram_is_bounded_and_does_not_log_payloads():
+    key = b"0123456789abcdef"
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="account", device_id="camera", session_id="session", local_key=key.decode(),
+        protocol_version="2.3",
+        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+    client._consume(encode_payload(key, 1, b"test", {"dps": {"110": "private-status"}}, 0, 4, "2.3"))
+    for protocol in range(100, 140):
+        client._consume(encode_payload(key, 1, b"test", {"payload": "private-content"}, 0, protocol, "2.3"))
+    assert "dp_report_no_query=1" in client.diagnostics
+    assert "4=1" in client.diagnostics and "other=" in client.diagnostics
+    assert len(client._inbound_protocols) <= 17
+    assert "private-status" not in client.diagnostics
+    assert "private-content" not in client.diagnostics
+    assert key.decode() not in client.diagnostics
+
+
 def test_pv20_uses_signed_json_for_send_and_keyed_crc_for_receive():
     key = b"0123456789abcdef"
     outbound = encode_payload(
@@ -96,9 +115,14 @@ async def test_direct_dp_query_waits_for_matching_report(monkeypatch, outcome):
     receive(4, {"cid": "child", "dps": {"110": 1}})
     receive(4, {"dps": {"111": 1, "110": True}})
     assert client._dp_query is not None and not client._dp_query[1].done()
+    assert "protocols=4=3,5=1" in client.diagnostics
+    assert "dp_report_other_device=1" in client.diagnostics
+    assert "dp_report_child=1" in client.diagnostics
+    assert "dp_report_missing_or_non_integer=1" in client.diagnostics
     if outcome == "report":
         receive(4, {"devId": "camera", "dps": {"110": 0}})
         assert await task == 0
+        assert "dp_report_accepted=1" in client.diagnostics
     elif outcome == "cancel":
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -229,7 +253,9 @@ def test_mqtt_reader_only_routes_exact_device_reply_topic():
     assert "another-camera" not in client.diagnostics
 
 
-@pytest.mark.parametrize(("sent_pv", "reply_pv"), [("2.2", "2.3"), ("2.3", "2.2")])
+@pytest.mark.parametrize(("sent_pv", "reply_pv"), [
+    ("2.2", "2.3"), ("2.3", "2.2"), ("2.3", "2.1"), ("2.3", "1.1"),
+])
 def test_mqtt_modern_reply_uses_wire_pv_and_requires_matching_session(sent_pv, reply_pv):
     answers = []
     key = b"0123456789abcdef"
@@ -260,6 +286,44 @@ def test_mqtt_modern_reply_uses_wire_pv_and_requires_matching_session(sent_pv, r
     assert client._protocol_version == sent_pv
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_pv", ["1.1", "2.1", "2.2", "2.3"])
+@pytest.mark.parametrize("status", [1, "1"])
+async def test_dp_report_decoder_uses_received_pv_without_changing_offer_pv(monkeypatch, reply_pv, status):
+    key = b"0123456789abcdef"
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="uid", device_id="camera", session_id="session", local_key=key.decode(),
+        protocol_version="2.3", on_answer=lambda _: None,
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+    )
+
+    async def publish(protocol, data):
+        assert (protocol, data) == (5, {"dps": {"247": None}})
+        # Wrong-device and malformed reports cannot satisfy the query.
+        for device, value in (("other", status), ("camera", True), ("camera", status)):
+            client._consume(encode_payload(
+                key, 3, b"test", {"devId": device, "dps": {"247": value}}, 1, 4, reply_pv,
+            ))
+
+    monkeypatch.setattr(client, "_async_publish", publish)
+    assert await client.async_query_direct_dp("247") == 1
+    assert client._protocol_version == "2.3"
+    assert "dp_report_other_device=1" in client.diagnostics
+    assert "dp_report_missing_or_non_integer=1" in client.diagnostics
+    assert client._dp_query is None
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (0, 0), ("0", 0), (" 5 ", 5), (True, None), ("true", None), (None, None),
+    ("", None), ("null", None), (1.5, None), ("1.5", None), ("[]", None),
+    ("{}", None), (2**31, None), ("2147483648", None), ("9" * 100, None),
+])
+def test_dp_status_integer_conversion_is_bounded(value, expected):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.json_types import dp_integer
+
+    assert dp_integer(value) == expected
+
 @pytest.mark.parametrize("version", ["1.1", "2.1", "2.2", "2.3"])
 def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
     answers = []
@@ -272,8 +336,7 @@ def test_mqtt_only_routes_302_and_classifies_inbound_without_payloads(version):
     )
     header = {"type": "answer", "sessionid": "session"}
     answer = {"header": header, "msg": {"sdp": "private-sdp"}}
-    mismatched = "1.1" if version != "1.1" else "2.1"
-    client._consume(encode_payload(b"0123456789abcdef", 1, b"test", answer, 0, 302, mismatched))
+    client._consume(b"9.9-invalid-wire-version")
     assert answers == []
     frames = [
         (22, answer),

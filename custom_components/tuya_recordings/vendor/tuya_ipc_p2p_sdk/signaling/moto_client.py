@@ -15,7 +15,7 @@ import aiomqtt
 
 from ..const import LOGGER
 from ..exceptions import TuyaIpcP2pConnectionError, TuyaIpcP2pError
-from ..json_types import JsonObject, JsonValue, optional_int, optional_str
+from ..json_types import JsonObject, JsonValue, dp_integer, optional_int, optional_str
 from .envelope import (
     SESSION_PROTOCOL,
     SIG_QUERY_PROTOCOL,
@@ -99,6 +99,7 @@ class MotoClient:
         self._decode_failures = 0
         self._session_mismatches = 0
         self._inbound: Counter[str] = Counter()
+        self._inbound_protocols: Counter[str] = Counter()
         self._published = 0
         self._outbound: Counter[str] = Counter()
         self._broker_status = "not_connected"
@@ -109,10 +110,12 @@ class MotoClient:
     def diagnostics(self) -> str:
         inbound = ",".join(f"{kind}={count}" for kind, count in sorted(self._inbound.items()))
         outbound = ",".join(f"{kind}={count}" for kind, count in sorted(self._outbound.items()))
+        protocols = ",".join(f"{kind}={count}" for kind, count in sorted(self._inbound_protocols.items()))
         return (f"published={self._published}, received={self._received}, decode_failures={self._decode_failures}, "
                 f"session_mismatches={self._session_mismatches}, subscription={self._subscription}, "
                 f"envelope_pv={self._protocol_version}, session_publish_qos=0, "
                 f"broker={self._broker_status}, outbound={outbound or 'none'}, inbound={inbound or 'none'}, "
+                f"protocols={protocols or 'none'}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
 
     async def async_connect(self) -> None:
@@ -191,16 +194,11 @@ class MotoClient:
     def _consume(self, payload: bytes) -> None:
         """Decode one payload and dispatch it to the session."""
         self._received += 1
-        versions = (b"2.0", b"1.1") if self._protocol_version == "2.0" else (
-            self._protocol_version.encode("ascii"),
-        )
         wire_version = payload[:3]
-        alternate_modern = (
-            wire_version not in versions
-            and wire_version in {b"2.2", b"2.3"}
-            and self._protocol_version in {"2.2", "2.3"}
-        )
-        if wire_version not in versions and not alternate_modern:
+        # Both APKs choose the receive decoder from the frame prefix, not
+        # from the inventory PV used for publishing. Authentication is still
+        # performed with this device's local key by decode_payload.
+        if wire_version not in {b"1.1", b"2.0", b"2.1", b"2.2", b"2.3"}:
             self._inbound["version_mismatch"] += 1
             return
         try:
@@ -209,10 +207,11 @@ class MotoClient:
             self._decode_failures += 1
             LOGGER.debug("Discarded an undecodable signaling payload: %s", type(exception).__name__)
             return
+        bucket = str(protocol)
+        if bucket not in self._inbound_protocols and len(self._inbound_protocols) >= 16:
+            bucket = "other"
+        self._inbound_protocols[bucket] += 1
         if protocol == _DP_REPORT_PROTOCOL:
-            if alternate_modern:
-                self._inbound["version_mismatch"] += 1
-                return
             self._consume_dp_report(data)
             return
         if protocol != SESSION_PROTOCOL:
@@ -224,22 +223,32 @@ class MotoClient:
             self._inbound["invalid_shape"] += 1
             return
         session_id = optional_str(header, "sessionid")
-        if (session_id or alternate_modern) and session_id != self._session_id:
+        if (session_id or wire_version != self._protocol_version.encode("ascii")) and session_id != self._session_id:
             self._session_mismatches += 1
             return
         self._dispatch(optional_str(header, "type"), message)
 
     def _consume_dp_report(self, data: JsonObject) -> None:
         if self._dp_query is None:
+            self._inbound["dp_report_no_query"] += 1
             return
         dp_id, reply = self._dp_query
-        if (reply.done() or data.get("devId") not in (None, "", self._device_id)
-                or data.get("cid") not in (None, "")):
+        if reply.done():
+            self._inbound["dp_report_late"] += 1
+            return
+        if data.get("devId") not in (None, "", self._device_id):
+            self._inbound["dp_report_other_device"] += 1
+            return
+        if data.get("cid") not in (None, ""):
+            self._inbound["dp_report_child"] += 1
             return
         dps = data.get("dps")
-        value = dps.get(dp_id) if isinstance(dps, dict) else None
-        if type(value) is int:
+        value = dp_integer(dps.get(dp_id)) if isinstance(dps, dict) else None
+        if value is not None:
+            self._inbound["dp_report_accepted"] += 1
             reply.set_result(value)
+        else:
+            self._inbound["dp_report_missing_or_non_integer"] += 1
 
     async def async_query_direct_dp(self, dp_id: str) -> int:
         """Query one schema DP and wait for a report, not the publish acknowledgement."""

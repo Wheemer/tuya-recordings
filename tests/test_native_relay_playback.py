@@ -86,8 +86,9 @@ def session():
 
 @pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "no_card", "missing", "hub"])
 @pytest.mark.parametrize("via_button", [False, True])
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
-    monkeypatch, tmp_path, caplog, outcome, via_button,
+    monkeypatch, tmp_path, caplog, outcome, via_button, profile,
 ):
     import logging
     import re
@@ -124,6 +125,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     send_key = None
 
     def inventory_call(self, api, version, post, app_session=None, extra_params=None):
+        assert self.app_profile_id == profile
         if api == "tuya.m.location.list":
             return [{"gid": 1}]
         if api == "tuya.m.my.group.device.list":
@@ -131,8 +133,16 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             return [{"devId": dev, "localKey": config.local_key, "category": "sp",
                      "productId": "fixture-product", **pv}]
         if api == "thing.m.device.product.ref.list":
-            return [{"productId": "fixture-product", "configMetas": {"low_power_wakeup": True}}]
-        detail = {"devId": dev, "productId": "fixture-product",
+            return [{"productId": "fixture-product", "configMetas": {"low_power_wakeup": True} if wake else {}}]
+        if api == "thing.m.device.ref.info.list":
+            assert version == "6.1"
+            assert json.loads(post["productIds"]) == [{"pid": "fixture-product", "ver": "2.0"}]
+            assert post["zigbeeGroup"] is True
+            events.append("schema")
+            return [{"id": "fixture-product", "productVer": "2.0", "schemaInfo": {
+                "schema": '[{"id":110,"code":"sd_status"}]',
+            }}]
+        detail = {"devId": dev, "productId": "fixture-product", **({"productVer": "2.0"} if wake else {}),
                   "communication": {"communicationNode": dev, "dataModel": 1,
                                     "communicationModes": [{"type": 1, "pv": "2.3"}]},
                   "skills": {"p2pType": 2}, "dataPointInfo": {"dps": {"149": False} if wake else {}},
@@ -148,7 +158,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         if api == "m.life.app.smart.local.device.list":
             return {
                 "deviceList": [] if detail_lookup else [detail],
-                "productList": [{"id": "fixture-product", "schemaInfo": {
+                "productList": [] if wake else [{"id": "fixture-product", "schemaInfo": {
                     "schema": '[{"id":"110","code":"sd_status"}]',
                 }}],
             }
@@ -183,11 +193,11 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             if protocol == 5:
                 assert wake and qos == 1 and payload[:3] == b"2.3"
                 assert body["dps"] == {"110": None}
-                assert events == ["wake"]
+                assert events == (["schema"] if via_button else []) + ["wake"]
                 events.append("sd-query")
                 reply = encode_payload(
-                    key, 1, b"test", {"devId": dev, "dps": {"110": 5 if outcome == "no_card" else 1}},
-                    0, 4, "2.3",
+                    key, 1, b"test", {"devId": dev, "dps": {"110": "5" if outcome == "no_card" else "1"}},
+                    0, 4, "2.2",
                 )
                 self.inbound.put_nowait(SimpleNamespace(topic=f"smart/mb/in/{dev}", payload=reply))
                 return
@@ -247,6 +257,18 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
 
         def __init__(self, _transmit):
             self.control = self
+            self.channels = {}
+
+        def conversation(self, number):
+            if number not in self.channels:
+                self.channels[number] = SimpleNamespace(
+                    receive_sequence=0,
+                    set_message_handler=lambda handler: setattr(self.channels[number], "handler", handler),
+                )
+            return self.channels[number]
+
+        async def async_wait_for_video(self, _timeout):
+            return self.conversation(1)
 
         def set_message_handler(self, handler):
             self.handler = handler
@@ -254,6 +276,19 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         def send(self, record):
             command = decrypt_record(send_key, record)
             _, request, _, high, low, _ = struct.unpack_from("<IIIHHI", command)
+            if high in (6, 7):
+                reply = struct.pack("<IIIHHI", 0x12345678, request, 1, high, low, 0)
+                self.handler(encrypt_record(ANSWER_KEY, reply))
+                if high == 7 and low == 4 and 1 in self.channels:
+                    for channel, payload_type, payload in (
+                        (1, 96, b"\x65video"), (2, 99, b"\x00\x00\xff\x7f"),
+                    ):
+                        header = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
+                        rtp = struct.pack(">BBHII", 0x80, 0x80 | payload_type, 1, 8000, 1) + payload
+                        self.channels[channel].handler(encrypt_record(
+                            ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp,
+                        ))
+                return
             if (high, low) != (3, 1):
                 return
             assert events[-1] == "nominated"
@@ -274,6 +309,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS", (0.03, 0.06, 0.12, 0.24))
     monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.32)
     entry_data = {
+        "app_profile": profile,
         "_native_app_call": lambda *_: bootstrap,
         "native_app_session": APP_SESSION,
         "device_local_keys": {dev: config.local_key},
@@ -307,7 +343,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         handlers = {}
 
         async def execute(function, *args):
-            return await asyncio.to_thread(function, *args)
+            return await asyncio.get_running_loop().run_in_executor(None, function, *args)
 
         async def call_service(domain, name, data, *, blocking):
             assert blocking
@@ -390,7 +426,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         if via_button:
             assert "report_no_card" in error and clips == []
         assert offers == [b"2.2"]
-        assert events == ["wake", "sd-query", "broker-closed"]
+        assert events == (["schema"] if via_button else []) + ["wake", "sd-query", "broker-closed"]
         return
     count = {"home": 1, "resend": 2, "silent": 5, "wake": 1, "missing": 1, "hub": 1}[outcome]
     assert offers == [b"2.2"] + [b"2.3"] * count
@@ -400,9 +436,26 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         assert "received=0" in error
         assert events == ["offer"] * count + ["direct-closed", "broker-closed"]
     else:
-        prefix = ["wake", "sd-query"] if wake else []
+        prefix = ((["schema"] if via_button else []) + ["wake", "sd-query"]) if wake else []
         assert events == prefix + ["offer"] * count + ["answer", "nominated", "catalog", "direct-closed", "broker-closed"]
         assert [(clip["start"], clip["end"]) for clip in clips] == [(clip_start, clip_end)]
+        if outcome == "wake":
+            async def play_after_refreshed_catalog():
+                playback = NativeRelayPlaybackSession(
+                    client._recordings_backend._provider.session_config(dev), APP_SESSION,
+                )
+                try:
+                    await playback.connect()
+                    await playback.start(start=clip_start, end=clip_end)
+                    async with asyncio.timeout(1):
+                        video = await playback.receive_frame()
+                        audio = await playback.receive_frame()
+                    assert video.payload == b"\x00\x00\x00\x01\x65video"
+                    assert audio.is_audio and audio.payload == b"\x00\x00\xff\x7f"
+                finally:
+                    await playback.close()
+
+            asyncio.run(play_after_refreshed_catalog())
 
 
 @pytest.mark.asyncio
@@ -537,6 +590,95 @@ async def test_wake_only_for_confirmed_direct_on_demand_catalog(
     if "wake" in expected:
         expected = ["subscribe", "wake", "sd_status", "offer"]
     assert calls == [*expected, "subscribe", "offer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("capability", ["low_power", "remote", "low_power_and_remote", "wireless", "unknown", "none"])
+async def test_connector_wake_is_foreground_direct_and_deduplicated(monkeypatch, allowed, direct, capability):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(camera_config(), wake_capability=capability, wake_direct=direct)
+
+    class Broker:
+        async def async_send_wake(self):
+            calls.append("wake")
+
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._connector_wake_allowed = allowed
+    await playback._maybe_send_connector_wake(Broker())
+    second = NativeRelayPlaybackSession(config, APP_SESSION)
+    second._connector_wake_allowed = allowed
+    await second._maybe_send_connector_wake(Broker())
+    assert calls == (["wake"] if allowed and direct and capability not in {"unknown", "none"} else [])
+
+
+@pytest.mark.asyncio
+async def test_connector_and_sd_presenter_share_one_wake_but_keep_status_query(monkeypatch):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    playback = NativeRelayPlaybackSession(replace(
+        camera_config(), wake_capability="low_power", wake_direct=True,
+        sd_low_power_wake=True, sd_status_mqtt_dp="247",
+    ), APP_SESSION)
+    playback._connector_wake_allowed = True
+    playback._on_demand_catalog = True
+
+    class Broker:
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_query_direct_dp(self, dp):
+            calls.append(("query", dp))
+            return 1
+
+    await playback._maybe_send_connector_wake(Broker())
+    await playback._maybe_send_wake(Broker())
+    assert calls == ["wake", ("query", "247")]
+    assert playback._sd_status_query == "report_received"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failure", "cancel", "report_cooldown"])
+async def test_connector_wake_failure_has_no_detached_retry(monkeypatch, outcome):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pError
+
+    commands = CameraCommandQueue()
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", commands)
+    config = replace(camera_config(), wake_capability="low_power", wake_direct=True)
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._connector_wake_allowed = True
+    calls = []
+
+    class Broker:
+        async def async_send_wake(self):
+            calls.append("wake")
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            raise TuyaIpcP2pError("fixture send failed")
+
+    if outcome == "report_cooldown":
+        commands.reserve_wake(config.dev_id)
+        commands.mark_wake_report_missing(config.dev_id)
+        with pytest.raises(NativeRelayPlaybackError, match="cooldown"):
+            await playback._maybe_send_connector_wake(Broker())
+        assert calls == []
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await playback._maybe_send_connector_wake(Broker())
+        assert calls == ["wake"]
+    else:
+        await playback._maybe_send_connector_wake(Broker())
+        assert playback._connector_wake_status == "send_failed"
+        await playback._maybe_send_connector_wake(Broker())
+        assert calls == ["wake"]
+    assert not playback._connector_wake_sent
 
 
 @pytest.mark.asyncio

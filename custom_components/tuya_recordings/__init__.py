@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from contextvars import copy_context
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -421,10 +422,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     client = entry_data["client"]
                     entry = entry_data["entry"]
                     if CONF_NATIVE_APP_SESSION in getattr(entry, "data", {}):
-                        updates = await hass.async_add_executor_job(client.refresh_inventory, _entry_runtime_data(entry))
+                        updates = await hass.async_add_executor_job(
+                            copy_context().run, client.refresh_inventory, _entry_runtime_data(entry),
+                        )
                         hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
                     if client.media_sync_enabled:
-                        await hass.async_add_executor_job(manual_catalog_refresh()(client.refresh_recent_recordings))
+                        await hass.async_add_executor_job(
+                            copy_context().run, manual_catalog_refresh()(client.refresh_recent_recordings),
+                        )
                     else:
                         await _async_request_catalog_refresh(
                             hass, entry_data["entry"].entry_id, "service", wait=True
@@ -629,7 +634,7 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
         refresh = client.refresh_background_catalog
         if reason == "service":
             refresh = manual_catalog_refresh()(refresh)
-        result = await hass.async_add_executor_job(refresh, CATALOG_SYNC_DAYS_PER_PASS)
+        result = await hass.async_add_executor_job(copy_context().run, refresh, CATALOG_SYNC_DAYS_PER_PASS)
         cameras = result.get("cameras", []) if isinstance(result, dict) else []
         _LOGGER.info(
             "Tuya Recordings catalog pass finished entry=%s source=%s request_id=%s cameras=%s failures=%s",
