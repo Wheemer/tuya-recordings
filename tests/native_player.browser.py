@@ -117,6 +117,15 @@ def record(kind: int, timestamp: int, payload: bytes = b"") -> bytes:
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         stream = native_browser_stream(Path(temporary) / "fixture.h264")
+        # Deliver enough fragments to start Chromium, then withhold the rest
+        # until the test has observed a genuine buffered-media starvation.
+        stall_resume = threading.Event()
+        stall_split = len(browser_stream_header())
+        video_records = 0
+        while video_records < 30:
+            kind, _timestamp, size = HEADER.unpack_from(stream, stall_split)
+            stall_split += HEADER.size + size
+            video_records += kind == 1
         record_bytes = stream[len(browser_stream_header()) : -len(record(BROWSER_STREAM_END, 0))]
         timeline_streams = {
             "initial": browser_stream_header(1, 400) + record_bytes,
@@ -144,7 +153,7 @@ def main() -> None:
                 if path == "/":
                     body = b"<html><body><div id='player'><video playsinline></video><div role='status'></div></div></body></html>"
                     content_type = "text/html"
-                elif path == "/stream":
+                elif path in ("/stream", "/stallstream"):
                     requests.append(self.path)
                     body = stream
                     content_type = "application/vnd.tuya-recordings.stream"
@@ -169,7 +178,14 @@ def main() -> None:
                 self.end_headers()
                 if path == "/stream":
                     time.sleep(0.5)
-                self.wfile.write(body)
+                if path == "/stallstream":
+                    self.wfile.write(body[:stall_split])
+                    self.wfile.flush()
+                    if not stall_resume.wait(12):
+                        return
+                    self.wfile.write(body[stall_split:])
+                else:
+                    self.wfile.write(body)
 
             def log_message(self, *_args: object) -> None:
                 pass
@@ -187,6 +203,57 @@ def main() -> None:
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(f"http://127.0.0.1:{server.server_port}/")
+                listener_cleanup = page.evaluate(
+                    """async () => {
+                      const text = await (await fetch('/frontend/camera-player.js')).text();
+                      const helpers = new Function(text.slice(text.indexOf('function once('),
+                        text.indexOf('function concatBytes(')) + ';return {once, appendBuffer};')();
+                      const tracked = target => {
+                        const listeners = new Map();
+                        const add = target.addEventListener.bind(target);
+                        const remove = target.removeEventListener.bind(target);
+                        target.addEventListener = (type, fn, ...args) => {
+                          if (!listeners.has(type)) listeners.set(type, new Set());
+                          listeners.get(type).add(fn);
+                          add(type, fn, ...args);
+                        };
+                        target.removeEventListener = (type, fn, ...args) => {
+                          listeners.get(type)?.delete(fn);
+                          remove(type, fn, ...args);
+                        };
+                        target.count = () => [...listeners.values()].reduce((n, set) => n + set.size, 0);
+                        return target;
+                      };
+                      const controller = new AbortController();
+                      const signal = tracked(controller.signal);
+                      const buffer = tracked(new EventTarget());
+                      buffer.appendBuffer = () => queueMicrotask(() => buffer.dispatchEvent(new Event('updateend')));
+                      const counts = [];
+                      for (let i = 0; i < 100; i++) {
+                        await helpers.appendBuffer(buffer, new Uint8Array(1), signal);
+                        const opened = helpers.once(buffer, 'sourceopen', signal);
+                        buffer.dispatchEvent(new Event('sourceopen'));
+                        await opened;
+                        counts.push(buffer.count() + signal.count());
+                      }
+                      buffer.appendBuffer = () => { throw new Error('fixture sync error'); };
+                      await helpers.appendBuffer(buffer, new Uint8Array(1), signal).catch(() => {});
+                      counts.push(buffer.count() + signal.count());
+                      buffer.appendBuffer = () => queueMicrotask(() => buffer.dispatchEvent(new Event('error')));
+                      await helpers.appendBuffer(buffer, new Uint8Array(1), signal).catch(() => {});
+                      counts.push(buffer.count() + signal.count());
+                      buffer.appendBuffer = () => {};
+                      const pending = helpers.appendBuffer(buffer, new Uint8Array(1), signal);
+                      controller.abort();
+                      const abortName = await pending.catch(error => error.name);
+                      counts.push(buffer.count() + signal.count());
+                      const alreadyAborted = await helpers.appendBuffer(buffer, new Uint8Array(1), signal).catch(error => error.name);
+                      return {maxRetained: Math.max(...counts), abortName, alreadyAborted};
+                    }"""
+                )
+                assert listener_cleanup == {
+                    "maxRetained": 0, "abortName": "AbortError", "alreadyAborted": "AbortError",
+                }, listener_cleanup
                 result = page.evaluate(
                     """async () => {
                       window.audioStarts = 0;
@@ -313,14 +380,42 @@ def main() -> None:
                       const video = document.querySelector('video');
                       window.disposePlayer = attachCameraPlayer(video, {
                         cached: false,
-                        duration: 0.4,
+                        duration: 2.5,
                         start: 300,
-                        end: 301,
-                        playback_url: '/stream',
+                        end: 303,
+                        playback_url: '/stallstream',
                         stream_transport: 'native',
                       }, async path => path, { autoplay: true });
                     }"""
                 )
+                page.wait_for_function(
+                    "document.querySelector('video').currentTime > 0.2",
+                    timeout=5_000,
+                )
+                # Seek the actual element into the withheld portion: Chromium
+                # must wait for those bytes, without a mocked media clock.
+                page.evaluate("document.querySelector('video').currentTime = 2")
+                page.wait_for_function(
+                    """() => document.querySelector('video').currentTime > 0.2
+                      && document.querySelector('video').readyState <= 2
+                      && !document.querySelector('video').paused""",
+                    timeout=5_000,
+                )
+                finite_stall = page.evaluate(
+                    """async () => {
+                      const video = document.querySelector('video');
+                      const before = video.currentTime;
+                      await new Promise(resolve => setTimeout(resolve, 2800));
+                      const retained = Boolean(video.getAttribute('src'));
+                      const status = document.querySelector('[role=status]').textContent;
+                      const after = video.currentTime;
+                      return {retained, status, before, after};
+                    }"""
+                )
+                assert finite_stall["retained"], finite_stall
+                assert finite_stall["status"] != "Finished", finite_stall
+                assert abs(finite_stall["after"] - finite_stall["before"]) < 0.05
+                stall_resume.set()
                 page.wait_for_function(
                     "document.querySelector('[role=status]').textContent === 'Finished'",
                     timeout=15_000,
@@ -555,7 +650,8 @@ def main() -> None:
                       // observed video clock without pausing the element.
                       // That models a decoder stall while a separately
                       // scheduled audio buffer still has data to play.
-                      window.addEventListener('timeupdate', event => event.stopImmediatePropagation(), true);
+                      window.suppressProgress = event => event.stopImmediatePropagation();
+                      window.addEventListener('timeupdate', window.suppressProgress, true);
                       Object.defineProperty(video, 'readyState', { value: 1, configurable: true });
                       const stopsBefore = window.audioStops;
                       const suspendsBefore = window.audioSuspends;
@@ -577,6 +673,10 @@ def main() -> None:
                       };
                     }"""
                 )
+                page.evaluate("""() => {
+                  window.removeEventListener('timeupdate', window.suppressProgress, true);
+                  delete document.querySelector('video').readyState;
+                }""")
                 page.evaluate(
                     """() => {
                       window.disposePlayer.pause();
@@ -599,6 +699,38 @@ def main() -> None:
                     timeout=15_000,
                 )
                 paused_seek_actions = page.evaluate("window.timelineActions.slice(-3)")
+                page.wait_for_function(
+                    """() => window.timelineDebug.some(e => e.phase === 'stream-header' && e.generation === 6)
+                      && document.querySelector('video').currentTime > 0.2
+                      && !document.querySelector('video').paused""",
+                    timeout=5_000,
+                )
+                plain_resume = page.evaluate(
+                    """async () => {
+                      const video = document.querySelector('video');
+                      const before = video.plyr.currentTime;
+                      const mediaBefore = video.currentTime;
+                      const src = video.src;
+                      const actionCount = window.timelineActions.length;
+                      window.disposePlayer.pause();
+                      const pausedPosition = video.plyr.currentTime;
+                      await new Promise(resolve => setTimeout(resolve, 100));
+                      video.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                      await new Promise(resolve => setTimeout(resolve, 250));
+                      return {before, mediaBefore, pausedPosition,
+                        after: video.plyr.currentTime, mediaAfter: video.currentTime,
+                        sameSource: src === video.src,
+                        samePlayer: video.plyr === window.timelinePlayer,
+                        sockets: window.timelineSockets.length,
+                        actions: window.timelineActions.slice(actionCount)};
+                    }"""
+                )
+                assert abs(plain_resume["pausedPosition"] - plain_resume["before"]) < 0.05, plain_resume
+                assert plain_resume["mediaAfter"] > plain_resume["mediaBefore"], plain_resume
+                assert abs((plain_resume["after"] - plain_resume["mediaAfter"]) - 1) < 0.05, plain_resume
+                assert plain_resume["sameSource"] and plain_resume["samePlayer"], plain_resume
+                assert plain_resume["sockets"] == 1, plain_resume
+                assert plain_resume["actions"] == [{"action": "pause"}, {"action": "resume"}], plain_resume
                 stale_restart = page.evaluate(
                     """async () => {
                       const video = document.querySelector('video');
@@ -623,6 +755,7 @@ def main() -> None:
                 page.screenshot(path=str(Path(temporary) / "native-player.png"))
                 browser.close()
         finally:
+            stall_resume.set()
             server.shutdown()
             server.server_close()
             thread.join()
@@ -630,7 +763,7 @@ def main() -> None:
     assert requests == [
         "/stream?position=100&transport=native",
         "/stream?position=200&transport=native",
-        "/stream?position=300&transport=native",
+        "/stallstream?position=300&transport=native",
     ]
     assert not errors
     assert report["plyr"] and report["controls"] >= 3
@@ -679,12 +812,16 @@ def main() -> None:
     assert stalled_audio["resumes"] == 1
     assert stalled_audio["recoveredStatus"] == ""
     assert stalled_audio["stalled"] is True
-    assert stale_restart == {
-        "unexpectedSignCalls": 0,
-        "audioStops": 0,
-        "socketClosed": True,
-    }, stale_restart
-    print(json.dumps({"requests": requests, **report}, sort_keys=True))
+    assert stale_restart["unexpectedSignCalls"] == 0, stale_restart
+    assert stale_restart["audioStops"] > 0, stale_restart
+    assert stale_restart["socketClosed"] is True, stale_restart
+    print(json.dumps({
+        "requests": requests, **report,
+        "finiteStall": finite_stall,
+        "listenerCleanup": listener_cleanup,
+        "plainResume": plain_resume,
+        "pausedSeekGeneration": 6,
+    }, sort_keys=True))
 
 
 if __name__ == "__main__":

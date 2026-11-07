@@ -130,6 +130,7 @@ def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) 
             "capability": wake if isinstance(wake := device.get("wakeCapability"), str)
             and wake in WAKE_CAPABILITIES else "unknown",
             "direct": device.get("wakeDirect") is True,
+            "lan_signaling_capable": device.get("lanSignalingCapable") is True,
             **({"evidence": device["sdWakeEvidence"]} if isinstance(device.get("sdWakeEvidence"), dict) else {}),
             **({"detail_lookup": device["sdWakeDetailLookup"]} if isinstance(device.get("sdWakeDetailLookup"), str) else {}),
             **({"schema_lookup": device["sdSchemaLookup"]} if isinstance(device.get("sdSchemaLookup"), str) else {}),

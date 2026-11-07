@@ -108,6 +108,7 @@ class NativeCameraSessionConfig:
     mqtt_protocol_version: str = "2.2"
     wake_capability: str = "unknown"
     wake_direct: bool = False
+    lan_signaling_capable: bool = False
     sd_low_power_wake: bool | None = None
     sd_status_mqtt_dp: str = ""
     sd_status_http_dp: str = ""
@@ -428,6 +429,7 @@ def normalize_camera_info(
     mqtt_protocol_version: str = "2.2",
     wake_capability: str = "unknown",
     wake_direct: bool = False,
+    lan_signaling_capable: bool = False,
     sd_low_power_wake: bool | None = None,
     sd_status_mqtt_dp: str = "",
     sd_status_http_dp: str = "",
@@ -476,6 +478,7 @@ def normalize_camera_info(
         mqtt_protocol_version=mqtt_protocol_version,
         wake_capability=wake_capability,
         wake_direct=wake_direct,
+        lan_signaling_capable=lan_signaling_capable,
         sd_low_power_wake=sd_low_power_wake,
         sd_status_mqtt_dp=sd_status_mqtt_dp,
         sd_status_http_dp=sd_status_http_dp,

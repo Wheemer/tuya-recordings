@@ -288,6 +288,8 @@ class NativeAppGatewayClient:
                 if wake is not None:
                     row["wakeCapability"] = wake
                 communication = device.get("communication")
+                if (lan_capable := _has_lan_communication(device)) is not None:
+                    row["lanSignalingCapable"] = lan_capable
                 if isinstance(communication, dict):
                     row["wakeDirect"] = communication.get("communicationNode") in (None, "", dev_id)
                 elif isinstance(device.get("communicationId"), str):
@@ -356,7 +358,7 @@ class NativeAppGatewayClient:
             if product_id and detail_product and detail_product != product_id:
                 row["sdWakeDetailLookup"] = "product_mismatch"
                 continue
-            if dev_id not in protocol_versions and (pv := _device_mqtt_protocol_version(detail)):
+            if pv := _device_mqtt_protocol_version(detail, allow_legacy=dev_id not in protocol_versions):
                 protocol_versions[dev_id] = pv
             product = home_products.get(gid, {}).get(product_id)
             if product and _optional_str(product, "productVer") != _optional_str(detail, "productVer"):
@@ -591,6 +593,8 @@ def _apply_sd_wake_metadata(
     row: dict[str, Any], device: dict[str, Any], dev_id: str, *, source: str = "home",
 ) -> None:
     row["sdWakeEvidence"] = _sd_wake_evidence(device, dev_id, source)
+    if (lan_capable := _has_lan_communication(device)) is not None:
+        row["lanSignalingCapable"] = lan_capable
     communication = device.get("communication")
     target = communication.get("communicationNode") if isinstance(communication, dict) else device.get("communicationId")
     if isinstance(target, str) and target:
@@ -600,9 +604,9 @@ def _apply_sd_wake_metadata(
         return
     row["sdLowPowerWake"] = eligible
     row["sdStatusMqttCapable"] = bool(_sd_status_mqtt_dp({**device, "cloudOnline": True})) if eligible else False
+    for key in ("sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp", "sdStatusLanErrorRoute"):
+        row.pop(key, None)
     if not eligible:
-        for key in ("sdStatusMqttDp", "sdStatusHttpDp", "sdStatusLanDp", "sdStatusLanErrorRoute"):
-            row.pop(key, None)
         return
     if dp := _sd_status_mqtt_dp(device):
         row.pop("sdStatusHttpDp", None)
@@ -615,6 +619,17 @@ def _apply_sd_wake_metadata(
         row.pop("sdStatusLanErrorRoute", None)
         if route := _sd_status_lan_error_route(device):
             row["sdStatusLanErrorRoute"] = route
+
+
+def _has_lan_communication(device: dict[str, Any]) -> bool | None:
+    """Read DeviceBean.hasLanCommunication independently of SD wake support."""
+    communication = device.get("communication")
+    modes = communication.get("communicationModes") if isinstance(communication, dict) else None
+    if not isinstance(modes, list) or not modes or any(
+        not isinstance(mode, dict) or type(mode.get("type")) is not int for mode in modes
+    ):
+        return None
+    return any(mode["type"] == 0 for mode in modes)
 
 
 def _is_provider_two(device: dict[str, Any], dev_id: str) -> bool | None:
@@ -747,20 +762,21 @@ def _product_wake_capability(reference: Any) -> str | None:
     return "low_power" if low_power else "remote" if remote else "none"
 
 
-def _device_mqtt_protocol_version(device: dict[str, Any]) -> str | None:
+def _device_mqtt_protocol_version(device: dict[str, Any], *, allow_legacy: bool = True) -> str | None:
     """Extract an explicit APK DeviceBean MQTT protocol version."""
-    version = device.get("pv")
-    if version is None or version == "":
-        communication = device.get("communication")
-        modes = communication.get("communicationModes") if isinstance(communication, dict) else None
-        if isinstance(modes, list):
-            for mode in modes:
-                if not isinstance(mode, dict):
-                    continue
-                kind = mode.get("type")
-                # Both APKs populate DeviceBean.pv in this order-sensitive loop.
-                if type(kind) is int and (kind == 1 or (kind in {2, 3} and not version)):
-                    version = mode.get("pv")
+    version = None
+    communication = device.get("communication")
+    modes = communication.get("communicationModes") if isinstance(communication, dict) else None
+    if isinstance(modes, list):
+        for mode in modes:
+            if not isinstance(mode, dict):
+                continue
+            kind = mode.get("type")
+            # Both APKs populate DeviceBean.pv in this order-sensitive loop.
+            if type(kind) is int and (kind == 1 or (kind in {2, 3} and not version)):
+                version = mode.get("pv")
+    if (version is None or version == "") and allow_legacy:
+        version = device.get("pv")
     if not isinstance(version, str | int | float):
         return None
     normalized = str(version).strip()
