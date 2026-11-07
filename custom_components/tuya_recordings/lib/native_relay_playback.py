@@ -54,7 +54,7 @@ from .native_playback_stream import (
     NativePlaybackStreamParser,
 )
 from .commands import CAMERA_COMMANDS
-from .native_session import NativeCameraSessionConfig, native_session_api_request
+from .native_session import NativeCameraSessionConfig, NativeTokenRoute, native_session_api_request
 from .native_simple_rtp import (
     NativeH264RtpDepacketizer,
     NativeSimpleMediaParser,
@@ -330,7 +330,12 @@ class NativeRelayPlaybackSession:
             f"app_profile={config.app_profile_id}, bootstrap_api_version={api_version}, "
             f"p2p_type={config.p2p_type}, p2p_policy={config.p2p_policy}, "
             f"mqtt_pv={config.mqtt_protocol_version or 'unknown'}, "
-            f"preconnect={bool(config.preconnect)}, security_level={config.p2p_security_level}, "
+            f"preconnect={bool(config.preconnect)}, "
+            f"offer_preconnect={config.signaling_preconnect}, "
+            f"token_selection={self._http_token_reason() or 'app_token'}, "
+            f"token_details=({config.token_route_diagnostics}), "
+            "session_identity=generated_local, "
+            f"security_level={config.p2p_security_level}, "
             f"token_route={self._token_route}, "
             f"wake_capability={config.wake_capability}, wake_direct={config.wake_direct}, "
             f"wake_status={wake_status}, sd_low_power_wake={config.sd_low_power_wake}, "
@@ -481,6 +486,7 @@ class NativeRelayPlaybackSession:
         log_config: Any,
     ) -> None:
         """Use the camera-advertised local policy before MQTT fallback."""
+        self._validate_direct_token(self._native_config.p2p_config)
         if self._native_config.p2p_policy == 1 and not self._http_initialized:
             config = self._native_config
             if (not self._sd_status_prepared and config.sd_low_power_wake is True
@@ -502,7 +508,7 @@ class NativeRelayPlaybackSession:
                 on_answer=lambda sdp: self._on_answer(sdp, source="lan"),
                 on_candidate=self._on_remote_candidate,
                 on_disconnect=self._on_disconnect,
-                preconnect=bool(self._native_config.preconnect),
+                preconnect=self._native_config.signaling_preconnect,
                 security_level=self._native_config.p2p_security_level,
                 moto_id=self._stream_config.moto_id,
                 on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
@@ -512,7 +518,7 @@ class NativeRelayPlaybackSession:
                 lan.configure_offer_metadata(
                     moto_id=self._stream_config.moto_id,
                     security_level=self._native_config.p2p_security_level,
-                    preconnect=bool(self._native_config.preconnect),
+                    preconnect=self._native_config.signaling_preconnect,
                 )
             self._moto = lan
             self._signaling_path = "lan"
@@ -526,6 +532,7 @@ class NativeRelayPlaybackSession:
                     await self._connect_auxiliary_mqtt(self._stream_config.p2p_session.session_id)
                 self._offer_status = "sending"
                 self._connect_phase = "lan_offer"
+                _LOGGER.debug("Native SD offer selected: %s", self.transport_diagnostics)
                 await lan.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
                 self._offer_status = "sent"
                 self._lan_answers_alive = True
@@ -558,6 +565,7 @@ class NativeRelayPlaybackSession:
         self._signaling_path = "mqtt"
         self._connect_phase = "mqtt_offer"
         self._offer_status = "sending"
+        _LOGGER.debug("Native SD offer selected: %s", self.transport_diagnostics)
         send_offer = partial(
             self._moto.async_send_offer, sdp, ice_servers, trace_id, tcp_token, log_config
         )
@@ -614,7 +622,7 @@ class NativeRelayPlaybackSession:
             on_candidate=self._on_remote_candidate,
             on_disconnect=self._on_disconnect,
             protocol_version=self._native_config.mqtt_protocol_version,
-            preconnect=bool(self._native_config.preconnect),
+            preconnect=self._native_config.signaling_preconnect,
             security_level=self._native_config.p2p_security_level,
             moto_id=self._stream_config.moto_id if self._stream_config else "",
             on_failure=self._on_signaling_failure,
@@ -910,27 +918,32 @@ class NativeRelayPlaybackSession:
         """Match ordinary connect_v3 token selection, never a timeout retry."""
         return self._http_token_reason() is not None
 
+    @staticmethod
+    def _validate_direct_token(token: dict[str, Any]) -> None:
+        if NativeTokenRoute.from_token(token).cloud_session:
+            raise NativeRelayPlaybackError(
+                "Native token selects a server-managed session; "
+                "the APK's separate server-managed transport is not implemented"
+            )
+
     def _http_token_reason(self) -> str | None:
-        token = self._native_config.p2p_config
-        session = token.get("session", {})
-        session = session if isinstance(session, dict) else {}
-        skill = token.get("skill", session.get("skill", {}))
-        cloud = skill.get("cloudP2P", 0) if isinstance(skill, dict) else 0
-        expiry = token.get("expire", session.get("expire", 0))
-        if type(cloud) is int and cloud != 0:
+        route = self._native_config.token_route
+        if route.cloud_p2p:
             return "http_cloud_p2p"
-        if type(expiry) is not int or not expiry:
+        if not route.expiry_numeric:
             return "http_missing_expiry"
-        if expiry <= int(time.time()):
+        if route.expiry <= int(time.time()):
             return "http_expired_token"
         return None
 
     async def _initialize_http_offer(self, trace_id: str) -> None:
         """Run native state zero once, before the ordinary MQTT offer state."""
+        self._validate_direct_token(self._native_config.p2p_config)
         if self._http_initialized:
             return
         self._token_route = self._http_token_reason() or "http_bootstrap_unavailable"
         self._connect_phase = "http_prepare"
+        _LOGGER.debug("Native SD token selected: %s", self.transport_diagnostics)
         if not callable(self._call_api):
             raise NativeRelayPlaybackError("Native initial HTTP offer gateway is unavailable")
         device_id = self._native_config.dev_id
@@ -976,12 +989,21 @@ class NativeRelayPlaybackSession:
             raise NativeRelayPlaybackError("Native HTTP offer returned no P2P configuration")
         token = result["p2pConfig"]
         remote = token.get("session")
+        self._validate_direct_token(token)
         if not isinstance(remote, dict) or remote.get("sessionId") != session_id:
             raise NativeRelayPlaybackError("Native HTTP offer returned a different session")
-        if token.get("isCloudSession"):
-            raise NativeRelayPlaybackError("Native HTTP offer requires a cloud media session; relay is disabled")
         merged = {**self._native_config.p2p_config, **token,
                   "session": {**self._native_config.p2p_config.get("session", {}), **remote}}
+        # Native route fields belong to the fresh token, not the old token's
+        # optional connection-data merge.
+        for field in ("expire", "skill"):
+            merged[field] = token.get(field, remote.get(field))
+        merged["isCloudSession"] = token.get("isCloudSession")
+        # An omitted flag in a fresh native token resets to false. Do not retain
+        # an expired token's true value while merging optional connection data.
+        merged["preconnect"] = replace(
+            self._native_config, token=json.dumps(token),
+        ).signaling_preconnect
         info = json.loads(self._native_config.config_json)
         info["p2pConfig"] = merged
         updated = replace(self._native_config, token=json.dumps(merged), config_json=json.dumps(info))
@@ -995,6 +1017,7 @@ class NativeRelayPlaybackSession:
             self._moto.configure_offer_metadata(
                 moto_id=self._stream_config.moto_id,
                 security_level=self._native_config.p2p_security_level,
+                preconnect=self._native_config.signaling_preconnect,
             )
 
     async def query_recordings(self, day: date) -> NativeV4CatalogPage:

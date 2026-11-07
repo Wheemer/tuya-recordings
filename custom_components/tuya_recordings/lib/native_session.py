@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -75,6 +76,43 @@ class NativePlaybackCallSpec:
         )
 
 
+def _native_json_integer(value: Any) -> int | None:
+    """Match cJSON_IsNumber/valueint: truncate and saturate signed int32."""
+    if type(value) not in (int, float):
+        return None
+    if type(value) is float and not math.isfinite(value):
+        return None
+    return max(-(1 << 31), min((1 << 31) - 1, int(value)))
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTokenRoute:
+    """The native parser's normalized route inputs, shared with diagnostics."""
+
+    expiry: int
+    expiry_numeric: bool
+    cloud_p2p: int
+    cloud_session: int
+
+    @classmethod
+    def from_token(cls, token: dict[str, Any]) -> NativeTokenRoute:
+        session = token.get("session")
+        session = session if isinstance(session, dict) else {}
+        skill = token.get("skill", session.get("skill"))
+        cloud = skill.get("cloudP2P") if isinstance(skill, dict) else None
+        expiry = _native_json_integer(token.get("expire", session.get("expire")))
+        cloud_session = token.get("isCloudSession")
+        return cls(
+            expiry=expiry if expiry is not None else 0,
+            expiry_numeric=expiry is not None,
+            cloud_p2p=_native_json_integer(cloud) or 0,
+            cloud_session=(
+                int(cloud_session) if type(cloud_session) is bool
+                else _native_json_integer(cloud_session) or 0
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class NativeCameraSessionConfig:
     """Connection values passed into the APK native camera SDK.
@@ -131,6 +169,39 @@ class NativeCameraSessionConfig:
     @property
     def p2p_config(self) -> dict[str, Any]:
         return _parse_json_object("token", self.token)
+
+    @property
+    def signaling_preconnect(self) -> bool:
+        """Match the native token boolean, not app connection optimization."""
+        token = self.p2p_config
+        session = token.get("session")
+        session = session if isinstance(session, dict) else {}
+        value = token.get("preconnect", session.get("preconnect"))
+        return value if type(value) is bool else False
+
+    @property
+    def token_route(self) -> NativeTokenRoute:
+        return NativeTokenRoute.from_token(self.p2p_config)
+
+    @property
+    def token_route_diagnostics(self) -> str:
+        """Describe native route inputs without serializing token contents."""
+        token = self.p2p_config
+        session = token.get("session")
+        session = session if isinstance(session, dict) else {}
+        route = self.token_route
+        preconnect_source = (
+            "root" if "preconnect" in token
+            else "session" if "preconnect" in session else "default"
+        )
+        return (
+            f"session_present={bool(session)}, "
+            f"cloud_p2p={bool(route.cloud_p2p)}, "
+            f"cloud_session={bool(route.cloud_session)}, "
+            f"expiry_numeric={route.expiry_numeric}, "
+            f"preconnect_source={preconnect_source}, "
+            f"offer_preconnect={self.signaling_preconnect}"
+        )
 
     @property
     def p2p_session_id(self) -> str:
