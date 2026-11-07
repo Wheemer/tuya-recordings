@@ -18,6 +18,7 @@ from custom_components.tuya_recordings.lib.native_session import (
     NativePlaybackRequest,
     NativeRecordingQuery,
     NativeSessionError,
+    NativeTokenRoute,
     derive_native_password,
     native_encryption_info_json,
     native_playback_jni_args,
@@ -52,6 +53,41 @@ def camera_info(**updates):
     }
     data.update(updates)
     return data
+
+
+@pytest.mark.parametrize("value,expected,numeric", [
+    (123, 123, True), (123.9, 123, True), (-123.9, -123, True),
+    (0.9, 0, True), (-0.9, 0, True),
+    (1 << 40, 2147483647, True), (-(1 << 40), -2147483648, True),
+    (1e40, 2147483647, True), (-1e40, -2147483648, True),
+    (True, 0, False), (False, 0, False), ("123", 0, False),
+    (None, 0, False), (float("nan"), 0, False), (float("inf"), 0, False),
+])
+@pytest.mark.parametrize("nested", [False, True])
+def test_native_route_numbers_match_cjson_valueint(value, expected, numeric, nested):
+    fields = {"expire": value, "skill": {"cloudP2P": value}}
+    token = {"session": fields} if nested else fields
+    route = NativeTokenRoute.from_token(token)
+    assert route.expiry == expected
+    assert route.expiry_numeric is numeric
+    assert route.cloud_p2p == expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    (True, 1), (False, 0), (1.0, 1), (0.9, 0), (-1.9, -1),
+    ("1", 0), (None, 0),
+])
+def test_native_cloud_session_accepts_boolean_or_native_number(value, expected):
+    assert NativeTokenRoute.from_token({"isCloudSession": value}).cloud_session == expected
+
+
+def test_native_route_present_root_null_does_not_fall_back_to_session():
+    route = NativeTokenRoute.from_token({
+        "expire": None, "skill": None,
+        "session": {"expire": 123.0, "skill": {"cloudP2P": 1.0}},
+    })
+    assert route.expiry_numeric is False
+    assert route.cloud_p2p == 0
 
 
 @pytest.mark.parametrize("preferred,ability,expected", [
@@ -159,6 +195,25 @@ def test_normalize_camera_info_uses_consumer_app_preconnect_policy():
     )
 
     assert config.preconnect == 1
+
+
+@pytest.mark.parametrize("token,expected", [
+    ({}, False),
+    ({"preconnect": True}, True),
+    ({"preconnect": False}, False),
+    ({"preconnect": 1}, False),
+    ({"preconnect": "true"}, False),
+    ({"session": {"preconnect": True}}, True),
+    ({"preconnect": None, "session": {"preconnect": True}}, False),
+    ({"preconnect": False, "session": {"preconnect": True}}, False),
+])
+def test_signaling_preconnect_matches_both_native_token_parsers(token, expected):
+    config = normalize_camera_info(
+        "dev123", camera_info(p2pConfig={"expire": 1, **token}),
+        local_key="local-key", trace_id="trace",
+    )
+    assert config.preconnect == 1
+    assert config.signaling_preconnect is expected
 
 
 def test_playback_catalog_v3_uses_the_apk_capability_bit():

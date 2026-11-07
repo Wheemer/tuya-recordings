@@ -380,12 +380,15 @@ class MotoClient:
         except aiomqtt.MqttError as error:
             raise TuyaIpcP2pConnectionError("Native camera wake send failed") from error
 
-    def configure_offer_metadata(self, *, moto_id: str, security_level: int) -> None:
+    def configure_offer_metadata(
+        self, *, moto_id: str, security_level: int, preconnect: bool
+    ) -> None:
         """Apply an HTTP token result without dropping the subscribed reader."""
         if security_level not in {2, 3, 4}:
             raise ValueError("Unsupported signaling security level")
         self._moto_id = moto_id
         self._security_level = security_level
+        self._preconnect = preconnect
 
     async def async_send_offer(
         self,

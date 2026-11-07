@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-9 (2026-11-07)
+
+### Connection
+
+- Correct the outgoing offer's preconnect flag using the token value traced in both Smart Life and Tuya Smart APKs, independently of the app's connection optimization.
+- Apply refreshed token flags to the existing MQTT connection and discard stale route flags when replacing a token.
+- Match the native SDK's numeric conversion for token expiry and connection-route fields, including decimal-form numbers.
+- Stop incompatible server-managed sessions before sending an ordinary direct-ICE offer.
+
+### Diagnostics
+
+- Log the token and offer route before sending, with separate app-optimization and outgoing preconnect flags.
+- Use the same normalized token values for route selection and diagnostics, without exposing credentials or media payloads.
+
 ## Tuya Recordings v0.4.13-8 (2026-11-07)
 
 ### Connection

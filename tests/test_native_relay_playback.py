@@ -97,8 +97,9 @@ def session():
 @pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
 @pytest.mark.parametrize("via_button", [False, True])
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+@pytest.mark.parametrize("wire_preconnect", [None, False, True])
 def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
-    monkeypatch, tmp_path, caplog, outcome, via_button, profile,
+    monkeypatch, tmp_path, caplog, outcome, via_button, profile, wire_preconnect,
 ):
     import logging
     import re
@@ -123,6 +124,11 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     bootstrap = {
         **json.loads(config.config_json), "p2pSpecifiedType": 4, "p2pPolicy": 0, "skill": "{}",
     }
+    # Both APKs use cJSON numeric conversion, including decimal-form numbers.
+    bootstrap["p2pConfig"]["expire"] = float(bootstrap["p2pConfig"]["expire"])
+    bootstrap["p2pConfig"]["skill"] = {"cloudP2P": 0.0}
+    if wire_preconnect is not None:
+        bootstrap["p2pConfig"]["preconnect"] = wire_preconnect
     offers = []
     refreshed_offers = []
     events = []
@@ -232,6 +238,9 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             if header["type"] == "disconnect":
                 return
             assert header["type"] == "offer"
+            # The native builder reads the token boolean, not connect_v3's
+            # independently enabled preconnection optimization.
+            assert body["msg"]["preconnect"] is (wire_preconnect is True)
             offers.append(payload[:3])
             events.append("offer")
             if payload[:3] != b"2.3":
@@ -562,12 +571,15 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
 
 
 @pytest.mark.asyncio
-async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch):
+@pytest.mark.parametrize("wire_preconnect", [None, False, True])
+async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch, wire_preconnect):
     calls = []
     captured = {}
     config = camera_config()
     token = json.loads(config.token)
     token["expire"] = 0
+    token["preconnect"] = True
+    token["skill"] = {"cloudP2P": 1.0}
     config = replace(config, token=json.dumps(token))
 
     def gateway(api, version, body, extra):
@@ -581,6 +593,8 @@ async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch):
         result = json.loads(camera_config().token)
         result["session"]["sessionId"] = message["header"]["sessionid"]
         result["motoId"] = "renewed-moto"
+        if wire_preconnect is not None:
+            result["preconnect"] = wire_preconnect
         return {"p2pConfig": result}
 
     class Signaling:
@@ -606,6 +620,9 @@ async def test_initial_http_token_precedes_single_mqtt_offer(monkeypatch):
     assert calls == ["mqtt", "http", "offer"]
     assert captured["signaling"]["session_id"] == captured["header"]["sessionid"]
     assert captured["signaling"]["moto_id"] == "renewed-moto"
+    assert captured["signaling"]["preconnect"] is (wire_preconnect is True)
+    assert playback._native_config.token_route.cloud_p2p == 0
+    assert "cloud_p2p=False" in playback.transport_diagnostics
     assert playback.local_cid != camera_config().p2p_session_id
     assert playback._offer.sdp == captured["msg"]["sdp"]
 
@@ -641,6 +658,71 @@ async def test_initial_http_failure_never_sends_mqtt_offer_or_retries(monkeypatc
 
 def test_current_app_token_does_not_require_http_offer():
     assert not session()._requires_http_token()
+
+
+@pytest.mark.parametrize("fields,expected,cloud,numeric", [
+    ({"expire": 1800000000.0}, None, False, True),
+    ({"expire": 1800000000.0, "skill": {"cloudP2P": 1.0}}, "http_cloud_p2p", True, True),
+    ({"expire": 1800000000.0, "skill": {"cloudP2P": 0.9}}, None, False, True),
+    ({"expire": 0.0}, "http_expired_token", False, True),
+    ({"expire": 1700000000.9}, "http_expired_token", False, True),
+    ({"expire": True}, "http_missing_expiry", False, False),
+    ({"expire": "1800000000"}, "http_missing_expiry", False, False),
+    ({}, "http_missing_expiry", False, False),
+])
+@pytest.mark.parametrize("nested", [False, True])
+def test_route_selection_and_logging_use_same_native_numbers(
+    monkeypatch, fields, expected, cloud, numeric, nested,
+):
+    monkeypatch.setattr(relay_module.time, "time", lambda: 1700000000)
+    token = {"session": fields} if nested else fields
+    playback = NativeRelayPlaybackSession(
+        replace(camera_config(), token=json.dumps(token)), APP_SESSION,
+    )
+    assert playback._http_token_reason() == expected
+    note = playback.transport_diagnostics
+    assert f"cloud_p2p={cloud}" in note
+    assert f"expiry_numeric={numeric}" in note
+    assert f"token_selection={expected or 'app_token'}" in note
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bootstrap", [False, True])
+async def test_initial_cloud_session_never_opens_ordinary_signaling(monkeypatch, bootstrap):
+    from unittest.mock import AsyncMock
+
+    config = camera_config()
+    token = json.loads(config.token)
+    token.update(isCloudSession=True, preconnect=True)
+    playback = NativeRelayPlaybackSession(
+        replace(config, token=json.dumps(token)), APP_SESSION,
+    )
+    connect = AsyncMock()
+    monkeypatch.setattr(playback, "_connect_mqtt", connect)
+    with pytest.raises(NativeRelayPlaybackError, match="server-managed"):
+        if bootstrap:
+            await playback._initialize_http_offer("trace")
+        else:
+            await playback._open_signaling("sdp", [], "trace", {}, {})
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_token_route_diagnostics_are_credential_free(nested):
+    config = camera_config()
+    token = json.loads(config.token)
+    target = token["session"] if nested else token
+    target["preconnect"] = True
+    config = replace(config, token=json.dumps(token))
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    note = playback.transport_diagnostics
+    assert "preconnect=True, offer_preconnect=True" in note
+    assert f"preconnect_source={'session' if nested else 'root'}" in note
+    assert "session_identity=generated_local" in note
+    for secret in (config.local_key, config.app_sid, config.app_uid,
+                   config.camera_password, token["session"]["sessionId"],
+                   token["session"]["icePassword"], token["session"]["aesKey"]):
+        assert secret not in note
 
 
 @pytest.mark.asyncio
@@ -1732,7 +1814,7 @@ def test_query_recordings_uses_apk_v3_catalog_when_advertised():
     assert struct.unpack_from("<5I", sent[0], 20) == (0, 2026, 9, 15, 0)
 
 
-@pytest.mark.parametrize("bootstrap", ["app-token", "expired", "missing", "early-answer"])
+@pytest.mark.parametrize("bootstrap", ["app-token", "expired", "missing", "early-answer", "cloud-number"])
 def test_connect_uses_mqtt_signaling_and_requires_direct_ice(monkeypatch, bootstrap):
     events = []
     captured = {}
@@ -1822,8 +1904,10 @@ def test_connect_uses_mqtt_signaling_and_requires_direct_ice(monkeypatch, bootst
     async def exercise():
         config = camera_config()
         if bootstrap != "app-token":
-            token = json.loads(config.token) if bootstrap == "expired" else {}
+            token = json.loads(config.token) if bootstrap in {"expired", "cloud-number"} else {}
             token["expire"] = 0
+            if bootstrap == "cloud-number":
+                token.update(expire=4102444800.0, skill={"cloudP2P": 1.0})
             info = json.loads(config.config_json)
             info["p2pConfig"] = token
             config = replace(config, token=json.dumps(token), config_json=json.dumps(info))
