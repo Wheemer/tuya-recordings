@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+import pytest
 
 
 from custom_components import tuya_recordings as integration
@@ -14,13 +15,18 @@ from custom_components.tuya_recordings.client import (
     camera_inventory_from_native_devices,
 )
 from custom_components.tuya_recordings.const import DOMAIN
-from custom_components.tuya_recordings.lib.commands import ON_DEMAND_OFFER_RETRIES
+from custom_components.tuya_recordings.lib.commands import (
+    ON_DEMAND_DAY_CATALOG,
+    ON_DEMAND_OFFER_RETRIES,
+)
 
 
-def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch):
+@pytest.mark.parametrize("media_sync", [False, True])
+def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch, media_sync):
     entry = SimpleNamespace(entry_id="target", title="Target", data={"native_app_session": {}}, options={})
     client = TuyaRecordingsClient({})
     other = TuyaRecordingsClient({})
+    client.media_sync_enabled = media_sync
     updates = {"device_protocol_versions": {"camera": "2.3"}}
     calls = []
 
@@ -28,6 +34,10 @@ def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch):
         calls.append("inventory")
         assert data["native_app_session"] == {}
         return updates
+
+    def refresh_recent():
+        assert ON_DEMAND_DAY_CATALOG.get() and ON_DEMAND_OFFER_RETRIES.get()
+        calls.append("catalog")
 
     async def refresh_catalog(hass, entry_id, reason, *, wait):
         assert (entry_id, reason, wait) == ("target", "service", True)
@@ -51,6 +61,7 @@ def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch):
         async_add_executor_job=execute,
     )
     monkeypatch.setattr(client, "refresh_inventory", refresh_inventory)
+    monkeypatch.setattr(client, "refresh_recent_recordings", refresh_recent)
     monkeypatch.setattr(integration, "_async_request_catalog_refresh", refresh_catalog)
     monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
     integration._async_register_services(hass)
@@ -66,7 +77,7 @@ def test_only_manual_catalog_service_enables_offer_resends(monkeypatch):
     observed = []
 
     def refresh(limit):
-        observed.append(ON_DEMAND_OFFER_RETRIES.get())
+        observed.append((ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get()))
         return {}
 
     async def execute(function, *args):
@@ -80,7 +91,93 @@ def test_only_manual_catalog_service_enables_offer_resends(monkeypatch):
     )
     for reason in ("catalog_cycle", "service", "catalog_cycle"):
         asyncio.run(integration._async_run_catalog_refresh(hass, "entry", reason))
-    assert observed == [False, True, False]
+    assert observed == [(False, False), (True, True), (False, False)]
+
+
+def test_manual_catalog_waits_for_scheduled_pass_then_runs_with_its_own_scope(monkeypatch):
+    import threading
+
+    client = TuyaRecordingsClient({})
+    observed = []
+    release = threading.Event()
+    data = {"client": client}
+    monkeypatch.setattr(integration, "_client_recording_backend_available", lambda _: True)
+    monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
+
+    async def scenario():
+        started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def refresh(limit):
+            observed.append((ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get()))
+            if len(observed) == 1:
+                loop.call_soon_threadsafe(started.set)
+                assert release.wait(3)
+            return {}
+
+        async def execute(function, *args):
+            return await asyncio.to_thread(function, *args)
+
+        monkeypatch.setattr(client, "refresh_background_catalog", refresh)
+        hass = SimpleNamespace(
+            data={DOMAIN: {"entry": data}}, async_add_executor_job=execute,
+            async_create_task=asyncio.create_task,
+        )
+        await integration._async_request_catalog_refresh(hass, "entry", "catalog_cycle")
+        scheduled = data[integration.DATA_CATALOG_REFRESH_TASK]
+        manual = None
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            manual = asyncio.create_task(
+                integration._async_request_catalog_refresh(hass, "entry", "service", wait=True)
+            )
+            await asyncio.sleep(0)
+            assert not manual.done() and not scheduled.cancelled()
+            assert observed == [(False, False)]
+        finally:
+            release.set()
+            await asyncio.wait_for(scheduled, 3)
+            if manual is not None:
+                await asyncio.wait_for(manual, 3)
+        assert integration.DATA_CATALOG_REFRESH_TASK not in data
+        await integration._async_request_catalog_refresh(hass, "entry", "catalog_cycle", wait=True)
+
+    asyncio.run(scenario())
+    assert observed == [(False, False), (True, True), (False, False)]
+
+
+def test_manual_catalog_logs_retained_backoff_without_a_new_camera_attempt(tmp_path, monkeypatch, caplog):
+    import logging
+    from datetime import datetime, timedelta, timezone
+    from custom_components.tuya_recordings.lib.commands import MANUAL_REFRESH_ID, manual_catalog_refresh
+
+    client = TuyaRecordingsClient(
+        {"device_inventory": {"camera": "Camera"}},
+        cache_path=tmp_path / "catalog.json",
+    )
+    now = datetime.now(timezone.utc)
+    client.set_camera_inventory({"camera": "Camera"})
+    client._camera_index_cache = {"cameras": [{
+        "devId": "camera", "clips": [],
+        "catalogErrorAt": now.isoformat(),
+        "catalogRetryAfter": (now + timedelta(minutes=5)).isoformat(),
+        "bridgeStatus": {"error": "old-error-not-a-new-attempt"},
+    }]}
+    monkeypatch.setattr(client, "_recordings_for_day", Mock(side_effect=AssertionError("unexpected camera request")))
+    caplog.set_level(logging.INFO, logger="custom_components.tuya_recordings")
+    token = MANUAL_REFRESH_ID.set("fixture-refresh")
+    try:
+        with manual_catalog_refresh():
+            result = client.refresh_background_catalog(1)
+    finally:
+        MANUAL_REFRESH_ID.reset(token)
+    assert result["cameras"][0]["bridgeStatus"]["error"] == "old-error-not-a-new-attempt"
+    assert "request_id=fixture-refresh" in caplog.text
+    assert "reason=cache_or_backoff retained_error=True" in caplog.text
+    assert "catalog query started" not in caplog.text
+    assert "catalog query failed" not in caplog.text
+    assert "old-error-not-a-new-attempt" not in caplog.text
+    assert MANUAL_REFRESH_ID.get() == "-"
 
 
 def test_runtime_uses_refreshed_pv_even_with_stale_options():

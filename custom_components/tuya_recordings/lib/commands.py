@@ -34,6 +34,7 @@ class Deadline:
 _WORK_CANCEL = ContextVar("tuya_camera_work_cancel", default=None)
 ON_DEMAND_DAY_CATALOG = ContextVar("tuya_on_demand_day_catalog", default=False)
 ON_DEMAND_OFFER_RETRIES = ContextVar("tuya_on_demand_offer_retries", default=False)
+MANUAL_REFRESH_ID = ContextVar("tuya_manual_refresh_id", default="-")
 
 
 @contextmanager
@@ -44,6 +45,17 @@ def on_demand_offer_retries():
         yield
     finally:
         ON_DEMAND_OFFER_RETRIES.reset(token)
+
+
+@contextmanager
+def manual_catalog_refresh():
+    """Carry explicit catalog wake permission through the executor and worker."""
+    token = ON_DEMAND_DAY_CATALOG.set(True)
+    try:
+        with on_demand_offer_retries():
+            yield
+    finally:
+        ON_DEMAND_DAY_CATALOG.reset(token)
 
 
 @contextmanager

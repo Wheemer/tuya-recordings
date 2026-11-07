@@ -68,6 +68,8 @@ from .lib.commands import (
     Deadline,
     camera_work_scope,
     ON_DEMAND_DAY_CATALOG,
+    ON_DEMAND_OFFER_RETRIES,
+    MANUAL_REFRESH_ID,
     on_demand_offer_retries,
 )
 from .lib.native_backend import RecordingBackend, RecordingBackendAuthError
@@ -128,6 +130,9 @@ def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) 
             "capability": wake if isinstance(wake := device.get("wakeCapability"), str)
             and wake in WAKE_CAPABILITIES else "unknown",
             "direct": device.get("wakeDirect") is True,
+            **({"evidence": device["sdWakeEvidence"]} if isinstance(device.get("sdWakeEvidence"), dict) else {}),
+            **({"detail_lookup": device["sdWakeDetailLookup"]} if isinstance(device.get("sdWakeDetailLookup"), str) else {}),
+            **({"home_lookup": device["sdWakeHomeLookup"]} if isinstance(device.get("sdWakeHomeLookup"), str) else {}),
             **({"sd_low_power": eligible} if type(eligible) is bool else {}),
             **({"sd_status_mqtt_dp": dp} if isinstance(dp := device.get("sdStatusMqttDp"), str) else {}),
             **({"sd_status_http_dp": dp} if isinstance(dp := device.get("sdStatusHttpDp"), str) else {}),
@@ -137,6 +142,7 @@ def camera_wake_capabilities_from_native_devices(devices: list[dict[str, Any]]) 
         } for device in devices
         if isinstance(dev_id := device.get("devId"), str) and dev_id in cameras
         and (type(eligible := device.get("sdLowPowerWake")) is bool
+             or isinstance(device.get("sdWakeEvidence"), dict)
              or isinstance(device.get("wakeCapability"), str))
     }
 
@@ -800,10 +806,28 @@ class TuyaRecordingsClient:
                 days = self.lookback_days if self.lookback_days > 0 else RECORDING_SCAN_MAX_DAYS
                 index = {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "cameras": cameras}
                 by_id = {camera["devId"]: camera for camera in cameras}
-                for dev_id, day in catalog_queries(cameras, today=today, now=now, days=days, limit=limit):
+                queries = catalog_queries(cameras, today=today, now=now, days=days, limit=limit)
+                request_id = MANUAL_REFRESH_ID.get()
+                log = LOGGER.info if request_id != "-" else LOGGER.debug
+                queried = {dev_id for dev_id, _ in queries}
+                for camera in cameras:
+                    if camera["devId"] not in queried:
+                        log(
+                            "Tuya Recordings catalog query skipped request_id=%s dev=%s reason=cache_or_backoff "
+                            "retained_error=%s last_error_at=%s retry_after=%s",
+                            request_id, camera["devId"], bool(camera.get("bridgeStatus", {}).get("error")),
+                            camera.get("catalogErrorAt", "none"), camera.get("catalogRetryAfter", "none"),
+                        )
+                for dev_id, day in queries:
                     if active.is_set():
                         raise CameraWorkCancelled("Recording catalog pass cancelled")
                     camera = by_id[dev_id]
+                    log(
+                        "Tuya Recordings catalog query started request_id=%s dev=%s day=%s "
+                        "wake_scope_enabled=%s offer_resend_enabled=%s",
+                        request_id, dev_id, day.isoformat(),
+                        ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get(),
+                    )
                     try:
                         clips = self._recordings_for_day(dev_id, day)
                         if active.is_set():
@@ -818,9 +842,17 @@ class TuyaRecordingsClient:
                         camera.pop("catalogErrorCount", None)
                         camera.pop("catalogRetryAfter", None)
                         camera["bridgeStatus"] = {"error": "", "listedCount": len(camera["clips"]), "daysChecked": sorted(camera["catalogDays"], reverse=True)}
+                        log(
+                            "Tuya Recordings catalog query succeeded request_id=%s dev=%s day=%s clips=%s",
+                            request_id, dev_id, day.isoformat(), len(clips),
+                        )
                     except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
                         raise
                     except Exception as error:
+                        LOGGER.exception(
+                            "Tuya Recordings catalog query failed request_id=%s dev=%s day=%s fresh_attempt=True",
+                            request_id, dev_id, day.isoformat(),
+                        )
                         failure_count, retry_after = next_catalog_retry_after(camera, now)
                         camera["catalogErrorAt"] = now.isoformat()
                         camera["catalogErrorCount"] = failure_count
@@ -885,6 +917,12 @@ class TuyaRecordingsClient:
                         raise RuntimeError("Smart Life APK-native recording catalog is not available")
                     remaining_days = list(recent_days)
                     while remaining_days:
+                        LOGGER.debug(
+                            "Tuya Recordings recent catalog query request_id=%s dev=%s days=%s "
+                            "wake_scope_enabled=%s offer_resend_enabled=%s",
+                            MANUAL_REFRESH_ID.get(), dev_id, [day.isoformat() for day in remaining_days],
+                            ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get(),
+                        )
                         queried = self._recordings_backend.recordings_for_days(
                             dev_id, {}, {}, remaining_days, cancel_event=cancellation,
                         )
@@ -898,9 +936,17 @@ class TuyaRecordingsClient:
                 except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
                     raise
                 except TuyaRecordingsApiError as exc:
+                    LOGGER.exception(
+                        "Tuya Recordings recent catalog query failed request_id=%s dev=%s fresh_attempt=True",
+                        MANUAL_REFRESH_ID.get(), dev_id,
+                    )
                     error = str(exc)
                     clips = previous_clips
                 except Exception as exc:
+                    LOGGER.exception(
+                        "Tuya Recordings recent catalog query failed request_id=%s dev=%s fresh_attempt=True",
+                        MANUAL_REFRESH_ID.get(), dev_id,
+                    )
                     error = str(exc)
                     clips = previous_clips
             cameras.append(
@@ -1646,6 +1692,14 @@ class TuyaRecordingsClient:
                 raise
             self._backend = replacement
             self.set_camera_inventory(updates[CONF_DEVICE_INVENTORY])
+            for dev_id, wake in updates[CONF_DEVICE_WAKE_CAPABILITIES].items():
+                LOGGER.info(
+                    "Tuya Recordings refreshed SD wake metadata request_id=%s dev=%s mqtt_pv=%s "
+                    "eligible=%s direct=%s home_lookup=%s detail_lookup=%s evidence=%s",
+                    MANUAL_REFRESH_ID.get(), dev_id, protocols.get(dev_id, "unknown"),
+                    wake.get("sd_low_power"), wake["direct"], wake.get("home_lookup", "not_needed"),
+                    wake.get("detail_lookup", "not_needed"), wake.get("evidence", {}),
+                )
             return updates
 
     def _camera_devices(self) -> list[dict[str, Any]]:

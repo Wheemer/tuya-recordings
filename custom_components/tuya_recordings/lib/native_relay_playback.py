@@ -297,6 +297,8 @@ class NativeRelayPlaybackSession:
             f"offer_retries={self._offer_retries}, "
             f"http_initialized={self._http_initialized}, phase={self._connect_phase}, "
             f"mode={self._connect_mode}, elapsed_seconds={elapsed}, "
+            f"wake_scope_enabled={self._on_demand_catalog}, "
+            f"offer_resend_enabled={self._on_demand_catalog or self._retry_mqtt_offer}, "
             f"app_profile={config.app_profile_id}, bootstrap_api_version={api_version}, "
             f"p2p_type={config.p2p_type}, p2p_policy={config.p2p_policy}, "
             f"mqtt_pv={config.mqtt_protocol_version or 'unknown'}, "

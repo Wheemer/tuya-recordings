@@ -6,6 +6,7 @@ import logging
 import time
 from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import voluptuous as vol
 from homeassistant.components import frontend as ha_frontend
@@ -52,7 +53,7 @@ from .http import (
     TuyaRecordingsThumbnailView,
     TuyaRecordingsTimelineView,
 )
-from .lib.commands import CameraWorkBusy, CameraWorkCancelled, on_demand_offer_retries
+from .lib.commands import CameraWorkBusy, CameraWorkCancelled, MANUAL_REFRESH_ID, manual_catalog_refresh
 from .lib.native_setup import NativeBackendSetupError, native_app_session
 
 CONF_ENTRY_ID = "entry_id"
@@ -64,6 +65,7 @@ SERVICE_SYNC_MEDIA = "sync_media"
 SERVICE_POPULATE_THUMBNAILS = "populate_thumbnails"
 DATA_CAMERA_WORK_TASK = "camera_work_task"
 DATA_CATALOG_REFRESH_TASK = "catalog_refresh_task"
+DATA_MANUAL_REFRESH_LOCK = "manual_refresh_lock"
 DATA_MEDIA_SYNC_RUNNING = "media_sync_running"
 DATA_MEDIA_SYNC_PENDING = "media_sync_pending"
 DATA_MEDIA_SYNC_SCHEDULE = "media_sync_schedule"
@@ -390,21 +392,63 @@ def _async_register_services(hass: HomeAssistant) -> None:
             if _entry_cloud_paused(entry_data):
                 _LOGGER.info("Skipping Tuya Recordings refresh because camera activity is paused")
                 continue
+            request_token = None
+            started = time.monotonic()
             try:
-                client = entry_data["client"]
-                entry = entry_data["entry"]
-                if CONF_NATIVE_APP_SESSION in getattr(entry, "data", {}):
-                    updates = await hass.async_add_executor_job(client.refresh_inventory, _entry_runtime_data(entry))
-                    hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
-                if client.media_sync_enabled:
-                    await hass.async_add_executor_job(on_demand_offer_retries()(client.refresh_recent_recordings))
-                else:
-                    await _async_request_catalog_refresh(
-                        hass, entry_data["entry"].entry_id, "service", wait=True
+                lock = entry_data.setdefault(DATA_MANUAL_REFRESH_LOCK, asyncio.Lock())
+                if lock.locked():
+                    _LOGGER.info("Tuya Recordings manual refresh is already running")
+                    continue
+                async with lock:
+                    request_token = MANUAL_REFRESH_ID.set(uuid4().hex[:12])
+                    _LOGGER.info(
+                        "Tuya Recordings manual refresh started request_id=%s",
+                        MANUAL_REFRESH_ID.get(),
                     )
+                    task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
+                    if task is not None and not task.done():
+                        _LOGGER.info(
+                            "Tuya Recordings manual refresh waiting for existing catalog pass request_id=%s",
+                            MANUAL_REFRESH_ID.get(),
+                        )
+                        await asyncio.shield(task)
+                    if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or _entry_cloud_paused(entry_data):
+                        _LOGGER.info(
+                            "Tuya Recordings manual refresh deferred request_id=%s reason=playback_or_pause",
+                            MANUAL_REFRESH_ID.get(),
+                        )
+                        continue
+                    client = entry_data["client"]
+                    entry = entry_data["entry"]
+                    if CONF_NATIVE_APP_SESSION in getattr(entry, "data", {}):
+                        updates = await hass.async_add_executor_job(client.refresh_inventory, _entry_runtime_data(entry))
+                        hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
+                    if client.media_sync_enabled:
+                        await hass.async_add_executor_job(manual_catalog_refresh()(client.refresh_recent_recordings))
+                    else:
+                        await _async_request_catalog_refresh(
+                            hass, entry_data["entry"].entry_id, "service", wait=True
+                        )
             except TuyaRecordingsAuthError as exc:
+                _LOGGER.warning(
+                    "Tuya Recordings manual refresh needs reauthentication request_id=%s",
+                    MANUAL_REFRESH_ID.get(),
+                )
                 entry_data["entry"].async_start_reauth(hass)
                 raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
+            except Exception as exc:
+                _LOGGER.error(
+                    "Tuya Recordings manual refresh failed request_id=%s error_type=%s",
+                    MANUAL_REFRESH_ID.get(), type(exc).__name__,
+                )
+                raise
+            finally:
+                if request_token is not None:
+                    _LOGGER.info(
+                        "Tuya Recordings manual refresh finished request_id=%s elapsed_seconds=%.2f",
+                        MANUAL_REFRESH_ID.get(), time.monotonic() - started,
+                    )
+                    MANUAL_REFRESH_ID.reset(request_token)
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
 
     async def clear_cache(call) -> None:
@@ -559,6 +603,13 @@ async def _async_request_catalog_refresh(
         return
 
     task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
+    if reason == "service" and task is not None and not task.done():
+        # A scheduled pass has no foreground wake permission. Finish it first;
+        # never promote, cancel, or mistake it for the user's manual request.
+        await asyncio.shield(task)
+        if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:
+            return
+        return await _async_request_catalog_refresh(hass, entry_id, reason, wait=wait)
     if task is None or task.done():
         task = hass.async_create_task(_async_run_catalog_refresh(hass, entry_id, reason))
         entry_data[DATA_CATALOG_REFRESH_TASK] = task
@@ -577,9 +628,14 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
             return
         refresh = client.refresh_background_catalog
         if reason == "service":
-            refresh = on_demand_offer_retries()(refresh)
+            refresh = manual_catalog_refresh()(refresh)
         result = await hass.async_add_executor_job(refresh, CATALOG_SYNC_DAYS_PER_PASS)
-        _LOGGER.info("Tuya Recordings catalog refresh result for %s via %s: %s", entry_id, reason, result)
+        cameras = result.get("cameras", []) if isinstance(result, dict) else []
+        _LOGGER.info(
+            "Tuya Recordings catalog pass finished entry=%s source=%s request_id=%s cameras=%s failures=%s",
+            entry_id, reason, MANUAL_REFRESH_ID.get(), len(cameras),
+            sum(bool(camera.get("bridgeStatus", {}).get("error")) for camera in cameras),
+        )
         if not client.cloud_activity_paused:
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)
     except (CameraWorkBusy, CameraWorkCancelled):
@@ -589,7 +645,7 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
             entry_data["entry"].async_start_reauth(hass)
         raise ConfigEntryAuthFailed("Tuya Recordings session expired") from exc
     finally:
-        if entry_data.get(DATA_CATALOG_REFRESH_TASK) is not None:
+        if entry_data.get(DATA_CATALOG_REFRESH_TASK) is asyncio.current_task():
             entry_data.pop(DATA_CATALOG_REFRESH_TASK, None)
 
 

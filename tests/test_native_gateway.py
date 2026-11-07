@@ -251,6 +251,10 @@ def test_device_connection_data_extracts_apk_mqtt_protocol(monkeypatch):
         "category": "",
         "productId": "",
         "online": None,
+        "sdWakeEvidence": {
+            "source": "group", "route": "missing", "provider_two": None,
+            "dp149": "missing", "sd_status_schema": False,
+        },
     }]
 
 
@@ -440,6 +444,19 @@ def test_inventory_only_fetches_details_for_unresolved_cameras(monkeypatch, prof
     assert evidence["group"] == ((True, True) if refresh else (None, None))
     assert evidence["home"] == ((False, False) if refresh else (None, None))
     assert evidence["missing"] == (None, None)
+    rows = {item["devId"]: item for item in inventory}
+    if refresh:
+        assert rows["group"]["sdWakeEvidence"] == {
+            "source": "detail", "route": "direct", "provider_two": True,
+            "dp149": "present", "sd_status_schema": False,
+        }
+        assert rows["home"]["sdWakeEvidence"]["route"] == "hub"
+        assert rows["missing"]["sdWakeEvidence"]["provider_two"] is None
+        assert rows["missing"]["sdWakeEvidence"]["dp149"] == "missing"
+        assert rows["wrong-device"]["sdWakeDetailLookup"] == "invalid_device"
+        assert rows["wrong-product"]["sdWakeDetailLookup"] == "product_mismatch"
+        assert rows["unavailable"]["sdWakeDetailLookup"] == "failed"
+        assert "fixture-key" not in json.dumps([item["sdWakeEvidence"] for item in inventory])
 
 
 @pytest.mark.parametrize("homes", [None, {}, "invalid"])
