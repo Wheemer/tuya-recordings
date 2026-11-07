@@ -84,6 +84,41 @@ def test_catalog_failure_is_backed_off_per_camera_without_blocking_others():
     assert cameras["camera-with-recordings"]["clips"][0]["start"] == 100
 
 
+def test_sd_status_timeout_skips_remaining_days_without_blocking_other_cameras(monkeypatch, tmp_path, caplog):
+    import logging
+    import custom_components.tuya_recordings.client as client_module
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    commands = CameraCommandQueue()
+    monkeypatch.setattr(client_module, "CAMERA_COMMANDS", commands)
+    calls = []
+
+    class Backend(PerCameraCatalogBackend):
+        def recordings_for_day(self, dev_id, config, auth, day):
+            calls.append((dev_id, day))
+            if dev_id == "camera-without-recordings":
+                commands.reserve_wake(dev_id)
+                commands.mark_wake_report_missing(dev_id)
+                raise RuntimeError("Camera did not report SD status after wake")
+            return super().recordings_for_day(dev_id, config, auth, day)
+
+    client = TuyaRecordingsClient(
+        {}, recordings_backend=Backend(), cache_path=tmp_path / "index.json",
+    )
+    client.lookback_days = 2
+    client.set_camera_inventory({
+        "camera-without-recordings": "Timed out", "camera-with-recordings": "Working",
+    })
+    caplog.set_level(logging.DEBUG, logger="custom_components.tuya_recordings")
+    index = client.refresh_background_catalog(limit=4)
+    assert [dev for dev, day in calls].count("camera-without-recordings") == 1
+    assert [dev for dev, day in calls].count("camera-with-recordings") == 2
+    cameras = {camera["devId"]: camera for camera in index["cameras"]}
+    assert cameras["camera-without-recordings"]["catalogErrorCount"] == 1
+    assert len(cameras["camera-with-recordings"]["catalogDays"]) == 2
+    assert "reason=sd_status_timeout_cooldown fresh_attempt=False" in caplog.text
+
+
 def test_thumbnail_failure_cools_down_only_that_camera(monkeypatch, tmp_path):
     client = TuyaRecordingsClient(
         {}, media_storage_path=tmp_path, recordings_backend=FakeAvailableBackend()

@@ -19,6 +19,7 @@ class SdpAnswer:
     ice_ufrag: str
     ice_password: str
     aes_key: bytes
+    candidates: tuple[str, ...] = ()
 
 
 def parse_answer(sdp: str) -> SdpAnswer:
@@ -26,6 +27,7 @@ def parse_answer(sdp: str) -> SdpAnswer:
     ice_ufrag = ""
     ice_password = ""
     aes_key = b""
+    candidates = []
     for raw_line in sdp.splitlines():
         line = raw_line.rstrip("\r")
         if line.startswith(_UFRAG_PREFIX):
@@ -39,9 +41,11 @@ def parse_answer(sdp: str) -> SdpAnswer:
                 raise TuyaIpcP2pProtocolError(
                     "Failed to parse answer: invalid AES key encoding"
                 ) from None
+        elif line.startswith("a=candidate:") and len(line) <= 1024 and len(candidates) < 64:
+            candidates.append(line)
     if not ice_ufrag or not ice_password or len(aes_key) != MEDIA_KEY_SIZE:
         raise TuyaIpcP2pProtocolError(
             f"Failed to parse answer: ufrag={bool(ice_ufrag)} pwd={bool(ice_password)}"
             f" keylen={len(aes_key)}"
         )
-    return SdpAnswer(ice_ufrag=ice_ufrag, ice_password=ice_password, aes_key=aes_key)
+    return SdpAnswer(ice_ufrag=ice_ufrag, ice_password=ice_password, aes_key=aes_key, candidates=tuple(candidates))

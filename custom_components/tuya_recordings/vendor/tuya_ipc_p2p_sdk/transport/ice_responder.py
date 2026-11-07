@@ -8,10 +8,10 @@ produces a role conflict the device never resolves: it opens the video
 conversation, sends the first frames, and tears the session down with
 ``close_reason=6`` seconds later.
 
-So this agent takes the controlled role: it binds a socket, publishes its host
-candidate and answers the device's binding requests. It never sends checks of
-its own. Once the device nominates the pair, authenticated KCP can flow over
-that direct path while the TCP relay remains available in parallel.
+This agent remains controlled: it publishes its host candidate, consumes peer
+candidates and sends authenticated controlled-role checks. Only the camera's
+authenticated nomination opens the direct KCP media path. Candidate checks
+are bounded and have no detached retry timer; cloud relay remains disabled.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import ipaddress
+import secrets
 import socket
 from typing import TYPE_CHECKING
 from zlib import crc32
@@ -149,6 +151,61 @@ class IceResponder(asyncio.DatagramProtocol):
         self._received_segments = 0
         self._authentication_failures = 0
         self._nominated = asyncio.Event()
+        self._remote_credentials: tuple[str, str] | None = None
+        self._remote_candidates: set[tuple[str, int]] = set()
+        self._checked_candidates: set[tuple[str, int]] = set()
+        self._tie_breaker = secrets.token_bytes(8)
+        self._closed = False
+
+    def set_remote_credentials(self, ufrag: str, password: str) -> None:
+        """Install peer credentials before processing its candidate checklist."""
+        if self._closed:
+            return
+        self._remote_credentials = (ufrag, password)
+        self._check_remote_candidates()
+
+    def add_remote_candidate(self, candidate: str) -> None:
+        """Accept bounded component-1 UDP direct candidates, as the native parser does."""
+        if self._closed or len(candidate) > 1024 or len(self._remote_candidates) >= 64:
+            return
+        fields = candidate.strip().removeprefix("a=").split()
+        if (len(fields) < 8 or not fields[0].startswith("candidate:")
+                or fields[1] != "1" or fields[2].lower() != "udp"
+                or fields[6] != "typ" or fields[7] not in {"host", "srflx", "prflx"}):
+            return
+        try:
+            address = ipaddress.IPv4Address(fields[4])
+            port = int(fields[5])
+            priority = int(fields[3])
+        except ValueError:
+            return
+        if (not 0 < port < 65536 or not 0 <= priority < 2**32
+                or address.is_unspecified or address.is_multicast or address.is_loopback
+                or str(address) == "255.255.255.255"):
+            return
+        self._remote_candidates.add((str(address), port))
+        self._check_remote_candidates()
+
+    def _check_remote_candidates(self) -> None:
+        if self._transport is None or self._remote_credentials is None or not self._local_ufrag:
+            return
+        if self._nominated.is_set():
+            return
+        ufrag, password = self._remote_credentials
+        for endpoint in self._remote_candidates - self._checked_candidates:
+            # Remain ICE-controlled: only the camera may nominate a pair.
+            body = _attribute(6, f"{ufrag}:{self._local_ufrag}".encode())
+            body += _attribute(0x24, _HOST_CANDIDATE_PRIORITY.to_bytes(4, "big"))
+            body += _attribute(0x8029, self._tie_breaker)
+            message = bytearray(
+                b"\x00\x01" + (len(body) + 24).to_bytes(2, "big")
+                + _STUN_MAGIC_COOKIE.to_bytes(4, "big") + secrets.token_bytes(12) + body
+            )
+            message += _attribute(8, hmac_sha1(password.encode(), bytes(message)))
+            message[2:4] = (len(message) - 20 + 8).to_bytes(2, "big")
+            message += _attribute(0x8028, (crc32(message) ^ _FINGERPRINT_XOR).to_bytes(4, "big"))
+            self._checked_candidates.add(endpoint)
+            self._transport.sendto(bytes(message), endpoint)
 
     def _binding_request(self, data: bytes) -> bool | None:
         """Authenticate a complete STUN request; return its nomination flag."""
@@ -196,12 +253,15 @@ class IceResponder(asyncio.DatagramProtocol):
 
     async def async_gather(self) -> None:
         """Bind the socket and publish the host candidate it listens on."""
+        if self._closed:
+            raise RuntimeError("ICE responder is closed")
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
             lambda: self,
             local_addr=("0.0.0.0", 0),  # noqa: S104
         )
         self._transport = transport
+        self._check_remote_candidates()
         port = transport.get_extra_info("sockname")[1]
         self._on_candidate(candidate_line(local_address(), int(port)))
 
@@ -271,7 +331,8 @@ class IceResponder(asyncio.DatagramProtocol):
         return (
             f"bindings={self._binding_requests}, nominated={self._remote is not None}, "
             f"segments={self._received_segments}, "
-            f"auth_failures={self._authentication_failures}"
+            f"auth_failures={self._authentication_failures}, "
+            f"remote_candidates={len(self._remote_candidates)}, checks_sent={len(self._checked_candidates)}"
         )
 
     def error_received(self, exc: Exception) -> None:
@@ -280,8 +341,12 @@ class IceResponder(asyncio.DatagramProtocol):
 
     def close(self) -> None:
         """Release the socket."""
+        self._closed = True
         transport = self._transport
         self._transport = None
+        self._remote_candidates.clear()
+        self._checked_candidates.clear()
+        self._remote_credentials = None
         if transport is not None:
             with contextlib.suppress(Exception):
                 transport.close()

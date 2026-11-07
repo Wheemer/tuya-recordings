@@ -113,6 +113,7 @@ class NativeCameraSessionConfig:
     sd_status_http_dp: str = ""
     sd_status_lan_dp: str = ""
     sd_status_lan_error_route: str = ""
+    sd_status_mqtt_capable: bool = False
 
     @property
     def username(self) -> str:
@@ -432,6 +433,7 @@ def normalize_camera_info(
     sd_status_http_dp: str = "",
     sd_status_lan_dp: str = "",
     sd_status_lan_error_route: str = "",
+    sd_status_mqtt_capable: bool = False,
 ) -> NativeCameraSessionConfig:
     """Convert the app API `CameraInfoBean` shape into native connect inputs."""
     if not isinstance(camera_info, dict):
@@ -479,6 +481,7 @@ def normalize_camera_info(
         sd_status_http_dp=sd_status_http_dp,
         sd_status_lan_dp=sd_status_lan_dp,
         sd_status_lan_error_route=sd_status_lan_error_route,
+        sd_status_mqtt_capable=sd_status_mqtt_capable,
     ).validate()
 
 

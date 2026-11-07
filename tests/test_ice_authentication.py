@@ -46,3 +46,38 @@ def test_authenticated_media_from_other_address_is_not_delivered():
         responder.datagram_received(wire, responder._remote)
         assert delivered == [segment]
     asyncio.run(run())
+
+
+def test_remote_candidate_checks_are_authenticated_controlled_and_bounded():
+    async def run():
+        sent = []
+        responder = ice.IceResponder("local-secret", lambda _: None, local_ufrag="local")
+        responder._transport = SimpleNamespace(sendto=lambda *args: sent.append(args), close=lambda: None)
+        candidate = "a=candidate:1 1 UDP 1234 192.0.2.1 2345 typ host"
+        responder.add_remote_candidate(candidate)
+        assert sent == []
+        responder.set_remote_credentials("camera", "camera-secret")
+        assert len(sent) == 1 and sent[0][1] == ("192.0.2.1", 2345)
+        wire = sent[0][0]
+        peer = ice.IceResponder("camera-secret", lambda _: None, local_ufrag="camera")
+        assert peer._binding_request(wire) is False
+        assert ice._attribute(0x8029, responder._tie_breaker) in wire
+        assert not responder._nominated.is_set() and responder._remote is None
+        responder.add_remote_candidate(candidate)
+        for invalid in (
+            candidate.replace(" 1 UDP ", " 2 UDP "),
+            candidate.replace(" UDP ", " TCP "),
+            candidate.replace("typ host", "typ relay"),
+            candidate.replace("2345", "99999"),
+            candidate.replace("192.0.2.1", "127.0.0.1"),
+        ):
+            responder.add_remote_candidate(invalid)
+        assert len(sent) == 1
+        for port in range(3000, 3100):
+            responder.add_remote_candidate(f"a=candidate:1 1 udp 1234 192.0.2.1 {port} typ host")
+        assert len(sent) == 64
+        responder.close()
+        responder.add_remote_candidate(candidate)
+        responder.set_remote_credentials("camera", "camera-secret")
+        assert len(sent) == 64 and responder._remote_candidates == set()
+    asyncio.run(run())
