@@ -35,7 +35,6 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   let activeSegmentGeneration = -1;
   let expectedTimelinePosition = null;
   let discardSegment = false;
-  let clipEndTimer = null;
   let waitingTimer = null;
   let lastPlaybackProgress = 0;
   let playingReportedRevision = -1;
@@ -114,8 +113,6 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   const release = () => {
     releasing = true;
     setLoading(false);
-    if (clipEndTimer !== null) clearTimeout(clipEndTimer);
-    clipEndTimer = null;
     if (waitingTimer !== null) clearTimeout(waitingTimer);
     waitingTimer = null;
     streamController?.abort();
@@ -168,16 +165,18 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   const pause = () => {
     if (disposed || releasing || !active()) return;
     if (continuous && paused) return;
-    offset = position();
     paused = true;
-    revision++;
     if (continuous && isControlledStream && timelineSocket?.readyState === WebSocket.OPEN) {
+      // Retain both the reader revision and its media-time origin. Only a
+      // replacement stream owns a new revision and a rebased offset.
       timelineSocket.send(JSON.stringify({ action: 'pause' }));
       video.pause();
       audioContext?.suspend().catch(() => {});
       status.textContent = 'Paused';
       return;
     }
+    offset = position();
+    revision++;
     release();
     status.textContent = 'Paused';
   };
@@ -798,10 +797,6 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     requestAnimationFrame(() => requestAnimationFrame(() => {
       if (!disposed) video.parentElement.classList.remove('camera-player--switching');
     }));
-    if (isControlledStream && !continuous && clipEndTimer === null) {
-      const remainingMs = Math.max(0, (clip.duration - position()) * 1000);
-      clipEndTimer = setTimeout(finishPlayback, remainingMs + 100);
-    }
     if (playingReportedRevision !== revision) {
       playingReportedRevision = revision;
       debug('playing');
@@ -919,11 +914,7 @@ function inferTimestampScale(items, sampleRate, channels) {
 }
 
 function once(target, event, signal) {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(new DOMException('Playback cancelled', 'AbortError'));
-    target.addEventListener(event, resolve, signal ? { once: true, signal } : { once: true });
-    signal?.addEventListener('abort', abort, { once: true });
-  });
+  return waitForMediaEvent(target, event, signal);
 }
 
 function openWebSocket(socket, signal) {
@@ -938,13 +929,24 @@ function openWebSocket(socket, signal) {
 }
 
 function appendBuffer(sourceBuffer, payload, signal) {
+  return waitForMediaEvent(sourceBuffer, 'updateend', signal, () => sourceBuffer.appendBuffer(payload));
+}
+
+function waitForMediaEvent(target, event, signal, start = null) {
   return new Promise((resolve, reject) => {
-    const abort = () => reject(new DOMException('Playback cancelled', 'AbortError'));
-    const error = () => reject(new Error('Browser rejected the H.264 stream'));
-    sourceBuffer.addEventListener('updateend', resolve, { once: true, signal });
-    sourceBuffer.addEventListener('error', error, { once: true, signal });
-    signal.addEventListener('abort', abort, { once: true });
-    sourceBuffer.appendBuffer(payload);
+    const cleanup = () => {
+      target.removeEventListener(event, done);
+      target.removeEventListener('error', failed);
+      signal?.removeEventListener('abort', abort);
+    };
+    const done = value => { cleanup(); resolve(value); };
+    const failed = () => { cleanup(); reject(new Error('Browser rejected the media stream')); };
+    const abort = () => { cleanup(); reject(new DOMException('Playback cancelled', 'AbortError')); };
+    if (signal?.aborted) { abort(); return; }
+    target.addEventListener(event, done);
+    target.addEventListener('error', failed);
+    signal?.addEventListener('abort', abort);
+    try { start?.(); } catch (error) { cleanup(); reject(error); }
   });
 }
 

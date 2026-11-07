@@ -1,6 +1,23 @@
 # Changelog
 
-## Tuya Recordings v0.4.13-7 (unreleased)
+## Tuya Recordings v0.4.13-8 (2026-11-07)
+
+### Connection
+
+- Receive native connection answers over both MQTT and LAN, following the listener registration in both Smart Life and Tuya Smart APKs. Keep the SD-status LAN socket open for the answer instead of closing it before the offer.
+- Separate LAN answer listening from low-power wake eligibility, and allow a usable LAN offer to proceed when its optional MQTT answer subscription is unavailable.
+- Prefer refreshed communication protocol metadata and discard obsolete SD-status routes when device details change.
+- Block replacement camera sessions when the previous transport has not closed cleanly.
+- Add live LAN reply diagnostics, including reader state, session mismatches, and answer source, without logging credentials or media payloads.
+
+### Playback
+
+- Fix pause, resume, and subsequent timeline seeks while retaining the same player and camera session. Correct timeline position after pausing.
+- Retrieve all pages of legacy detection catalogs instead of stopping after the first page.
+- Wait for stream producers to finish during cancellation and early HTTP errors, and release media-event listeners after each completed operation.
+- Finish finite clips according to media progress rather than elapsed wall time, so buffering does not cut playback short.
+
+## Tuya Recordings v0.4.13-7 (2026-11-07)
 
 ### Fixes
 

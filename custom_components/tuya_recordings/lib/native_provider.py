@@ -92,6 +92,7 @@ class NativeAppCameraConfigProvider:
             sd_status_lan_dp = wake.get("sd_status_lan_dp") if isinstance(wake, dict) else None
             lan_error_route = wake.get("sd_status_lan_error_route") if isinstance(wake, dict) else None
             mqtt_capable = isinstance(wake, dict) and wake.get("sd_status_mqtt_capable") is True
+            lan_capable = isinstance(wake, dict) and wake.get("lan_signaling_capable") is True
             if isinstance(wake, dict):
                 wake = wake.get("capability")
             config = normalize_camera_info(
@@ -106,6 +107,7 @@ class NativeAppCameraConfigProvider:
                 mqtt_protocol_version=self.protocol_version_lookup(dev_id),
                 wake_capability=wake if isinstance(wake, str) and wake in WAKE_CAPABILITIES else "unknown",
                 wake_direct=direct,
+                lan_signaling_capable=lan_capable,
                 sd_low_power_wake=sd_low_power if type(sd_low_power) is bool else None,
                 sd_status_mqtt_dp=sd_status_dp if isinstance(sd_status_dp, str) else "",
                 sd_status_http_dp=sd_status_http_dp if isinstance(sd_status_http_dp, str) else "",

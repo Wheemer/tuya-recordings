@@ -52,6 +52,7 @@ class Lan302Client:
         preconnect: bool,
         security_level: int,
         moto_id: str = "",
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         self._uid = uid
         self._device_id = device_id
@@ -61,6 +62,7 @@ class Lan302Client:
         self._on_answer = on_answer
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
+        self._on_failure = on_failure
         self._preconnect = bool(preconnect)
         self._security_level = security_level
         self._device: Any | None = None
@@ -70,12 +72,35 @@ class Lan302Client:
         self._offer_attempted = False
         self._query_state = "not_sent"
         self._query_protocol = "unselected"
+        self._reader_state = "not_started"
+        self._session_mismatches = 0
+        self._received_messages = 0
+        self._invalid_messages = 0
+        self._signals: dict[str, int] = {}
 
     @property
     def diagnostics(self) -> str:
         """Describe the local query without keys, addresses or DP values."""
         version = getattr(self._device, "version", "unknown")
-        return f"version={version}, query_protocol={self._query_protocol}, query_state={self._query_state}"
+        return (f"version={version}, query_protocol={self._query_protocol}, query_state={self._query_state}, "
+                f"reader={self._reader_state}, received={self._received_messages}, "
+                f"invalid_shape={self._invalid_messages}, session_mismatches={self._session_mismatches}, "
+                f"signals={self._signals or 'none'}")
+
+    def configure_offer_metadata(self, *, moto_id: str, security_level: int, preconnect: bool) -> None:
+        """Reuse the established device socket for a native LAN offer."""
+        self._moto_id = moto_id
+        self._security_level = security_level
+        self._preconnect = preconnect
+
+    async def async_listen(self) -> None:
+        """Read IPC_LAN_302 replies without sending an offer or another query."""
+        async with self._lock:
+            if self._closed or self._device is None:
+                raise NativeLanUnavailableError("LAN answer listener needs an open socket")
+            if self._reader is None:
+                self._reader_state = "listening"
+                self._reader = asyncio.create_task(self._read_messages())
 
     async def async_connect(self) -> None:
         """Discover the single configured device and open one local socket."""
@@ -118,8 +143,7 @@ class Lan302Client:
         )
         self._offer_attempted = True
         await self._async_send(message)
-        if self._reader is None:
-            self._reader = asyncio.create_task(self._read_messages())
+        await self.async_listen()
 
     async def async_query_direct_dp(self, dp: str) -> int:
         """Send one CONTROL query on a socket not yet used for signaling."""
@@ -164,15 +188,22 @@ class Lan302Client:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    self._on_disconnect(0)
+                    self._reader_failed("receive_failed")
                     return
             if _is_device_error(message):
-                self._on_disconnect(0)
+                self._reader_failed("device_error")
                 return
             dispatched = self._dispatch(message)
             # TinyTuya may return immediately on an empty/error response.
             # Do not turn that into an executor busy loop.
             await asyncio.sleep(0.01 if dispatched else 0.1)
+
+    def _reader_failed(self, reason: str) -> None:
+        self._reader_state = reason
+        if self._on_failure is not None:
+            self._on_failure(reason)
+        else:
+            self._on_disconnect(0)
 
     async def async_send_candidate(self, candidate: str) -> None:
         await self._async_send(
@@ -194,6 +225,7 @@ class Lan302Client:
 
     async def async_close(self) -> None:
         self._closed = True
+        self._reader_state = "closed"
         if self._reader is not None:
             self._reader.cancel()
             await asyncio.gather(self._reader, return_exceptions=True)
@@ -349,15 +381,23 @@ class Lan302Client:
         return result
 
     def _dispatch(self, message: dict[str, Any] | None) -> bool:
+        if message is None:
+            return False
+        self._received_messages += 1
         if not isinstance(message, dict):
+            self._invalid_messages += 1
             return False
         header = message.get("header")
         body = message.get("msg")
         if not isinstance(header, dict) or not isinstance(body, dict):
+            self._invalid_messages += 1
             return False
-        if header.get("sessionid") not in (None, "", self._session_id):
+        if header.get("sessionid") != self._session_id:
+            self._session_mismatches += 1
             return False
         message_type = header.get("type")
+        bucket = message_type if message_type in ("answer", "candidate", "disconnect") else "other"
+        self._signals[bucket] = self._signals.get(bucket, 0) + 1
         if message_type == "answer" and isinstance(body.get("sdp"), str):
             self._on_answer(body["sdp"])
             return True

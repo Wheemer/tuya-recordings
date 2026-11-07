@@ -176,6 +176,14 @@ class NativeRelayPlaybackSession:
         self._control_decoder = NativeSimpleCommandDecoder()
         self._moto: MotoClient | Lan302Client | None = None
         self._status_lan: Lan302Client | None = None
+        self._answer_lan: Lan302Client | None = None
+        self._answer_mqtt: MotoClient | None = None
+        self._lan_answers_alive = False
+        self._mqtt_answers_alive = False
+        self._answer_source = "none"
+        self._duplicate_answers = 0
+        self._answer_channel_failures: dict[str, str] = {}
+        self._lan_answer_attempted = False
         self._signaling_path = "unconnected"
         self._lan_status = "not_attempted"
         self._offer_status = "not_sent"
@@ -256,6 +264,7 @@ class NativeRelayPlaybackSession:
         ice = self._ice
         session_status = session.diagnostics if session is not None else "unavailable"
         ice_status = ice.diagnostics if ice is not None else "unavailable"
+        lan_answers = self._answer_lan or (self._moto if self._signaling_path == "lan" else None)
         wake_status = self._wake_status
         if wake_status == "sent_unconfirmed" and getattr(self._moto, "low_power_wake_confirmed", False):
             wake_status = "confirmed"
@@ -306,6 +315,10 @@ class NativeRelayPlaybackSession:
             f"signaling_details=({getattr(self._moto, 'diagnostics', 'unavailable')}), "
             f"sd_lan_details=({getattr(self._status_lan, 'diagnostics', self._sd_status_lan_details)}), "
             f"sd_preparation_signaling=({self._sd_status_signaling_details}), "
+            f"answer_channels=(mqtt={self._mqtt_answers_alive}, lan={self._lan_answers_alive}, "
+            f"source={self._answer_source}, duplicates={self._duplicate_answers}, "
+            f"failures={self._answer_channel_failures}), "
+            f"lan_answer_details=({getattr(lan_answers, 'diagnostics', 'not_open')}), "
             f"lan={self._lan_status}, offer={self._offer_status}, "
             "offer_delivery=unconfirmed, "
             f"answer={self._answer_status}, "
@@ -479,21 +492,28 @@ class NativeRelayPlaybackSession:
                 self._sd_status_signaling_details = getattr(status_moto, "diagnostics", "unavailable")
                 if getattr(status_moto, "low_power_wake_confirmed", False):
                     self._wake_status = "confirmed"
-                if not await _bounded_cleanup(status_moto.async_close()):
-                    raise NativeRelayPlaybackError("SD preparation MQTT cleanup timed out")
+                self._answer_mqtt = status_moto
                 self._moto = None
-            lan = Lan302Client(
+            lan = self._answer_lan or Lan302Client(
                 uid=self._uid,
                 device_id=self._stream_config.device_id,
                 session_id=self._stream_config.p2p_session.session_id,
                 local_key=self._stream_config.local_key,
-                on_answer=self._on_answer,
+                on_answer=lambda sdp: self._on_answer(sdp, source="lan"),
                 on_candidate=self._on_remote_candidate,
                 on_disconnect=self._on_disconnect,
                 preconnect=bool(self._native_config.preconnect),
                 security_level=self._native_config.p2p_security_level,
                 moto_id=self._stream_config.moto_id,
+                on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
             )
+            if self._answer_lan is not None:
+                self._answer_lan = None
+                lan.configure_offer_metadata(
+                    moto_id=self._stream_config.moto_id,
+                    security_level=self._native_config.p2p_security_level,
+                    preconnect=bool(self._native_config.preconnect),
+                )
             self._moto = lan
             self._signaling_path = "lan"
             self._lan_status = "connecting"
@@ -501,10 +521,14 @@ class NativeRelayPlaybackSession:
             try:
                 await lan.async_connect()
                 self._lan_status = "socket_open"
+                self._lan_answers_alive = True
+                if self._answer is not None and self._answer_mqtt is None and config.mqtt_protocol_version:
+                    await self._connect_auxiliary_mqtt(self._stream_config.p2p_session.session_id)
                 self._offer_status = "sending"
                 self._connect_phase = "lan_offer"
                 await lan.async_send_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
                 self._offer_status = "sent"
+                self._lan_answers_alive = True
                 self._token_route = "lan_app_token"
                 return
             except NativeLanUnavailableError:
@@ -525,7 +549,10 @@ class NativeRelayPlaybackSession:
         if not self._http_initialized:
             self._token_route = "app_token"
         if self._moto is None:
-            await self._connect_mqtt(self._stream_config.p2p_session.session_id)
+            if self._answer_mqtt is not None:
+                self._moto, self._answer_mqtt = self._answer_mqtt, None
+            else:
+                await self._connect_mqtt(self._stream_config.p2p_session.session_id)
         if self._ended is not None and self._ended.done():
             raise self._ended.result()
         self._signaling_path = "mqtt"
@@ -550,30 +577,21 @@ class NativeRelayPlaybackSession:
         if not await _bounded_cleanup(lan.async_close()):
             raise NativeRelayPlaybackError("Native LAN cleanup timed out")
         self._moto = None
+        self._lan_answers_alive = False
 
     async def _connect_mqtt(self, session_id: str) -> None:
+        if self._answer_mqtt is not None:
+            self._moto, self._answer_mqtt = self._answer_mqtt, None
+            return
         if not self._native_config.mqtt_protocol_version:
             raise NativeRelayPlaybackError(
                 "Camera MQTT protocol version is unknown; refresh the camera inventory"
             )
         self._signaling_path = "mqtt"
         self._connect_phase = "mqtt_subscribe"
-        self._moto = MotoClient(
-            identity=self._mqtt_identity,
-            uid=self._uid,
-            device_id=self._native_config.dev_id,
-            session_id=session_id,
-            local_key=self._native_config.local_key,
-            on_answer=self._on_answer,
-            on_candidate=self._on_remote_candidate,
-            on_disconnect=self._on_disconnect,
-            protocol_version=self._native_config.mqtt_protocol_version,
-            preconnect=bool(self._native_config.preconnect),
-            security_level=self._native_config.p2p_security_level,
-            moto_id=self._stream_config.moto_id if self._stream_config else "",
-            on_failure=self._on_signaling_failure,
-        )
+        self._moto = self._new_mqtt_client(session_id)
         await self._moto.async_connect()
+        self._mqtt_answers_alive = True
         await self._maybe_send_wake(self._moto)
         config = self._native_config
         if (config.sd_low_power_wake is True and config.wake_direct
@@ -583,6 +601,64 @@ class NativeRelayPlaybackSession:
                 f"Camera SD status was not verified ({self.transport_diagnostics})"
             )
         await self._maybe_send_connector_wake(self._moto)
+        await self._ensure_lan_answer_listener()
+
+    def _new_mqtt_client(self, session_id: str) -> MotoClient:
+        return MotoClient(
+            identity=self._mqtt_identity,
+            uid=self._uid,
+            device_id=self._native_config.dev_id,
+            session_id=session_id,
+            local_key=self._native_config.local_key,
+            on_answer=lambda sdp: self._on_answer(sdp, source="mqtt"),
+            on_candidate=self._on_remote_candidate,
+            on_disconnect=self._on_disconnect,
+            protocol_version=self._native_config.mqtt_protocol_version,
+            preconnect=bool(self._native_config.preconnect),
+            security_level=self._native_config.p2p_security_level,
+            moto_id=self._stream_config.moto_id if self._stream_config else "",
+            on_failure=self._on_signaling_failure,
+        )
+    async def _connect_auxiliary_mqtt(self, session_id: str) -> None:
+        """Subscribe for answers without making broker availability a LAN gate."""
+        mqtt = self._new_mqtt_client(session_id)
+        self._answer_mqtt = mqtt
+        try:
+            await mqtt.async_connect()
+        except (TuyaIpcP2pError, OSError, TimeoutError) as error:
+            self._mqtt_answers_alive = False
+            self._answer_channel_failures["MQTT"] = type(error).__name__
+            if not await _bounded_cleanup(mqtt.async_close()):
+                raise NativeRelayPlaybackError("MQTT answer listener cleanup timed out") from error
+            self._answer_mqtt = None
+        else:
+            self._mqtt_answers_alive = True
+
+    async def _ensure_lan_answer_listener(self) -> None:
+        config = self._native_config
+        if (self._answer is None or self._answer_lan is not None or self._lan_answer_attempted
+                or not config.wake_direct
+                or not (config.lan_signaling_capable or config.sd_status_lan_dp)):
+            return
+        self._lan_answer_attempted = True
+        lan = Lan302Client(
+            uid=self._uid, device_id=config.dev_id, session_id=self.local_cid,
+            local_key=config.local_key, on_answer=lambda sdp: self._on_answer(sdp, source="lan"),
+            on_candidate=self._on_remote_candidate, on_disconnect=self._on_disconnect,
+            preconnect=False, security_level=config.p2p_security_level,
+            on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
+        )
+        self._answer_lan = lan
+        try:
+            await lan.async_connect()
+            await lan.async_listen()
+        except (NativeLanSignalError, OSError) as error:
+            self._answer_channel_failures["LAN"] = type(error).__name__
+            if not await _bounded_cleanup(lan.async_close()):
+                raise NativeRelayPlaybackError("LAN answer listener cleanup timed out") from error
+            self._answer_lan = None
+        else:
+            self._lan_answers_alive = True
 
     async def _maybe_send_connector_wake(self, moto: MotoClient) -> None:
         """Match InternalThingSmartCameraP2P's pre-connect direct wake."""
@@ -741,15 +817,18 @@ class NativeRelayPlaybackSession:
     async def _try_lan_sd_status(self, dp: str, deadline: float, moto: MotoClient) -> bool:
         """Return false only when LAN could not dispatch the query."""
         config = self._native_config
+        self._lan_answer_attempted = True
         lan = Lan302Client(
             uid=self._uid, device_id=config.dev_id, session_id=self.local_cid,
-            local_key=config.local_key, on_answer=self._on_answer,
+            local_key=config.local_key, on_answer=lambda sdp: self._on_answer(sdp, source="lan"),
             on_candidate=self._on_remote_candidate, on_disconnect=self._on_disconnect,
             preconnect=False, security_level=config.p2p_security_level,
+            on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
         )
         self._connect_phase = "lan_sd_status"
         self._sd_status_query = "waiting_for_report"
         self._status_lan = lan
+        retained = False
         try:
             async with asyncio.timeout_at(deadline):
                 try:
@@ -789,15 +868,22 @@ class NativeRelayPlaybackSession:
             raise self._missing_sd_status_report() from None
         else:
             self._accept_sd_status_report(status)
+            if self._answer is not None:
+                await lan.async_listen()
+                self._lan_answers_alive = True
+                self._answer_lan = lan
+                self._status_lan = None
+                retained = True
         finally:
             self._sd_status_lan_details = getattr(lan, "diagnostics", "unavailable")
-            try:
-                await lan.async_close()
-            except BaseException:
-                self._sd_status_query = "lan_cleanup_incomplete"
-                raise
-            else:
-                self._status_lan = None
+            if not retained:
+                try:
+                    await lan.async_close()
+                except BaseException:
+                    self._sd_status_query = "lan_cleanup_incomplete"
+                    raise
+                else:
+                    self._status_lan = None
         return True
 
     async def _send_http_sd_status(self, dp: str) -> None:
@@ -953,36 +1039,70 @@ class NativeRelayPlaybackSession:
                 return decode_recording_month_reply(command, request_id=request_id, month=month)
 
     async def query_event_recordings(self, day: date) -> NativeV4CatalogPage:
-        """Query Smart Life's capability-gated event timeline."""
+        """Collect the event day, serializing bounded legacy page requests."""
         self._require_connected()
         if self._playback_started:
             raise NativeRelayPlaybackError(
                 "Event catalog cannot run after playback starts"
             )
-        request_id = self._allocate_request_id()
-        self._send_control(
-            encode_event_catalog_request(
-                request_id=request_id,
-                channel=0,
-                day=day,
-                page=0,
-                v2=self._native_config.event_catalog_v2,
-            )
-        )
-        while True:
-            command = await self._receive_or_transport_failure(self._control_messages)
-            if command.request_id != request_id:
-                continue
-            try:
-                return decode_event_catalog_reply(
-                    command,
-                    request_id=request_id,
-                    v2=self._native_config.event_catalog_v2,
+        items = []
+        totals = None
+        # Application safety bounds, not SDK timing guarantees. The worker's
+        # configurable command deadline may cancel the entire collection sooner.
+        collection_timeout_seconds = 15.0
+        max_pages = 1024
+        max_items = 86400
+        # V1 carries a zero-based page ID. V2 has no wire page selector and
+        # returns its complete JSON list in one callback.
+        async with asyncio.timeout(collection_timeout_seconds):
+            for page_index in range(max_pages):
+                request_id = self._allocate_request_id()
+                self._send_control(
+                    encode_event_catalog_request(
+                        request_id=request_id,
+                        channel=0,
+                        day=day,
+                        page=page_index,
+                        v2=self._native_config.event_catalog_v2,
+                    )
                 )
-            except NativeSimpleError as err:
-                raise NativeRelayPlaybackError(
-                    f"Camera returned an invalid event catalog reply: {err}"
-                ) from err
+                while True:
+                    command = await self._receive_or_transport_failure(self._control_messages)
+                    if command.request_id != request_id:
+                        continue
+                    try:
+                        page = decode_event_catalog_reply(
+                            command,
+                            request_id=request_id,
+                            v2=self._native_config.event_catalog_v2,
+                        )
+                    except NativeSimpleError as err:
+                        raise NativeRelayPlaybackError(
+                            f"Camera returned an invalid event catalog reply: {err}"
+                        ) from err
+                    break
+                current_totals = (page.total_pages, page.total_files)
+                if (
+                    not 1 <= page.total_pages <= max_pages
+                    or not 0 <= page.total_files <= max_items
+                    or page.page != page_index + 1
+                    or (totals is not None and current_totals != totals)
+                ):
+                    raise NativeRelayPlaybackError("Invalid event catalog pagination metadata")
+                totals = current_totals
+                items.extend(page.items)
+                if len(items) > page.total_files:
+                    raise NativeRelayPlaybackError("Event catalog exceeds reported total")
+                if page.page == page.total_pages:
+                    if len(items) != page.total_files:
+                        raise NativeRelayPlaybackError("Incomplete event catalog")
+                    return NativeV4CatalogPage(
+                        page.response_id, page.status, page.error_message,
+                        1, len(items), 1, tuple(items),
+                    )
+                if not page.items:
+                    raise NativeRelayPlaybackError("Event catalog pagination made no progress")
+        raise NativeRelayPlaybackError("Event catalog exceeded pagination limit")
 
     async def download_thumbnail(self, *, start: int, end: int) -> bytes:
         """Download the recording JPEG with Smart Life's current 3/8 command."""
@@ -1206,13 +1326,16 @@ class NativeRelayPlaybackSession:
     async def close(self) -> None:
         """Close every transport once and release the camera-side session."""
         if (self._closed and self._session is None and self._moto is None
-                and self._status_lan is None and self._ice is None and not self._candidate_tasks):
+                and self._status_lan is None and self._answer_lan is None
+                and self._answer_mqtt is None and self._ice is None and not self._candidate_tasks):
             return
         if self._connected and self._playback_started:
             with suppress(Exception):
                 await _bounded_cleanup(self.stop())
         self._closed = True
         self._connected = False
+        self._lan_answers_alive = False
+        self._mqtt_answers_alive = False
         failures = []
         for task in list(self._candidate_tasks):
             task.cancel()
@@ -1254,6 +1377,16 @@ class NativeRelayPlaybackSession:
                     failures.append("LAN status close timed out")
             except Exception:
                 failures.append("LAN status close failed")
+        for attribute in ("_answer_lan", "_answer_mqtt"):
+            channel = getattr(self, attribute)
+            if channel is not None:
+                try:
+                    if await _bounded_cleanup(channel.async_close()):
+                        setattr(self, attribute, None)
+                    else:
+                        failures.append(f"{attribute} close timed out")
+                except Exception:
+                    failures.append(f"{attribute} close failed")
         moto = self._moto
         if moto is not None:
             # A missing remote disconnect acknowledgement does not imply a
@@ -1324,9 +1457,12 @@ class NativeRelayPlaybackSession:
                     f"Native MQTT offer retry failed ({self.transport_diagnostics})"
                 ) from err
 
-    def _on_answer(self, sdp: str) -> None:
+    def _on_answer(self, sdp: str, *, source: str = "unknown") -> None:
         answer = self._answer
-        if answer is None or answer.done():
+        if self._closed or answer is None:
+            return
+        if answer.done():
+            self._duplicate_answers += 1
             return
         try:
             answer.set_result(parse_answer(sdp))
@@ -1337,6 +1473,7 @@ class NativeRelayPlaybackSession:
             ))
         else:
             self._answer_status = "accepted"
+            self._answer_source = source
 
     def _on_local_candidate(self, candidate: str) -> None:
         moto = self._moto
@@ -1371,6 +1508,17 @@ class NativeRelayPlaybackSession:
         self._fail_transport(error)
 
     def _on_signaling_failure(self, reason: str, *, transport: str = "MQTT") -> None:
+        if self._closed:
+            return
+        self._answer_channel_failures[transport] = reason
+        if transport == "MQTT":
+            self._mqtt_answers_alive = False
+            if self._lan_answers_alive:
+                return
+        else:
+            self._lan_answers_alive = False
+            if self._mqtt_answers_alive:
+                return
         error = NativeRelayPlaybackError(f"Native {transport} signaling stopped ({reason})")
         if self._answer is not None and not self._answer.done():
             self._answer.set_exception(error)

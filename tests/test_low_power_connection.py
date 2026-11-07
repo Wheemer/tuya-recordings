@@ -228,7 +228,7 @@ async def test_native_lan_cannot_bypass_or_duplicate_sd_preparation(monkeypatch,
 
         async def async_connect(self):
             assert playback._sd_status_prepared
-            assert events == ["subscribe", "wake", "status", "mqtt-closed"]
+            assert events == ["subscribe", "wake", "status"]
             events.append("lan-connect")
             if outcome == "mqtt_fallback":
                 raise playback_module.NativeLanUnavailableError("fixture unavailable")
@@ -251,11 +251,11 @@ async def test_native_lan_cannot_bypass_or_duplicate_sd_preparation(monkeypatch,
             if outcome == "lan":
                 assert events[-1] == "lan-offer"
             else:
-                assert events[-3:] == ["lan-closed", "subscribe", "mqtt-offer"]
+                assert events[-2:] == ["lan-closed", "mqtt-offer"]
             assert events.count("wake") == 1
             assert events.count("status") == 1
     finally:
-        await playback._moto.async_close()
+        await playback.close()
 
 
 @pytest.mark.asyncio

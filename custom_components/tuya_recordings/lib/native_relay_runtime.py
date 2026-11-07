@@ -542,10 +542,13 @@ class NativeRelayPlaybackWorker:
                     raise NativeRelayRuntimeError("Previous native transport did not close")
                 wanted_mode = "metadata" if isinstance(work, _CatalogWork | _ThumbnailWork) else "media"
                 if playback is not None and connection_mode != wanted_mode:
-                    with suppress(Exception):
+                    try:
                         await _close_worker_transport(self, playback)
-                    playback = None
-                    connection_mode = None
+                    finally:
+                        # Failed closure remains owned by _unfinished_transport.
+                        # Do not retry implicitly or connect in this request.
+                        playback = None
+                        connection_mode = None
                 if playback is None:
                     playback = self._playback_factory(
                         self._config,

@@ -816,11 +816,14 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
     ) -> web.StreamResponse:
         chunks: queue.Queue[bytes | Exception | object] = queue.Queue(maxsize=8)
         sentinel = object()
+        loop = asyncio.get_running_loop()
+        available = asyncio.Event()
 
         def put_chunk(chunk: bytes) -> None:
             while not stop_event.is_set():
                 try:
                     chunks.put(chunk, timeout=0.25)
+                    loop.call_soon_threadsafe(available.set)
                     return
                 except queue.Full:
                     continue
@@ -830,6 +833,7 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
             while not stop_event.is_set():
                 try:
                     chunks.put(item, timeout=0.25)
+                    loop.call_soon_threadsafe(available.set)
                     return
                 except queue.Full:
                     continue
@@ -849,32 +853,44 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
                     put_result(err)
             finally:
                 put_result(sentinel)
+                loop.call_soon_threadsafe(available.set)
 
-        producer = asyncio.ensure_future(self.hass.async_add_executor_job(produce))
-        loop = asyncio.get_running_loop()
-        first = await loop.run_in_executor(None, chunks.get)
-        if first is sentinel:
-            stop_event.set()
-            await producer
-            raise web.HTTPServiceUnavailable(reason="Tuya recording playback produced no video")
-        if isinstance(first, Exception):
-            stop_event.set()
-            await producer
-            raise first
+        async def next_chunk():
+            while True:
+                available.clear()
+                if stop_event.is_set():
+                    raise CameraWorkCancelled("Browser ended Tuya recording playback")
+                try:
+                    return chunks.get_nowait()
+                except queue.Empty:
+                    # A replaced request can stop without a final queue item.
+                    # Never leave a blocking executor queue read behind.
+                    try:
+                        await asyncio.wait_for(available.wait(), timeout=0.25)
+                    except TimeoutError:
+                        continue
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Cache-Control": "no-store",
-                "Content-Type": "application/vnd.tuya-recordings.stream",
-                "Accept-Ranges": "none",
-            },
-        )
-        await response.prepare(request)
+        producer = None
         try:
+            producer = asyncio.ensure_future(self.hass.async_add_executor_job(produce))
+            first = await next_chunk()
+            if first is sentinel:
+                raise web.HTTPServiceUnavailable(reason="Tuya recording playback produced no video")
+            if isinstance(first, Exception):
+                raise first
+
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Type": "application/vnd.tuya-recordings.stream",
+                    "Accept-Ranges": "none",
+                },
+            )
+            await response.prepare(request)
             await response.write(first)
             while True:
-                item = await loop.run_in_executor(None, chunks.get)
+                item = await next_chunk()
                 if item is sentinel:
                     break
                 if isinstance(item, Exception):
@@ -889,7 +905,20 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
             raise
         finally:
             stop_event.set()
-            await producer
+            if producer is not None:
+                # Cancellation must not cancel the executor future: ownership
+                # remains here until the underlying camera producer has exited.
+                cancelled = False
+                while True:
+                    try:
+                        await asyncio.shield(producer)
+                        break
+                    except asyncio.CancelledError:
+                        if producer.cancelled():
+                            raise
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
         await response.write_eof()
         return response
 
