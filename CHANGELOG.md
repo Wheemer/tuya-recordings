@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-10 (2026-11-08)
+
+### Connection
+
+- Add APK-native command-channel signaling for the reported security-level 3 connection path, including session answers received through the native bootstrap.
+- Keep TCP restricted to signaling, close it after the answer, and block TCP recording-control, video, and audio packets. Playback remains LAN-only.
+- Use bounded command retransmission backoff and stop obsolete bootstrap retransmits after the answer. Scheduled catalog work does not gain a TCP bootstrap.
+
+### Safety And Diagnostics
+
+- Validate TCP handshake authentication and native command framing, bound receive buffers, and reject replies for another device or session.
+- Join bootstrap tasks during cancellation and cleanup, and continue closing the other transports if command-channel cleanup fails.
+- Report the command-answer source, TCP attempt count, rejected sessions, and blocked media without logging credentials.
+
 ## Tuya Recordings v0.4.13-9 (2026-11-07)
 
 ### Connection

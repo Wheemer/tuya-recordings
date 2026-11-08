@@ -58,9 +58,16 @@ class _PendingSegment:
 class KcpConversation:
     """Reassembles inbound messages and keeps the outbound queue acknowledged."""
 
-    def __init__(self, conversation: int, transmit: Callable[[bytes], None]) -> None:
+    def __init__(
+        self, conversation: int, transmit: Callable[[bytes], None],
+        *, max_message_bytes: int = _MAX_MESSAGE_BYTES, backoff: bool = False,
+    ) -> None:
         """Bind the conversation to the connection that carries its segments."""
         self.conversation = conversation
+        if not 0 < max_message_bytes <= _MAX_MESSAGE_BYTES:
+            raise ValueError("Invalid KCP message limit")
+        self._max_message_bytes = max_message_bytes
+        self._backoff = backoff
         self._transmit = transmit
         self._next_send_sequence = 0
         self._next_receive_sequence = 0
@@ -86,6 +93,10 @@ class KcpConversation:
         pending, self._pending_messages = self._pending_messages, []
         for message in pending:
             handler(message)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @property
     def receive_sequence(self) -> int:
@@ -156,7 +167,7 @@ class KcpConversation:
                 self.close()
                 raise RuntimeError("KCP fragment countdown is invalid")
             self._fragment_bytes += len(nxt.data)
-            if self._fragment_bytes > _MAX_MESSAGE_BYTES:
+            if self._fragment_bytes > self._max_message_bytes:
                 self.close()
                 raise RuntimeError("KCP message exceeds receive limit")
             self._expected_fragment = nxt.fragment - 1 if nxt.fragment else None
@@ -175,12 +186,23 @@ class KcpConversation:
                     # an H.264 FU-A frame does not begin on a continuation packet.
                     self._pending_messages.append(message)
 
+    def flush_pending(self) -> None:
+        """Copy unacknowledged segments onto a newly attached transport."""
+        if not self._closed:
+            for pending in self._pending:
+                self._transmit(pending.raw)
+
+    def discard_pending(self) -> None:
+        """Stop obsolete bootstrap retransmits without resetting receive state."""
+        self._pending.clear()
+        self._disarm_retransmit()
+
     def send(self, message: bytes) -> None:
         """Queue one message, fragmenting it when it exceeds the segment size."""
         if self._closed:
             raise RuntimeError("Failed to send: the KCP conversation is closed")
         count = max(1, -(-len(message) // _MAX_SEGMENT_SIZE))
-        if count > 256 or len(message) > _MAX_MESSAGE_BYTES:
+        if count > 256 or len(message) > self._max_message_bytes:
             raise ValueError("KCP message exceeds fragment limit")
         if len(self._pending) + count > _RECEIVE_WINDOW:
             raise RuntimeError("KCP send queue is full")
@@ -257,7 +279,10 @@ class KcpConversation:
         for entry in list(self._pending):
             if not entry.transmits:
                 continue
-            if _difference(now, entry.sent_at) < _RETRANSMIT_INTERVAL_SECONDS * 1000:
+            interval = _RETRANSMIT_INTERVAL_SECONDS * (
+                2 ** max(0, entry.transmits - 1) if self._backoff else 1
+            )
+            if _difference(now, entry.sent_at) < interval * 1000:
                 continue
             if entry.transmits >= _MAX_RETRANSMITS:
                 LOGGER.warning(

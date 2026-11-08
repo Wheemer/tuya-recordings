@@ -16,6 +16,8 @@ from typing import Any
 
 from ..vendor.tuya_ipc_p2p_sdk import MqttIdentity, StreamConfig
 from ..vendor.tuya_ipc_p2p_sdk.models.p2p_session import P2pSession
+from ..vendor.tuya_ipc_p2p_sdk.models.relay_token import RelayToken
+from ..vendor.tuya_ipc_p2p_sdk.signaling.relay_frames import relay_candidate_frame, relay_offer_frame
 from ..vendor.tuya_ipc_p2p_sdk.control import (
     auth_credential,
     session_sequence,
@@ -55,6 +57,7 @@ from .native_playback_stream import (
 )
 from .commands import CAMERA_COMMANDS
 from .native_session import NativeCameraSessionConfig, NativeTokenRoute, native_session_api_request
+from .native_command_signaling import NativeCommandSignaling
 from .native_simple_rtp import (
     NativeH264RtpDepacketizer,
     NativeSimpleMediaParser,
@@ -152,6 +155,12 @@ class NativeRelayPlaybackSession:
                 "Native relay playback currently supports P2P type 4 cameras"
             )
         self._http_initialized = False
+        self._command = None
+        self._command_task = None
+        self._command_offer = None
+        self._command_token = None
+        self._command_candidates = []
+        self._command_status = "not_started"
         self._http_trace_id = ""
         self._uid = config.app_uid
         if not self._uid:
@@ -313,6 +322,7 @@ class NativeRelayPlaybackSession:
             f"{self._media_sequences()}), "
             f"codec_info={self._rtp_codec_info or 'none'}, "
             f"signaling_details=({getattr(self._moto, 'diagnostics', 'unavailable')}), "
+            f"command_signaling=({getattr(self._command, 'diagnostics', self._command_status)}), "
             f"sd_lan_details=({getattr(self._status_lan, 'diagnostics', self._sd_status_lan_details)}), "
             f"sd_preparation_signaling=({self._sd_status_signaling_details}), "
             f"answer_channels=(mqtt={self._mqtt_answers_alive}, lan={self._lan_answers_alive}, "
@@ -411,8 +421,14 @@ class NativeRelayPlaybackSession:
             )
             await self._ice.async_gather()
             self._session = DirectSession(self._ice.send_segment)
+            self._start_command_signaling(
+                tcp=media or self._on_demand_catalog or self._retry_mqtt_offer,
+            )
             self._connect_phase = "wait_answer"
             answer = await self._wait_for_answer()
+            if self._command is not None:
+                if not await _bounded_cleanup(self._command.finish_bootstrap()):
+                    raise NativeRelayPlaybackError("Native signaling TCP cleanup timed out")
             if self._ended.done():
                 raise self._ended.result()
             self._ice.set_receive_key(answer.aes_key)
@@ -487,6 +503,7 @@ class NativeRelayPlaybackSession:
     ) -> None:
         """Use the camera-advertised local policy before MQTT fallback."""
         self._validate_direct_token(self._native_config.p2p_config)
+        self._prepare_command_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
         if self._native_config.p2p_policy == 1 and not self._http_initialized:
             config = self._native_config
             if (not self._sd_status_prepared and config.sd_low_power_wake is True
@@ -555,6 +572,7 @@ class NativeRelayPlaybackSession:
             log_config = self._stream_config.log_config_as_json()
         if not self._http_initialized:
             self._token_route = "app_token"
+        self._prepare_command_offer(sdp, ice_servers, trace_id, tcp_token, log_config)
         if self._moto is None:
             if self._answer_mqtt is not None:
                 self._moto, self._answer_mqtt = self._answer_mqtt, None
@@ -580,6 +598,62 @@ class NativeRelayPlaybackSession:
         self._offer_status = "published"
         if self._on_demand_catalog or self._retry_mqtt_offer:
             self._retry_offer = (started, send_offer)
+
+    def _prepare_command_offer(self, sdp, ice_servers, trace_id, tcp_token, log_config) -> None:
+        if self._stream_config is None:
+            return
+        self._command_token = tcp_token
+        self._command_offer = relay_offer_frame(
+            self._uid, self._stream_config.device_id, self.local_cid, trace_id,
+            sdp, ice_servers, tcp_token, log_config, self._stream_config.moto_id,
+            self._native_config.signaling_preconnect,
+            self._native_config.p2p_security_level,
+        )
+
+    def _start_command_signaling(self, *, tcp: bool) -> None:
+        if self._answer.done() or self._command_offer is None:
+            return
+        if self._native_config.p2p_security_level != 3:
+            self._command_status = "security_mode_unavailable"
+            return
+        token = RelayToken.from_json(self._command_token)
+        self._command = NativeCommandSignaling(
+            token=token, device_id=self._stream_config.device_id, uid=self._uid,
+            session_id=self.local_cid, key=self._offer.aes_key,
+            transmit_direct=self._ice.send_segment, on_signal=self._on_command_signal,
+        )
+        attach = getattr(self._session, "set_signaling_handler", None)
+        if callable(attach):
+            attach(self._command.input_direct)
+        self._command.queue(self._command_offer)
+        for candidate in self._command_candidates:
+            self._queue_command_candidate(candidate)
+
+        async def run() -> None:
+            try:
+                await self._command.start(
+                    lambda: self._ice.async_wait_for_nomination(_ANSWER_TIMEOUT_SECONDS), tcp=tcp,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._command_status = type(error).__name__
+        self._command_task = asyncio.create_task(run())
+
+    def _on_command_signal(self, payload: dict) -> None:
+        kind, message = payload["header"]["type"], payload["msg"]
+        if kind == "answer" and isinstance(message.get("sdp"), str):
+            self._on_answer(message["sdp"], source="command")
+        elif kind == "candidate" and isinstance(message.get("candidate"), str):
+            self._on_remote_candidate(message["candidate"])
+        elif kind == "disconnect" and type(message.get("close_reason")) is int:
+            self._on_disconnect(message["close_reason"])
+
+    def _queue_command_candidate(self, candidate: str) -> None:
+        self._command.queue(relay_candidate_frame(
+            self._uid, self._stream_config.device_id, self.local_cid,
+            self._native_config.trace_id, candidate, self._stream_config.moto_id,
+        ))
 
     async def _close_failed_lan(self, lan: Lan302Client) -> None:
         if not await _bounded_cleanup(lan.async_close()):
@@ -1350,7 +1424,8 @@ class NativeRelayPlaybackSession:
         """Close every transport once and release the camera-side session."""
         if (self._closed and self._session is None and self._moto is None
                 and self._status_lan is None and self._answer_lan is None
-                and self._answer_mqtt is None and self._ice is None and not self._candidate_tasks):
+                and self._answer_mqtt is None and self._ice is None and not self._candidate_tasks
+                and self._command is None and self._command_task is None):
             return
         if self._connected and self._playback_started:
             with suppress(Exception):
@@ -1360,6 +1435,20 @@ class NativeRelayPlaybackSession:
         self._lan_answers_alive = False
         self._mqtt_answers_alive = False
         failures = []
+        if self._command_task is not None:
+            self._command_task.cancel()
+            if not await _bounded_cleanup(asyncio.gather(self._command_task, return_exceptions=True)):
+                failures.append("native command task cleanup timed out")
+            else:
+                self._command_task = None
+        if self._command is not None:
+            try:
+                if not await _bounded_cleanup(self._command.async_close()):
+                    failures.append("native command cleanup timed out")
+                else:
+                    self._command = None
+            except Exception:
+                failures.append("native command cleanup failed")
         for task in list(self._candidate_tasks):
             task.cancel()
         if self._candidate_tasks:
@@ -1499,6 +1588,10 @@ class NativeRelayPlaybackSession:
             self._answer_source = source
 
     def _on_local_candidate(self, candidate: str) -> None:
+        if candidate not in self._command_candidates and len(self._command_candidates) < 8:
+            self._command_candidates.append(candidate)
+            if self._command is not None:
+                self._queue_command_candidate(candidate)
         moto = self._moto
         if moto is None:
             return
@@ -1536,11 +1629,15 @@ class NativeRelayPlaybackSession:
         self._answer_channel_failures[transport] = reason
         if transport == "MQTT":
             self._mqtt_answers_alive = False
-            if self._lan_answers_alive:
+            if self._lan_answers_alive or (
+                self._command is not None and self._command.accepting_signals
+            ):
                 return
         else:
             self._lan_answers_alive = False
-            if self._mqtt_answers_alive:
+            if self._mqtt_answers_alive or (
+                self._command is not None and self._command.accepting_signals
+            ):
                 return
         error = NativeRelayPlaybackError(f"Native {transport} signaling stopped ({reason})")
         if self._answer is not None and not self._answer.done():

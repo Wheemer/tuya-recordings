@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from ..const import LOGGER
 from ..exceptions import TuyaIpcP2pSessionError
 from .kcp_conversation import KcpConversation
-from .kcp_segment import parse_segments
+from .kcp_segment import KcpSegment, parse_segments
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -28,6 +28,7 @@ class DirectSession:
         self._segment_counts: dict[tuple[int, int], int] = {}
         self._malformed_datagrams = 0
         self._closed = False
+        self._signaling_handler = None
         self._video_ready: asyncio.Future[KcpConversation] = (
             asyncio.get_event_loop().create_future()
         )
@@ -49,6 +50,10 @@ class DirectSession:
             raise TuyaIpcP2pSessionError("Failed to open conversation: invalid channel")
         return self._conversation(conversation_id)
 
+    def set_signaling_handler(self, handler: Callable[[KcpSegment], None] | None) -> None:
+        """Route the native bootstrap channel separately from LAN media."""
+        self._signaling_handler = handler
+
     def input_segment(self, raw: bytes) -> None:
         """Route one authenticated KCP datagram received directly from the camera."""
         if self._closed:
@@ -58,6 +63,9 @@ class DirectSession:
             self._malformed_datagrams += 1
             return
         for segment in segments:
+            if segment.conversation == 0x010000F3 and self._signaling_handler is not None:
+                self._signaling_handler(segment)
+                continue
             if segment.conversation not in self._conversations and len(self._conversations) >= _MAX_CONVERSATIONS:
                 self._malformed_datagrams += 1
                 continue
@@ -95,6 +103,7 @@ class DirectSession:
         if self._closed and not self._conversations:
             return
         self._closed = True
+        self._signaling_handler = None
         errors = []
         for channel, conversation in list(self._conversations.items()):
             try:

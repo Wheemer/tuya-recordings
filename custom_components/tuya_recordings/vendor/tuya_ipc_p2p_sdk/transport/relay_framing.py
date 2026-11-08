@@ -10,6 +10,7 @@ outer length includes that padding while the inner attribute length does not.
 
 from __future__ import annotations
 
+import hmac
 from ..crypto import aes_cbc_decrypt, aes_cbc_encrypt, hmac_sha1, hmac_sha256
 from ..exceptions import TuyaIpcP2pProtocolError
 from ..json_types import JsonObject, parse_json_object
@@ -120,6 +121,11 @@ def assemble_handshake_frame(
 
 def parse_handshake_frame(key: bytes, payload: bytes) -> JsonObject:
     """Decrypt an inbound f4 frame's JSON message."""
+    if len(payload) < _TLV_HEADER_LENGTH + _MAC_LENGTH or payload[-36:-32] != b"\x00\x08\x00\x20":
+        raise TuyaIpcP2pProtocolError("Failed to read handshake frame: missing MAC")
+    signed = bytes((FRAME_HANDSHAKE, 0)) + len(payload).to_bytes(2, "big") + payload[:-32]
+    if not hmac.compare_digest(payload[-32:], hmac_sha256(key, signed)):
+        raise TuyaIpcP2pProtocolError("Failed to read handshake frame: MAC mismatch")
     cursor = _HANDSHAKE_TLV_START
     iv: bytes | None = None
     while cursor + _TLV_HEADER_LENGTH <= len(payload):
