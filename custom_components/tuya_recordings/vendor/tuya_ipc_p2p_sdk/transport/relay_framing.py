@@ -66,18 +66,38 @@ def media_frame(media_key: bytes, kcp_segment: bytes) -> bytes:
     return relay_frame(FRAME_MEDIA, bytes(inner))
 
 
-def unwrap_media_frame(media_key: bytes, payload: bytes) -> bytes:
-    """Verify an inbound f6 frame's tag and return the KCP segment it carries."""
-    if len(payload) < _TLV_HEADER_LENGTH + MEDIA_TAG_LENGTH:
-        raise TuyaIpcP2pProtocolError("Failed to read media frame: payload too short")
-    inner = int.from_bytes(payload[2:4], "big")
-    if inner < MEDIA_TAG_LENGTH or _TLV_HEADER_LENGTH + inner > len(payload):
-        raise TuyaIpcP2pProtocolError(f"Failed to read media frame: bad inner length {inner}")
-    end = _TLV_HEADER_LENGTH + inner
-    segment = payload[_TLV_HEADER_LENGTH : end - MEDIA_TAG_LENGTH]
-    if payload[end - MEDIA_TAG_LENGTH : end] != media_tag(media_key, segment):
+def decode_media_frame(media_key: bytes, payload: bytes) -> tuple[bytes, int, int]:
+    """Select the last type-7 attribute, as the native relay decoder does."""
+    cursor = 0
+    selected = None
+    attributes = 0
+    data_attributes = 0
+    while cursor < len(payload):
+        if len(payload) - cursor < _TLV_HEADER_LENGTH:
+            raise TuyaIpcP2pProtocolError("Failed to read media frame: truncated TLV header")
+        kind = int.from_bytes(payload[cursor:cursor + 2], "big")
+        length = int.from_bytes(payload[cursor + 2:cursor + 4], "big")
+        start = cursor + _TLV_HEADER_LENGTH
+        end = start + length
+        padded_end = end + (-length % _TLV_ALIGNMENT)
+        if padded_end > len(payload):
+            raise TuyaIpcP2pProtocolError("Failed to read media frame: truncated TLV payload")
+        if kind == 7:
+            selected = payload[start:end]
+            data_attributes += 1
+        attributes += 1
+        cursor = padded_end
+    if selected is None or len(selected) < MEDIA_TAG_LENGTH:
+        raise TuyaIpcP2pProtocolError("Failed to read media frame: no tagged type-7 data")
+    segment = selected[:-MEDIA_TAG_LENGTH]
+    if not hmac.compare_digest(selected[-MEDIA_TAG_LENGTH:], media_tag(media_key, segment)):
         raise TuyaIpcP2pProtocolError("Failed to read media frame: tag mismatch")
-    return segment
+    return segment, attributes, data_attributes
+
+
+def unwrap_media_frame(media_key: bytes, payload: bytes) -> bytes:
+    """Return the authenticated data selected by the native TLV decoder."""
+    return decode_media_frame(media_key, payload)[0]
 
 
 def _type_length_value(value_type: int, value: bytes) -> bytes:

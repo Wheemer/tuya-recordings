@@ -17,10 +17,10 @@ from .relay_framing import (
     FRAME_KEEPALIVE,
     FRAME_MEDIA,
     assemble_handshake_frame,
+    decode_media_frame,
     keepalive_frame,
     media_frame,
     parse_handshake_frame,
-    unwrap_media_frame,
 )
 
 if TYPE_CHECKING:
@@ -81,6 +81,9 @@ class RelayConnection:
         self._handshake_status: int | None = None
         self._socket_errno: int | None = None
         self._endpoint_attempts = 0
+        self._received_attributes = 0
+        self._multi_attribute_frames = 0
+        self._last_data_attributes = 0
 
     async def async_connect(self) -> None:
         """Dial the relay, run the handshake, and start carrying media."""
@@ -230,11 +233,14 @@ class RelayConnection:
                     LOGGER.debug("Discarded relay frame 0x%02x (%s bytes)", magic, len(payload))
                     continue
                 try:
-                    segment = unwrap_media_frame(self._media_key, payload)
+                    segment, attributes, data_attributes = decode_media_frame(self._media_key, payload)
                 except TuyaIpcP2pProtocolError:
                     self._decode_failures += 1
                     self._failure = "frame_auth_or_length"
                     raise
+                self._received_attributes += attributes
+                self._multi_attribute_frames += int(attributes > 1)
+                self._last_data_attributes = data_attributes
                 self._received_segments += 1
                 if self._segment_handler is not None:
                     self._segment_handler(segment)
@@ -275,6 +281,8 @@ class RelayConnection:
         )
         return (
             f"frames={frames or 'none'}, segments={self._received_segments}, "
+            f"f6_attributes={self._received_attributes}, multi_attribute_frames={self._multi_attribute_frames}, "
+            f"last_data_attributes={self._last_data_attributes}, "
             f"decode_failures={self._decode_failures}, phase={self._phase}, "
             f"failure={self._failure}, read_stage={self._read_stage}, "
             f"read_expected={self._read_expected}, read_partial={self._read_partial}, "
