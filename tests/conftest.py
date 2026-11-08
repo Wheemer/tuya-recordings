@@ -8,6 +8,18 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolate_command_signaling_from_legacy_transport_fixtures(request, monkeypatch):
+    # Existing fixtures emulate MQTT/LAN only. Real command-channel transport
+    # and full-session coverage live in the dedicated loopback test module.
+    if request.node.path.name != "test_native_command_signaling.py":
+        from custom_components.tuya_recordings.lib.native_command_signaling import NativeCommandSignaling
+        async def offline_bootstrap(self, *args, **kwargs):
+            self._bootstrap_finished = True
+            return None
+        monkeypatch.setattr(NativeCommandSignaling, "start", offline_bootstrap)
+
+
+@pytest.fixture(autouse=True)
 def forbid_external_network(monkeypatch):
     attempts = []
     original_connect = socket.socket.connect
