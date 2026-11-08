@@ -313,9 +313,9 @@ class NativePlaybackEventSink(NativePlaybackFrameSink):
         self.emit = emit
         self.protocol = protocol
 
-    def frame(self, frame: NativePlaybackFrame) -> None:
+    def frame(self, frame: NativePlaybackFrame) -> Any:
         event = playback_frame_event(frame, protocol=self.protocol)
-        self.emit(validate_playback_frame_event(event, protocol=self.protocol))
+        return self.emit(validate_playback_frame_event(event, protocol=self.protocol))
 
 
 def _positive(name: str, value: int) -> None:

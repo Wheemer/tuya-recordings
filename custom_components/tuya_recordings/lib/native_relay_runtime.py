@@ -1168,6 +1168,7 @@ class NativeRelayRuntimeSession:
                     "position": current.position,
                 }
             )
+            video_deadline = loop.time() + self.first_frame_timeout
             while not self._cancelled():
                 command = deferred_command
                 deferred_command = None
@@ -1205,8 +1206,7 @@ class NativeRelayRuntimeSession:
                             playback.resume(), timeout=self.signaling_timeout
                         )
                         paused = False
-                        if not saw_video:
-                            video_deadline = loop.time() + self.first_frame_timeout
+                        video_deadline = loop.time() + self.first_frame_timeout
                         continue
                     if action != "seek" or next_request is None:
                         raise NativeRelayRuntimeError(
@@ -1238,6 +1238,7 @@ class NativeRelayRuntimeSession:
                         ),
                         timeout=self.signaling_timeout + 15,
                     )
+                    video_deadline = loop.time() + self.first_frame_timeout
                     sink.started(
                         {
                             "transport": "tuya-imm-simple",
@@ -1250,8 +1251,8 @@ class NativeRelayRuntimeSession:
                 if paused:
                     await asyncio.sleep(0.05)
                     continue
-                if not saw_video and loop.time() >= video_deadline:
-                    media_seen = "audio but no video" if saw_audio else "no media"
+                if loop.time() >= video_deadline:
+                    media_seen = "video stalled" if saw_video else "audio but no video" if saw_audio else "no media (no usable video)"
                     raise NativeRelayRuntimeError(
                         f"Camera returned {media_seen} before the playback deadline"
                     )
@@ -1281,11 +1282,12 @@ class NativeRelayRuntimeSession:
                         )
                     continue
                 empty_media_frames = 0
+                accepted = await _thread_job(sink.frame, converted)
                 if frame.is_audio:
                     saw_audio = True
-                else:
+                elif accepted is not False:
                     saw_video = True
-                await _thread_job(sink.frame, converted)
+                    video_deadline = loop.time() + self.first_frame_timeout
         finally:
             if receive_task is not None:
                 receive_task.cancel()

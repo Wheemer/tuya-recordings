@@ -29,7 +29,7 @@ class RelayToken:
     @classmethod
     def from_json(cls, source: JsonObject) -> RelayToken:
         """Read the relay token out of a ``p2pConfig`` object."""
-        urls = str_list(source, "urls") or str_list(source, "urlsEx")
+        urls = list(dict.fromkeys([*str_list(source, "urls"), *str_list(source, "urlsEx")]))
         if not urls:
             raise TuyaIpcP2pProtocolError("Failed to read tcpRelay: no urls")
         return cls(
@@ -48,7 +48,16 @@ class RelayToken:
     @property
     def endpoint(self) -> tuple[str, int]:
         """The host and port to dial, preferring the IPv4 URL."""
-        preferred = next((url for url in self.urls if url.startswith("tcp4:")), self.urls[0])
+        return self.endpoints[0]
+
+    @property
+    def endpoints(self) -> tuple[tuple[str, int], ...]:
+        """Retain token endpoint alternatives in stable IPv4-first order."""
+        ordered = sorted(self.urls, key=lambda url: not url.startswith("tcp4:"))
+        return tuple(dict.fromkeys(self._endpoint(url) for url in ordered))
+
+    @staticmethod
+    def _endpoint(preferred: str) -> tuple[str, int]:
         without_scheme = preferred.removeprefix("tcp4:").removeprefix("tcp6:")
         host, separator, port = without_scheme.rpartition(":")
         if not separator or not port.isdigit():

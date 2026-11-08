@@ -46,6 +46,17 @@ _HOST_CANDIDATE_PRIORITY = 2130706431
 _STUN_HEADER_LENGTH = 20
 _INTEGRITY_LENGTH = 24
 _FINGERPRINT_LENGTH = 8
+_LAN_NETWORKS = tuple(ipaddress.IPv4Network(value) for value in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8",
+))
+
+
+def _lan_address(value) -> bool:
+    try:
+        address = ipaddress.IPv4Address(value.decode() if isinstance(value, bytes) else value)
+    except (ValueError, TypeError):
+        return False
+    return any(address in network for network in _LAN_NETWORKS)
 
 
 def local_address() -> str:
@@ -156,6 +167,7 @@ class IceResponder(asyncio.DatagramProtocol):
         self._checked_candidates: set[tuple[str, int]] = set()
         self._tie_breaker = secrets.token_bytes(8)
         self._closed = False
+        self._blocked_non_lan = 0
 
     def set_remote_credentials(self, ufrag: str, password: str) -> None:
         """Install peer credentials before processing its candidate checklist."""
@@ -182,6 +194,9 @@ class IceResponder(asyncio.DatagramProtocol):
         if (not 0 < port < 65536 or not 0 <= priority < 2**32
                 or address.is_unspecified or address.is_multicast or address.is_loopback
                 or str(address) == "255.255.255.255"):
+            return
+        if not _lan_address(str(address)):
+            self._blocked_non_lan += 1
             return
         self._remote_candidates.add((str(address), port))
         self._check_remote_candidates()
@@ -270,6 +285,9 @@ class IceResponder(asyncio.DatagramProtocol):
         transport = self._transport
         if transport is None:
             return
+        if not _lan_address(addr[0]):
+            self._blocked_non_lan += 1
+            return
         if (
             len(data) >= _STUN_HEADER_LENGTH
             and int.from_bytes(data[0:2], "big") == _BINDING_REQUEST
@@ -331,6 +349,7 @@ class IceResponder(asyncio.DatagramProtocol):
         return (
             f"bindings={self._binding_requests}, nominated={self._remote is not None}, "
             f"segments={self._received_segments}, "
+            f"blocked_non_lan={self._blocked_non_lan}, "
             f"auth_failures={self._authentication_failures}, "
             f"remote_candidates={len(self._remote_candidates)}, checks_sent={len(self._checked_candidates)}"
         )

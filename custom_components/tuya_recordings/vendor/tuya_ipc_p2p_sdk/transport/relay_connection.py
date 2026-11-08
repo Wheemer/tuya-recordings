@@ -73,25 +73,49 @@ class RelayConnection:
         self._received_frames: dict[int, int] = {}
         self._received_segments = 0
         self._decode_failures = 0
+        self._phase = "created"
+        self._failure = "none"
+        self._read_stage = "none"
+        self._read_expected = 0
+        self._read_partial = 0
+        self._handshake_status: int | None = None
+        self._socket_errno: int | None = None
+        self._endpoint_attempts = 0
 
     async def async_connect(self) -> None:
         """Dial the relay, run the handshake, and start carrying media."""
         if len(self._token.credential) < _CREDENTIAL_KEY_LENGTH:
             raise TuyaIpcP2pProtocolError("Failed to dial the relay: credential too short")
-        host, port = self._token.endpoint
+        self._phase = "dial"
         try:
             async with asyncio.timeout(_CONNECT_TIMEOUT_SECONDS):
-                self._reader, self._writer = await asyncio.open_connection(host, port)
+                last_error = None
+                for host, port in self._token.endpoints:
+                    self._endpoint_attempts += 1
+                    try:
+                        self._reader, self._writer = await asyncio.open_connection(host, port)
+                    except OSError as error:
+                        last_error = error
+                        continue
+                    break
+                else:
+                    raise last_error or OSError("No usable signaling endpoint")
         except (TimeoutError, OSError) as exception:
+            self._socket_errno = getattr(exception, "errno", None)
+            self._failure = "dial_timeout" if isinstance(exception, TimeoutError) else "dial_socket_error"
             raise TuyaIpcP2pConnectionError(
-                f"Failed to dial the relay {host}:{port}: {exception}"
+                "Failed to dial the signaling endpoints"
             ) from exception
         try:
+            self._phase = "handshake"
             async with asyncio.timeout(_HANDSHAKE_TIMEOUT_SECONDS):
                 await self._async_handshake()
-        except BaseException:
+        except BaseException as error:
+            if self._failure == "none":
+                self._failure = "handshake_timeout" if isinstance(error, TimeoutError) else "handshake_rejected"
             await self.async_close()
             raise
+        self._phase = "ready"
         self._reader_task = asyncio.create_task(self._async_read_loop())
         self._keepalive_task = asyncio.create_task(self._async_keepalive_loop())
 
@@ -135,7 +159,13 @@ class RelayConnection:
                 ),
             )
         )
-        await self._async_next_handshake_frame()
+        final = await self._async_next_handshake_frame()
+        complete = parse_handshake_frame(key, final)
+        status = complete.get("statuscode")
+        self._handshake_status = status if type(status) is int else None
+        if (final[:6] != b"\x00\x01\x00\x02\x00\x03"
+                or complete.get("method") != "complete" or self._handshake_status != 200):
+            raise TuyaIpcP2pProtocolError("Relay handshake completion rejected")
 
     async def _async_next_handshake_frame(self) -> bytes:
         """Read frames until a handshake one arrives, skipping keepalives."""
@@ -155,10 +185,18 @@ class RelayConnection:
         if reader is None:
             raise TuyaIpcP2pConnectionError("Failed to read from the relay: not connected")
         try:
+            self._read_stage, self._read_expected = "header", _FRAME_HEADER_LENGTH
             header = await reader.readexactly(_FRAME_HEADER_LENGTH)
             length = int.from_bytes(header[2:4], "big")
+            self._read_stage, self._read_expected = "payload", length
             payload = await reader.readexactly(length) if length else b""
-        except (asyncio.IncompleteReadError, ConnectionError, OSError) as exception:
+        except asyncio.IncompleteReadError as exception:
+            self._read_partial = len(exception.partial)
+            self._failure = "peer_eof"
+            raise TuyaIpcP2pConnectionError("Relay peer closed the stream") from exception
+        except (ConnectionError, OSError) as exception:
+            self._failure = "socket_error"
+            self._socket_errno = exception.errno
             raise TuyaIpcP2pConnectionError(
                 f"Failed to read from the relay: {exception}"
             ) from exception
@@ -195,6 +233,7 @@ class RelayConnection:
                     segment = unwrap_media_frame(self._media_key, payload)
                 except TuyaIpcP2pProtocolError:
                     self._decode_failures += 1
+                    self._failure = "frame_auth_or_length"
                     raise
                 self._received_segments += 1
                 if self._segment_handler is not None:
@@ -203,6 +242,13 @@ class RelayConnection:
             raise
         except Exception as exception:
             error = exception
+            if self._failure == "none":
+                self._failure = "invalid_frame" if isinstance(exception, TuyaIpcP2pProtocolError) else "reader_error"
+        self._phase = "peer_closed" if error is not None else "closed"
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+        if self._writer is not None:
+            self._writer.close()
         self._notify_closed(error)
 
     async def _async_keepalive_loop(self) -> None:
@@ -229,7 +275,11 @@ class RelayConnection:
         )
         return (
             f"frames={frames or 'none'}, segments={self._received_segments}, "
-            f"decode_failures={self._decode_failures}"
+            f"decode_failures={self._decode_failures}, phase={self._phase}, "
+            f"failure={self._failure}, read_stage={self._read_stage}, "
+            f"read_expected={self._read_expected}, read_partial={self._read_partial}, "
+            f"handshake_status={self._handshake_status}, socket_errno={self._socket_errno}"
+            f", endpoint_attempts={self._endpoint_attempts}"
         )
 
     def _notify_closed(self, error: Exception | None) -> None:

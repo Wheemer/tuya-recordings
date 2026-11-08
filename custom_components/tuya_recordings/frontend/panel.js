@@ -1020,7 +1020,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     const revision = this.playbackRevision;
     try {
       this.debugPlayback("player-import", this.selectedClip);
-      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261016-timeline-epoch-31');
+      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261108-native-clock-32');
       if (revision !== this.playbackRevision || !video.isConnected) return;
       this.disposePlayer?.();
       this.disposePlayer = null;

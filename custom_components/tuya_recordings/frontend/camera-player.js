@@ -25,6 +25,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   let audioTimestampScale = null;
   let audioTimestampScaleHint = null;
   let firstVideoTimestamp = null;
+  let videoTimestampScaleHint = null;
   let aacElement = null;
   let aacObjectUrl = '';
   let aacNode = null;
@@ -97,7 +98,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     if (!aacElement || firstAacTimestamp === null || firstVideoTimestamp === null) return;
     const scale = audioTimestampScaleHint;
     if (!scale) return;
-    const wanted = video.currentTime + (firstVideoTimestamp - firstAacTimestamp) / scale;
+    const wanted = video.currentTime + firstVideoTimestamp / (videoTimestampScaleHint || scale) - firstAacTimestamp / scale;
     if (streamStarting || video.paused || video.readyState < 3 || wanted < 0 || audioStalled) {
       aacElement.pause();
       return;
@@ -134,6 +135,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     audioSampleRate = 8000;
     audioChannels = 1;
     audioTimestampScaleHint = null;
+    videoTimestampScaleHint = null;
     audioTimestampScale = null;
     firstVideoTimestamp = null;
     videoAudioStartTime = 0;
@@ -434,7 +436,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       videoAudioStartTime = audioContext.currentTime + 0.08;
       audioTimestampScale = audioTimestampScaleHint || inferTimestampScale(queuedAudio, audioSampleRate, audioChannels);
       for (const item of queuedAudio.splice(0)) {
-        if (!firstVideoTimestamp || !item.timestamp || item.timestamp >= firstVideoTimestamp) {
+        if (!firstVideoTimestamp || !item.timestamp || item.timestamp / audioTimestampScale >= firstVideoTimestamp / (videoTimestampScaleHint || audioTimestampScale)) {
           scheduleAudio(item.kind, item.payload, item.timestamp);
         }
       }
@@ -528,6 +530,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           videoRecords = 0;
           queuedAudio.splice(0);
           audioTimestampScaleHint = null;
+          videoTimestampScaleHint = null;
           resetAudioTimeline();
           activeMediaEpoch = await createMediaPipeline();
           if (!activeMediaEpoch) return;
@@ -631,6 +634,10 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
             throw new Error('Camera AAC exceeded its buffered audio limit');
           }
           syncAac();
+        } else if (kind === 8) {
+          if (payload.length !== 4) throw new Error('Camera video format is invalid');
+          videoTimestampScaleHint = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(0);
+          if (!videoTimestampScaleHint || videoTimestampScaleHint > 1000000) throw new Error('Camera video clock is invalid');
         } else if (kind === 3) {
           streamComplete = true;
           debug('stream-complete', {
@@ -711,7 +718,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     if (audioStalled) return;
     const contiguousTime = Math.max(audioNextTime, audioContext.currentTime + 0.02);
     const timestampTime = audioTimestampScale && firstVideoTimestamp !== null && timestamp
-      ? videoAudioStartTime + ((timestamp - firstVideoTimestamp) / audioTimestampScale)
+      ? videoAudioStartTime + timestamp / audioTimestampScale - firstVideoTimestamp / (videoTimestampScaleHint || audioTimestampScale)
       : contiguousTime;
     const startTime = Math.max(contiguousTime, timestampTime);
     if (audioSources.size >= 512 || startTime + buffer.duration - audioContext.currentTime > 15) {

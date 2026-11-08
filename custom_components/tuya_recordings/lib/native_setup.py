@@ -31,18 +31,32 @@ class NativeBackendSetupError(RuntimeError):
     """The APK-native backend cannot be built from the current configuration."""
 
 
+class _OwnedAppCall:
+    """Keep the gateway's HTTP session in the backend's resource ownership."""
+
+    def __init__(self, gateway, session):
+        self.gateway = gateway
+        self.session = session
+
+    def __call__(self, api, version, body, extra_params):
+        return self.gateway.call_with_saved_session(api, version, body, self.session, extra_params)
+
+    def close(self):
+        self.gateway.session.close()
+
+
 def build_recordings_backend(
     entry_data: Mapping[str, Any],
 ) -> RecordingBackend:
     """Return the in-process native IMM/Simple backend or a fail-closed backend."""
 
     try:
-        app_call = native_app_call(entry_data)
         app_session = native_app_session(entry_data)
         local_keys = resolved_local_keys(entry_data)
         protocol_versions = resolved_protocol_versions(entry_data)
         if not local_keys:
             raise NativeBackendSetupError("No Tuya camera local keys are available")
+        app_call = native_app_call(entry_data)
     except NativeBackendSetupError as err:
         return NativeBackendNotConfigured(str(err))
 
@@ -64,11 +78,18 @@ def build_recordings_backend(
         media_secrets=media_secrets,
         call_api=app_call,
     )
+    def close_backend():
+        # Never close the HTTP gateway while an unjoined worker still owns it.
+        runtime_pool.close()
+        close = getattr(app_call, "close", None)
+        if callable(close):
+            close()
+
     return ApkNativeRecordingBackend(
         NativeCameraSessionProvider(
             session_config=provider.session_config,
             open_session=runtime_pool.session,
-            close=runtime_pool.close,
+            close=close_backend,
         )
     )
 
@@ -91,9 +112,7 @@ def native_app_call(
             app_profile_id=str(entry_data.get(CONF_APP_PROFILE) or "smart_life"),
             device_fingerprint=session["device_fingerprint"],
         )
-        return lambda api, version, body, extra_params: gateway.call_with_saved_session(
-            api, version, body, session, extra_params
-        )
+        return _OwnedAppCall(gateway, session)
     raise NativeBackendSetupError("Tuya mobile app-session authorization is not configured")
 
 
