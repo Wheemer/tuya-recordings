@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 _CONNECT_TIMEOUT_SECONDS = 10
 _HANDSHAKE_TIMEOUT_SECONDS = 10
 _KEEPALIVE_INTERVAL_SECONDS = 1.0
+_KEEPALIVE_TIMEOUT_SECONDS = 10.0
 _CREDENTIAL_KEY_LENGTH = 16
 _CLIENT_RANDOM_LENGTH = 32
 _FRAME_HEADER_LENGTH = 4
@@ -84,6 +85,7 @@ class RelayConnection:
         self._received_attributes = 0
         self._multi_attribute_frames = 0
         self._last_data_attributes = 0
+        self._empty_data_frames = 0
 
     async def async_connect(self) -> None:
         """Dial the relay, run the handshake, and start carrying media."""
@@ -224,10 +226,18 @@ class RelayConnection:
     async def _async_read_loop(self) -> None:
         """Read frames until the connection ends, handing segments to the session."""
         error: Exception | None = None
+        loop = asyncio.get_running_loop()
+        heartbeat_deadline = loop.time() + _KEEPALIVE_TIMEOUT_SECONDS
         try:
             while not self._closed:
-                magic, payload = await self._async_read_frame()
+                try:
+                    async with asyncio.timeout_at(heartbeat_deadline):
+                        magic, payload = await self._async_read_frame()
+                except TimeoutError as exception:
+                    self._failure = "heartbeat_timeout"
+                    raise TuyaIpcP2pConnectionError("Native signaling heartbeat timed out") from exception
                 if magic == FRAME_KEEPALIVE:
+                    heartbeat_deadline = loop.time() + _KEEPALIVE_TIMEOUT_SECONDS
                     continue
                 if magic != FRAME_MEDIA:
                     LOGGER.debug("Discarded relay frame 0x%02x (%s bytes)", magic, len(payload))
@@ -241,6 +251,9 @@ class RelayConnection:
                 self._received_attributes += attributes
                 self._multi_attribute_frames += int(attributes > 1)
                 self._last_data_attributes = data_attributes
+                if not segment:
+                    self._empty_data_frames += 1
+                    continue
                 self._received_segments += 1
                 if self._segment_handler is not None:
                     self._segment_handler(segment)
@@ -250,7 +263,10 @@ class RelayConnection:
             error = exception
             if self._failure == "none":
                 self._failure = "invalid_frame" if isinstance(exception, TuyaIpcP2pProtocolError) else "reader_error"
-        self._phase = "peer_closed" if error is not None else "closed"
+        self._phase = (
+            "timed_out" if self._failure == "heartbeat_timeout"
+            else "peer_closed" if error is not None else "closed"
+        )
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
         if self._writer is not None:
@@ -283,6 +299,7 @@ class RelayConnection:
             f"frames={frames or 'none'}, segments={self._received_segments}, "
             f"f6_attributes={self._received_attributes}, multi_attribute_frames={self._multi_attribute_frames}, "
             f"last_data_attributes={self._last_data_attributes}, "
+            f"empty_data_frames={self._empty_data_frames}, "
             f"decode_failures={self._decode_failures}, phase={self._phase}, "
             f"failure={self._failure}, read_stage={self._read_stage}, "
             f"read_expected={self._read_expected}, read_partial={self._read_partial}, "

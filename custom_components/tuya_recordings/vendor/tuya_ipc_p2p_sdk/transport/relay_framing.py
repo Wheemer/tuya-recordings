@@ -87,8 +87,10 @@ def decode_media_frame(media_key: bytes, payload: bytes) -> tuple[bytes, int, in
             data_attributes += 1
         attributes += 1
         cursor = padded_end
-    if selected is None or len(selected) < MEDIA_TAG_LENGTH:
-        raise TuyaIpcP2pProtocolError("Failed to read media frame: no tagged type-7 data")
+    if selected is None or not selected:
+        return b"", attributes, data_attributes
+    if len(selected) < MEDIA_TAG_LENGTH:
+        raise TuyaIpcP2pProtocolError("Failed to read media frame: truncated type-7 authentication tag")
     segment = selected[:-MEDIA_TAG_LENGTH]
     if not hmac.compare_digest(selected[-MEDIA_TAG_LENGTH:], media_tag(media_key, segment)):
         raise TuyaIpcP2pProtocolError("Failed to read media frame: tag mismatch")

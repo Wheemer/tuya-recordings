@@ -26,7 +26,7 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.kcp_seg
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.relay_framing import (
     FRAME_HANDSHAKE, FRAME_MEDIA, assemble_handshake_frame, media_frame,
-    parse_handshake_frame, unwrap_media_frame,
+    parse_handshake_frame, unwrap_media_frame, keepalive_frame,
 )
 
 
@@ -108,10 +108,14 @@ def test_f6_valid_first_ack_does_not_mask_invalid_last_data_tag():
 
 
 def test_f6_unknown_attribute_is_not_mistaken_for_native_data():
-    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
     ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
-    with pytest.raises(TuyaIpcP2pProtocolError, match="type-7"):
-        unwrap_media_frame(OFFER_KEY, f6_attribute(5, ack + hmac_sha1(OFFER_KEY, ack)))
+    assert unwrap_media_frame(OFFER_KEY, f6_attribute(5, ack + hmac_sha1(OFFER_KEY, ack))) == b""
+
+
+def test_f6_empty_last_data_attribute_does_not_fall_back_to_previous_data():
+    ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
+    body = f6_attribute(7, ack + hmac_sha1(OFFER_KEY, ack)) + f6_attribute(7, b"")
+    assert unwrap_media_frame(OFFER_KEY, body) == b""
 
 
 def command(on_signal, direct=lambda _: None):
@@ -255,6 +259,9 @@ class Peer:
                 self.offers.append(payload)
                 if self.mode == "silent":
                     continue
+                if self.mode in {"nondata_answer", "batched_answer"}:
+                    for body in (b"", f6_attribute(9, b"nondata"), f6_attribute(7, b"")):
+                        writer.write(struct.pack(">BBH", 0xF6, 0, len(body)) + body)
                 answer = message(sid=payload["header"]["sessionid"])
                 answer["header"].update({"from": "camera-device", "to": "account-uid"})
                 if self.mode == "foreign":
@@ -297,6 +304,10 @@ class Peer:
             ))
             if self.mode in {"rejected", "eof_ready"}:
                 return
+            if self.mode == "heartbeat":
+                for _ in range(5):
+                    await asyncio.sleep(0.06)
+                    writer.write(keepalive_frame())
             while True:
                 magic, body = await self.read(reader)
                 if magic == FRAME_MEDIA:
@@ -322,7 +333,7 @@ class Peer:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "batched_answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
+    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
 ] + [("background", False), ("udp_answer", True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
@@ -440,7 +451,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
         try:
-            if mode in {"answer", "batched_answer", "udp_answer"}:
+            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer"}:
                 await session.connect(media=media, allow_wake=True, retry_offer=True)
                 assert session._answer_source == "command"
                 assert session._command._blocked == 3
@@ -458,6 +469,9 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert peer.batched_frames == 1
                     assert session._command._connection._multi_attribute_frames == 1
                     assert "last_data_attributes=2" in session._command.diagnostics
+                if mode in {"nondata_answer", "batched_answer", "udp_answer"}:
+                    assert session._command._connection._empty_data_frames == 3
+                    assert session._command._connection._decode_failures == 0
                 assert not session._command._tcp_ready
                 assert session._command._channel._retransmit_task is None
                 if media:
@@ -562,6 +576,40 @@ async def test_cancelled_native_command_handshake_joins_every_task():
         assert c._connection._writer is None
         assert c._connection._reader_task is None
         assert c._connection._keepalive_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["silent", "heartbeat"])
+async def test_native_tcp_heartbeat_deadline_is_refreshed_and_never_reconnects(monkeypatch, mode):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import relay_connection
+    monkeypatch.setattr(relay_connection, "_KEEPALIVE_TIMEOUT_SECONDS", 0.25, raising=False)
+    async with Peer(mode) as peer:
+        peer.key = OFFER_KEY
+        c = NativeCommandSignaling(
+            token=token(peer.port), device_id="camera-device", uid="account-uid",
+            session_id="session", key=OFFER_KEY, transmit_direct=lambda _: None,
+            on_signal=lambda _: pytest.fail("Heartbeat is not a signaling answer"),
+        )
+        ready = asyncio.Event()
+        task = asyncio.create_task(c.start(ready.wait, tcp=True))
+        try:
+            async with asyncio.timeout(1):
+                while not c._tcp_ready:
+                    await asyncio.sleep(0.001)
+            if mode == "heartbeat":
+                await asyncio.sleep(0.35)
+                assert c._tcp_ready
+                assert c._connection._received_frames[0xF5] == 5
+            async with asyncio.timeout(1):
+                while c._connection._failure != "heartbeat_timeout":
+                    await asyncio.sleep(0.001)
+            assert not c._tcp_ready
+            assert c._connection._phase == "timed_out"
+            assert c._tcp_attempts == peer.opened == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await c.async_close()
 
 
 @pytest.mark.asyncio
