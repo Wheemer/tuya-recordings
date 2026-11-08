@@ -94,6 +94,31 @@ def test_only_manual_catalog_service_enables_offer_resends(monkeypatch):
     assert observed == [(False, False), (True, True), (False, False)]
 
 
+def test_scheduled_catalog_drops_inherited_manual_context(monkeypatch):
+    from custom_components.tuya_recordings.lib.commands import MANUAL_REFRESH_ID, manual_catalog_refresh
+    client = TuyaRecordingsClient({})
+    observed = []
+    def refresh(limit):
+        observed.append((MANUAL_REFRESH_ID.get(), ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get()))
+        return {}
+    async def execute(function, *args):
+        return await asyncio.get_running_loop().run_in_executor(None, function, *args)
+    monkeypatch.setattr(client, "refresh_background_catalog", refresh)
+    monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
+    hass = SimpleNamespace(data={DOMAIN: {"entry": {"client": client}}}, async_add_executor_job=execute)
+    async def scenario():
+        token = MANUAL_REFRESH_ID.set("old-manual")
+        try:
+            with manual_catalog_refresh():
+                await integration._async_run_catalog_refresh(hass, "entry", "catalog_cycle")
+                assert MANUAL_REFRESH_ID.get() == "old-manual"
+                assert ON_DEMAND_DAY_CATALOG.get() and ON_DEMAND_OFFER_RETRIES.get()
+        finally:
+            MANUAL_REFRESH_ID.reset(token)
+    asyncio.run(scenario())
+    assert observed == [("-", False, False)]
+
+
 def test_manual_catalog_waits_for_scheduled_pass_then_runs_with_its_own_scope(monkeypatch):
     import threading
 
@@ -146,7 +171,7 @@ def test_manual_catalog_waits_for_scheduled_pass_then_runs_with_its_own_scope(mo
     assert observed == [(False, False), (True, True), (False, False)]
 
 
-def test_manual_catalog_logs_retained_backoff_without_a_new_camera_attempt(tmp_path, monkeypatch, caplog):
+def test_manual_catalog_bypasses_scheduler_backoff_with_short_repeat_cooldown(tmp_path, monkeypatch, caplog):
     import logging
     from datetime import datetime, timedelta, timezone
     from custom_components.tuya_recordings.lib.commands import MANUAL_REFRESH_ID, manual_catalog_refresh
@@ -163,18 +188,21 @@ def test_manual_catalog_logs_retained_backoff_without_a_new_camera_attempt(tmp_p
         "catalogRetryAfter": (now + timedelta(minutes=5)).isoformat(),
         "bridgeStatus": {"error": "old-error-not-a-new-attempt"},
     }]}
-    monkeypatch.setattr(client, "_recordings_for_day", Mock(side_effect=AssertionError("unexpected camera request")))
+    query = Mock(return_value=[])
+    monkeypatch.setattr(client, "_recordings_for_day", query)
     caplog.set_level(logging.INFO, logger="custom_components.tuya_recordings")
     token = MANUAL_REFRESH_ID.set("fixture-refresh")
     try:
         with manual_catalog_refresh():
             result = client.refresh_background_catalog(1)
+            client.refresh_background_catalog(1)
     finally:
         MANUAL_REFRESH_ID.reset(token)
-    assert result["cameras"][0]["bridgeStatus"]["error"] == "old-error-not-a-new-attempt"
+    assert query.call_count == 1
+    assert result["cameras"][0]["bridgeStatus"]["error"] == ""
     assert "request_id=fixture-refresh" in caplog.text
-    assert "reason=cache_or_backoff retained_error=True" in caplog.text
-    assert "catalog query started" not in caplog.text
+    assert "reason=manual_cooldown" in caplog.text
+    assert "catalog query started" in caplog.text
     assert "catalog query failed" not in caplog.text
     assert "old-error-not-a-new-attempt" not in caplog.text
     assert MANUAL_REFRESH_ID.get() == "-"

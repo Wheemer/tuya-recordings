@@ -183,6 +183,7 @@ class TuyaRecordingsClient:
         self._browse_days: dict[tuple[str, str], float] = {}
         self._browse_months: dict[tuple[str, str], float] = {}
         self._browse_camera_failures: dict[str, float] = {}
+        self._manual_catalog_after: dict[str, float] = {}
         self._browse_discovery_error = ""
         self._thumbnail_autofill_lock = threading.Lock()
         self._thumbnail_create_lock = threading.Lock()
@@ -810,18 +811,25 @@ class TuyaRecordingsClient:
                 days = self.lookback_days if self.lookback_days > 0 else RECORDING_SCAN_MAX_DAYS
                 index = {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "cameras": cameras}
                 by_id = {camera["devId"]: camera for camera in cameras}
-                queries = catalog_queries(cameras, today=today, now=now, days=days, limit=limit)
+                manual = ON_DEMAND_DAY_CATALOG.get()
+                eligible = cameras
+                if manual:
+                    eligible = [camera for camera in cameras if time.monotonic() >= self._manual_catalog_after.get(camera["devId"], 0)]
+                queries = catalog_queries(eligible, today=today, now=now, days=days, limit=limit, manual=manual)
                 request_id = MANUAL_REFRESH_ID.get()
                 log = LOGGER.info if request_id != "-" else LOGGER.debug
                 queried = {dev_id for dev_id, _ in queries}
                 for camera in cameras:
                     if camera["devId"] not in queried:
                         log(
-                            "Tuya Recordings catalog query skipped request_id=%s dev=%s reason=cache_or_backoff "
+                            "Tuya Recordings catalog query skipped request_id=%s dev=%s reason=%s "
                             "retained_error=%s last_error_at=%s retry_after=%s",
-                            request_id, camera["devId"], bool(camera.get("bridgeStatus", {}).get("error")),
+                            request_id, camera["devId"],
+                            "manual_cooldown" if manual and time.monotonic() < self._manual_catalog_after.get(camera["devId"], 0) else "cache_or_backoff",
+                            bool(camera.get("bridgeStatus", {}).get("error")),
                             camera.get("catalogErrorAt", "none"), camera.get("catalogRetryAfter", "none"),
                         )
+                failed_cameras = set()
                 for dev_id, day in queries:
                     if active.is_set():
                         raise CameraWorkCancelled("Recording catalog pass cancelled")
@@ -829,6 +837,12 @@ class TuyaRecordingsClient:
                         log(
                             "Tuya Recordings catalog query skipped request_id=%s dev=%s day=%s "
                             "reason=sd_status_timeout_cooldown fresh_attempt=False",
+                            request_id, dev_id, day.isoformat(),
+                        )
+                        continue
+                    if dev_id in failed_cameras:
+                        log(
+                            "Tuya Recordings catalog query skipped request_id=%s dev=%s day=%s reason=failed_this_pass fresh_attempt=False",
                             request_id, dev_id, day.isoformat(),
                         )
                         continue
@@ -864,8 +878,10 @@ class TuyaRecordingsClient:
                             "Tuya Recordings catalog query failed request_id=%s dev=%s day=%s fresh_attempt=True",
                             request_id, dev_id, day.isoformat(),
                         )
-                        failure_count, retry_after = next_catalog_retry_after(camera, now)
-                        camera["catalogErrorAt"] = now.isoformat()
+                        failed_cameras.add(dev_id)
+                        failed_at = datetime.now(timezone.utc)
+                        failure_count, retry_after = next_catalog_retry_after(camera, failed_at)
+                        camera["catalogErrorAt"] = failed_at.isoformat()
                         camera["catalogErrorCount"] = failure_count
                         camera["catalogRetryAfter"] = retry_after.isoformat()
                         camera["bridgeStatus"] = {
@@ -875,6 +891,9 @@ class TuyaRecordingsClient:
                         }
                         self._store_cache(index, CACHE_TTL)
                         continue
+                    finally:
+                        if manual:
+                            self._manual_catalog_after[dev_id] = time.monotonic() + 30
                     self._store_cache(index, CACHE_TTL)
                 if active.is_set():
                     raise CameraWorkCancelled("Recording catalog pass cancelled")

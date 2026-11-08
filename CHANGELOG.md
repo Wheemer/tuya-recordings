@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-12 (2026-11-08)
+
+### Connection
+
+- Match the Smart Life APK's native TCP decoder by scanning all frame attributes and selecting the last type-7 data attribute, rather than silently discarding a later answer behind an ACK.
+- Keep the connection open after well-formed frames without native data so a later authenticated answer can still arrive. Malformed frames and invalid authentication tags remain rejected.
+- Apply the APK's ten-second inbound heartbeat deadline without reconnecting. Distinguish local heartbeat timeouts from remote socket closure.
+- Add frame-attribute counts, ignored non-data counts, ACK sequence details, and pending-segment diagnostics without exposing credentials or payloads. Video and audio remain LAN-only.
+
+### Refresh Recordings
+
+- Let manual Refresh recordings try again during automatic catalog backoff, with a separate 30-second repeat cooldown. Existing wake-timeout safety limits remain active.
+- Stop querying older days for a camera after its first failure in a pass, while allowing other cameras to continue. Start automatic backoff when the failed attempt finishes.
+- Prevent scheduled catalog work from inheriting a manual request ID or foreground wake and resend permissions.
+
 ## Tuya Recordings v0.4.13-11 (2026-11-08)
 
 ### Connection

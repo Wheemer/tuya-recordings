@@ -84,6 +84,48 @@ def test_catalog_failure_is_backed_off_per_camera_without_blocking_others():
     assert cameras["camera-with-recordings"]["clips"][0]["start"] == 100
 
 
+def test_any_catalog_failure_stops_remaining_days_for_that_camera(tmp_path, monkeypatch):
+    calls = []
+    client = TuyaRecordingsClient({}, cache_path=tmp_path / "index.json")
+    client.lookback_days = 3
+    client.set_camera_inventory({"camera": "Front"})
+    def failed(dev_id, day):
+        calls.append((dev_id, day))
+        raise RuntimeError("DEVICE_OFFLINE")
+    monkeypatch.setattr(client, "_recordings_for_day", failed)
+    index = client.refresh_background_catalog(limit=3)
+    assert len(calls) == 1
+    assert index["cameras"][0]["catalogErrorCount"] == 1
+
+
+def test_manual_refresh_cooldown_expires_without_changing_background_backoff(tmp_path, monkeypatch):
+    import custom_components.tuya_recordings.client as client_module
+    from custom_components.tuya_recordings.lib.commands import manual_catalog_refresh
+    clock = [100.0]
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    calls = []
+    client = TuyaRecordingsClient({}, cache_path=tmp_path / "index.json")
+    client.set_camera_inventory({"camera": "Front"})
+    def failed(dev_id, day):
+        calls.append((dev_id, day))
+        clock[0] += 20
+        raise RuntimeError("No answer")
+    monkeypatch.setattr(client, "_recordings_for_day", failed)
+    client.refresh_background_catalog(2)
+    assert len(calls) == 1
+    with manual_catalog_refresh():
+        client.refresh_background_catalog(2)
+        assert len(calls) == 2
+        clock[0] += 29
+        client.refresh_background_catalog(2)
+        assert len(calls) == 2
+        clock[0] += 1
+        client.refresh_background_catalog(2)
+        assert len(calls) == 3
+    client.refresh_background_catalog(2)
+    assert len(calls) == 3
+
+
 def test_sd_status_timeout_skips_remaining_days_without_blocking_other_cameras(monkeypatch, tmp_path, caplog):
     import logging
     import custom_components.tuya_recordings.client as client_module

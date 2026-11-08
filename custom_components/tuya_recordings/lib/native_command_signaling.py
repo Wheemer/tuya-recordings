@@ -72,6 +72,7 @@ class NativeCommandSignaling:
         self._tcp_push_duplicates = 0
         self._tcp_pushes = 0
         self._lan_packets = 0
+        self._last_ack = "none"
 
     def queue(self, payload: bytes) -> None:
         """Queue a single framed signaling message, with bounded plaintext."""
@@ -185,6 +186,8 @@ class NativeCommandSignaling:
     def _input(self, segment: KcpSegment) -> None:
         count_key = (self._input_source, segment.command)
         self._segment_counts[count_key] = self._segment_counts.get(count_key, 0) + 1
+        if segment.command == 0x52:
+            self._last_ack = f"{self._input_source}:sn={segment.sequence}:una={segment.unacknowledged}"
         try:
             if len(segment.data) > _MAX_ENCRYPTED_CHUNK:
                 raise ValueError("Native command chunk limit")
@@ -293,6 +296,8 @@ class NativeCommandSignaling:
             f"source={self._signal_source}, tcp_attempts={self._tcp_attempts}, "
             f"session_mismatches={self._mismatches}, blocked_media={self._blocked}, "
             f"failure={self._failure}, packets={packets}, "
+            f"last_ack={self._last_ack}, pending_segments={self._channel.pending_count}, "
+            f"next_receive_sequence={self._channel.receive_sequence}, "
             f"tcp_duplicate_pushes_suppressed={self._tcp_push_duplicates}, "
             f"tcp_pushes={self._tcp_pushes}, lan_packets={self._lan_packets}, "
             f"queued_signals={len(self._queued)}, "

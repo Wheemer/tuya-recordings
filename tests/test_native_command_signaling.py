@@ -15,6 +15,7 @@ from custom_components.tuya_recordings.lib.native_command_signaling import (
     NativeCommandSignaling,
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import decrypt_record, encrypt_record
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.models.relay_token import RelayToken
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.handshake_signer import (
     HandshakeSigner, authorization_field,
@@ -25,7 +26,7 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.kcp_seg
 )
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.relay_framing import (
     FRAME_HANDSHAKE, FRAME_MEDIA, assemble_handshake_frame, media_frame,
-    parse_handshake_frame, unwrap_media_frame,
+    parse_handshake_frame, unwrap_media_frame, keepalive_frame,
 )
 
 
@@ -72,6 +73,49 @@ def message(kind="answer", sid="session", **data):
 def record(value):
     payload = json.dumps(value).encode()
     return struct.pack(">HH", 1, len(payload)) + payload + bytes(-len(payload) % 4)
+
+
+def f6_attribute(kind, value):
+    return struct.pack(">HH", kind, len(value)) + value + bytes(-len(value) % 4)
+
+
+def test_f6_scans_attributes_and_uses_the_last_native_data_attribute():
+    ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
+    push = build_segment(COMMAND_CONVERSATION, CMD_PUSH, 0, 512, 0, 0, 0, b"answer")
+    body = (
+        f6_attribute(5, b"not a KCP attribute")
+        + f6_attribute(7, ack + hmac_sha1(OFFER_KEY, ack))
+        + f6_attribute(7, push + hmac_sha1(OFFER_KEY, push))
+        + f6_attribute(9, b"end")
+    )
+    assert unwrap_media_frame(OFFER_KEY, body) == push
+
+
+@pytest.mark.parametrize("tail", [b"\x00", b"\x00\x07\x00\x20short", b"\x00\x05\x00\x03abc"])
+def test_f6_does_not_silently_ignore_a_truncated_trailing_attribute(tail):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
+    frame = media_frame(OFFER_KEY, build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1))
+    with pytest.raises(TuyaIpcP2pProtocolError, match="truncated"):
+        unwrap_media_frame(OFFER_KEY, frame[4:] + tail)
+
+
+def test_f6_valid_first_ack_does_not_mask_invalid_last_data_tag():
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
+    ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
+    body = f6_attribute(7, ack + hmac_sha1(OFFER_KEY, ack)) + f6_attribute(7, ack + bytes(20))
+    with pytest.raises(TuyaIpcP2pProtocolError, match="tag mismatch"):
+        unwrap_media_frame(OFFER_KEY, body)
+
+
+def test_f6_unknown_attribute_is_not_mistaken_for_native_data():
+    ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
+    assert unwrap_media_frame(OFFER_KEY, f6_attribute(5, ack + hmac_sha1(OFFER_KEY, ack))) == b""
+
+
+def test_f6_empty_last_data_attribute_does_not_fall_back_to_previous_data():
+    ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 1)
+    body = f6_attribute(7, ack + hmac_sha1(OFFER_KEY, ack)) + f6_attribute(7, b"")
+    assert unwrap_media_frame(OFFER_KEY, body) == b""
 
 
 def command(on_signal, direct=lambda _: None):
@@ -154,6 +198,7 @@ class Peer:
         self.opened = 0
         self.closed = asyncio.Event()
         self.errors = []
+        self.batched_frames = 0
 
     async def __aenter__(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -180,7 +225,23 @@ class Peer:
         key = t.credential[:16].encode()
         buffer = bytearray()
         channels = {}
+        pending_ack = None
         def send(raw):
+            nonlocal pending_ack
+            segment = parse_segments(raw)[0]
+            if self.mode == "batched_answer" and segment.conversation == COMMAND_CONVERSATION:
+                if segment.command == 0x52:
+                    pending_ack = raw
+                    return
+                if segment.command == CMD_PUSH:
+                    assert pending_ack is not None
+                    body = b""
+                    for packet in (pending_ack, raw):
+                        tagged = packet + hmac_sha1(self.key, packet)
+                        body += struct.pack(">HH", 7, len(tagged)) + tagged + bytes(-len(tagged) % 4)
+                    writer.write(struct.pack(">BBH", 0xF6, 0, len(body)) + body)
+                    self.batched_frames += 1
+                    return
             writer.write(media_frame(self.key, raw))
         channels[COMMAND_CONVERSATION] = KcpConversation(COMMAND_CONVERSATION, send)
 
@@ -198,6 +259,9 @@ class Peer:
                 self.offers.append(payload)
                 if self.mode == "silent":
                     continue
+                if self.mode in {"nondata_answer", "batched_answer"}:
+                    for body in (b"", f6_attribute(9, b"nondata"), f6_attribute(7, b"")):
+                        writer.write(struct.pack(">BBH", 0xF6, 0, len(body)) + body)
                 answer = message(sid=payload["header"]["sessionid"])
                 answer["header"].update({"from": "camera-device", "to": "account-uid"})
                 if self.mode == "foreign":
@@ -240,11 +304,18 @@ class Peer:
             ))
             if self.mode in {"rejected", "eof_ready"}:
                 return
+            if self.mode == "heartbeat":
+                for _ in range(5):
+                    await asyncio.sleep(0.06)
+                    writer.write(keepalive_frame())
             while True:
                 magic, body = await self.read(reader)
                 if magic == FRAME_MEDIA:
                     for segment in parse_segments(unwrap_media_frame(self.key, body)):
                         assert segment.conversation == COMMAND_CONVERSATION
+                        if self.mode == "batched_answer" and segment.command == CMD_PUSH:
+                            pending_ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512,
+                                segment.timestamp, segment.sequence, segment.sequence + 1)
                         channels[COMMAND_CONVERSATION].input(segment)
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
             pass
@@ -262,11 +333,11 @@ class Peer:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
+    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
 ] + [("background", False), ("udp_answer", True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
-    async with Peer("answer" if mode == "udp_answer" else mode) as peer:
+    async with Peer("batched_answer" if mode == "udp_answer" else mode) as peer:
         config = camera_config()
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
@@ -380,7 +451,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
         try:
-            if mode in {"answer", "udp_answer"}:
+            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer"}:
                 await session.connect(media=media, allow_wake=True, retry_offer=True)
                 assert session._answer_source == "command"
                 assert session._command._blocked == 3
@@ -394,6 +465,13 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert session._ice._nominated.is_set()
                 assert session._sd_status_query == "report_received"
                 assert peer.opened == len(peer.offers) == 1
+                if mode in {"batched_answer", "udp_answer"}:
+                    assert peer.batched_frames == 1
+                    assert session._command._connection._multi_attribute_frames == 1
+                    assert "last_data_attributes=2" in session._command.diagnostics
+                if mode in {"nondata_answer", "batched_answer", "udp_answer"}:
+                    assert session._command._connection._empty_data_frames == 3
+                    assert session._command._connection._decode_failures == 0
                 assert not session._command._tcp_ready
                 assert session._command._channel._retransmit_task is None
                 if media:
@@ -458,6 +536,22 @@ async def test_native_command_receives_over_lan_without_sending_push_over_ice():
 
 
 @pytest.mark.asyncio
+async def test_ack_only_is_not_a_signaling_answer_and_reports_pending_segments():
+    received = []
+    c = command(received.append)
+    try:
+        c._input_source = "TCP"
+        segment = parse_segments(build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 0))[0]
+        c._input(segment)
+        assert received == []
+        assert "signals=0" in c.diagnostics
+        assert "last_ack=TCP:sn=0:una=0" in c.diagnostics
+        assert "pending_segments=0" in c.diagnostics
+    finally:
+        await c.async_close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_native_command_handshake_joins_every_task():
     async with Peer("stall_handshake") as peer:
         c = NativeCommandSignaling(
@@ -482,6 +576,40 @@ async def test_cancelled_native_command_handshake_joins_every_task():
         assert c._connection._writer is None
         assert c._connection._reader_task is None
         assert c._connection._keepalive_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["silent", "heartbeat"])
+async def test_native_tcp_heartbeat_deadline_is_refreshed_and_never_reconnects(monkeypatch, mode):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import relay_connection
+    monkeypatch.setattr(relay_connection, "_KEEPALIVE_TIMEOUT_SECONDS", 0.25, raising=False)
+    async with Peer(mode) as peer:
+        peer.key = OFFER_KEY
+        c = NativeCommandSignaling(
+            token=token(peer.port), device_id="camera-device", uid="account-uid",
+            session_id="session", key=OFFER_KEY, transmit_direct=lambda _: None,
+            on_signal=lambda _: pytest.fail("Heartbeat is not a signaling answer"),
+        )
+        ready = asyncio.Event()
+        task = asyncio.create_task(c.start(ready.wait, tcp=True))
+        try:
+            async with asyncio.timeout(1):
+                while not c._tcp_ready:
+                    await asyncio.sleep(0.001)
+            if mode == "heartbeat":
+                await asyncio.sleep(0.35)
+                assert c._tcp_ready
+                assert c._connection._received_frames[0xF5] == 5
+            async with asyncio.timeout(1):
+                while c._connection._failure != "heartbeat_timeout":
+                    await asyncio.sleep(0.001)
+            assert not c._tcp_ready
+            assert c._connection._phase == "timed_out"
+            assert c._tcp_attempts == peer.opened == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await c.async_close()
 
 
 @pytest.mark.asyncio
