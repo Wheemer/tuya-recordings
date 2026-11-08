@@ -1312,7 +1312,7 @@ async def test_http_initialization_accepts_bootstrap_without_preissued_ice_keys(
     playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
     from unittest.mock import AsyncMock
     monkeypatch.setattr(playback, "_connect_mqtt", AsyncMock())
-    assert playback._stream_config is None
+    assert playback._stream_config.relay_token is None
     await playback._initialize_http_offer("trace")
     assert len(requests) == 1
     assert playback._http_initialized
@@ -1939,8 +1939,8 @@ def test_connect_uses_mqtt_signaling_and_requires_direct_ice(monkeypatch, bootst
     expected = [
         "mqtt-connect",
         "offer",
-        "ice-gather",
         "direct-open",
+        "ice-gather",
     ]
     if bootstrap != "app-token":
         expected.insert(1, "http-init")
@@ -2250,10 +2250,10 @@ def test_start_keeps_media_delivered_while_playback_acknowledgements_arrive():
 
         async def response(*_args, **_kwargs):
             playback._video.handler(
-                media_record(0x00010004, 1, 1000, 96, b"\x65video")
+                media_record(playback._stream_id, 1, 1000, 96, b"\x65video")
             )
             playback._audio.handler(
-                media_record(0x00010005, 1, 8000, 99, b"\x00\x00\xff\x7f")
+                media_record(playback._stream_id, 1, 8000, 99, b"\x00\x00\xff\x7f")
             )
 
         playback._wait_for_playback_responses = response

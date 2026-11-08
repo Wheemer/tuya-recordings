@@ -118,7 +118,13 @@ def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
 async def _bounded_cleanup(operation: Any) -> bool:
     """Run one transport cleanup step without allowing it to wedge playback."""
     task = asyncio.ensure_future(operation)
-    done, _ = await asyncio.wait({task}, timeout=_CLOSE_STEP_TIMEOUT_SECONDS)
+    task.add_done_callback(_consume_cleanup_result)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_CLOSE_STEP_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.wait({task}, timeout=_CLOSE_STEP_TIMEOUT_SECONDS)
+        raise
     if task in done:
         await task
         return True
@@ -149,6 +155,8 @@ class NativeRelayPlaybackSession:
         call_api: Any = None,
     ) -> None:
         self._native_config = config.validate()
+        if self._native_config.p2p_security_level != 3:
+            raise NativeRelayPlaybackError("Native security level is unsupported by this transport")
         self._call_api = call_api
         if self._native_config.p2p_type != 4:
             raise NativeRelayPlaybackError(
@@ -275,7 +283,10 @@ class NativeRelayPlaybackSession:
         ice_status = ice.diagnostics if ice is not None else "unavailable"
         lan_answers = self._answer_lan or (self._moto if self._signaling_path == "lan" else None)
         wake_status = self._wake_status
-        if wake_status == "sent_unconfirmed" and getattr(self._moto, "low_power_wake_confirmed", False):
+        if wake_status == "sent_unconfirmed" and (
+            self._sd_status_query == "report_received"
+            or getattr(self._moto, "low_power_wake_confirmed", False)
+        ):
             wake_status = "confirmed"
         config = self._native_config
         _, api_version, _, _ = native_session_api_request(
@@ -391,7 +402,9 @@ class NativeRelayPlaybackSession:
             f"{config.device_id}{int(time.time())}"
             f"{random_alphanumeric(_RENDEZVOUS_SUFFIX_LENGTH)}"
         )
-        token = config.relay_token if self._http_initialized else config.relay_token.with_session_id(rendezvous_id)
+        token = config.relay_token
+        if token is not None and not self._http_initialized:
+            token = token.with_session_id(rendezvous_id)
         trace_id = self._http_trace_id if self._http_initialized else self._native_config.trace_id
         self._offer = self._offer or build_offer(
             self._uid,
@@ -406,7 +419,7 @@ class NativeRelayPlaybackSession:
                 self._offer.sdp,
                 config.ice_servers_as_json(),
                 trace_id,
-                token.as_json(),
+                token.as_json() if token is not None else {},
                 config.log_config_as_json(),
             )
             config = self._stream_config
@@ -419,11 +432,11 @@ class NativeRelayPlaybackSession:
                 on_segment=self._on_direct_segment,
                 local_ufrag=p2p.ice_ufrag,
             )
-            await self._ice.async_gather()
             self._session = DirectSession(self._ice.send_segment)
             self._start_command_signaling(
                 tcp=media or self._on_demand_catalog or self._retry_mqtt_offer,
             )
+            await self._ice.async_gather()
             self._connect_phase = "wait_answer"
             answer = await self._wait_for_answer()
             if self._command is not None:
@@ -568,7 +581,8 @@ class NativeRelayPlaybackSession:
             await self._initialize_http_offer(trace_id)
             sdp = self._require_offer().sdp
             ice_servers = self._stream_config.ice_servers_as_json()
-            tcp_token = self._stream_config.relay_token.as_json()
+            relay = self._stream_config.relay_token
+            tcp_token = relay.as_json() if relay is not None else {}
             log_config = self._stream_config.log_config_as_json()
         if not self._http_initialized:
             self._token_route = "app_token"
@@ -616,7 +630,7 @@ class NativeRelayPlaybackSession:
         if self._native_config.p2p_security_level != 3:
             self._command_status = "security_mode_unavailable"
             return
-        token = RelayToken.from_json(self._command_token)
+        token = RelayToken.from_json(self._command_token) if self._command_token else None
         self._command = NativeCommandSignaling(
             token=token, device_id=self._stream_config.device_id, uid=self._uid,
             session_id=self.local_cid, key=self._offer.aes_key,
@@ -1710,6 +1724,11 @@ class NativeRelayPlaybackSession:
             self._media_stream_packets[packet.stream_id] = (
                 self._media_stream_packets.get(packet.stream_id, 0) + 1
             )
+            if self._playback_started and self._stream_id is not None:
+                # ThingPlayTask admits video by task, audio by full request ID.
+                if (conversation == _VIDEO_CONVERSATION and packet.stream_id >> 16 != self._task_id
+                        or conversation == _AUDIO_CONVERSATION and packet.stream_id != self._stream_id):
+                    continue
             if packet.codec_info:
                 self._rtp_codec_info[conversation] = (
                     self._rtp_codec_info.get(conversation, 0) + 1

@@ -31,7 +31,7 @@ _MINIMUM_PACKET_LENGTH = 8
 
 _CAPABILITY_PAYLOAD = (
     b'{"cmd":"capability_exchange_req","protocol_version":1,'
-    b'"data":{"capabilities":{"opus_encode":1,"opus_decode":1}}}\x00'
+    b'"data":{"capabilities":{"opus_encode":0,"opus_decode":0}}}\x00'
 )
 
 

@@ -140,7 +140,7 @@ def encode_recording_month_request(*, request_id: int, channel: int, month: date
 
 def decode_recording_month_reply(command: NativeSimpleCommand, *, request_id: int, month: date) -> list[date]:
     """Read SDK callback mask at 0x0c, or 0x4c in its extended envelope."""
-    if command.request_id != request_id:
+    if command.request_id != request_id or command.control != 1:
         raise NativeSimpleError("Recording month response has another request ID")
     offsets = {16: 12, 80: 76}
     if len(command.payload) not in offsets:

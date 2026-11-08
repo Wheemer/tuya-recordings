@@ -18,7 +18,7 @@ def test_only_authenticated_use_candidate_nominates_pair():
         sent = []
         responder = ice.IceResponder("secret", lambda _: None, local_ufrag="local")
         responder._transport = SimpleNamespace(sendto=lambda *args: sent.append(args))
-        address = ("192.0.2.1", 1234)
+        address = ("192.168.50.1", 1234)
         for malformed in (request(password="wrong"), request(username=b"other:camera"), request()[:-1]):
             responder.datagram_received(malformed, address)
         assert not sent
@@ -38,10 +38,10 @@ def test_authenticated_media_from_other_address_is_not_delivered():
         key = b"a" * 16
         responder = ice.IceResponder("secret", lambda _: None, receive_key=key, on_segment=delivered.append)
         responder._transport = SimpleNamespace(sendto=lambda *args: None)
-        responder._remote = ("192.0.2.1", 1234)
+        responder._remote = ("192.168.50.1", 1234)
         segment = b"segment"
         wire = segment + ice.hmac_sha1(key, segment)
-        responder.datagram_received(wire, ("192.0.2.2", 1234))
+        responder.datagram_received(wire, ("192.168.50.2", 1234))
         assert delivered == []
         responder.datagram_received(wire, responder._remote)
         assert delivered == [segment]
@@ -53,11 +53,11 @@ def test_remote_candidate_checks_are_authenticated_controlled_and_bounded():
         sent = []
         responder = ice.IceResponder("local-secret", lambda _: None, local_ufrag="local")
         responder._transport = SimpleNamespace(sendto=lambda *args: sent.append(args), close=lambda: None)
-        candidate = "a=candidate:1 1 UDP 1234 192.0.2.1 2345 typ host"
+        candidate = "a=candidate:1 1 UDP 1234 192.168.50.1 2345 typ host"
         responder.add_remote_candidate(candidate)
         assert sent == []
         responder.set_remote_credentials("camera", "camera-secret")
-        assert len(sent) == 1 and sent[0][1] == ("192.0.2.1", 2345)
+        assert len(sent) == 1 and sent[0][1] == ("192.168.50.1", 2345)
         wire = sent[0][0]
         peer = ice.IceResponder("camera-secret", lambda _: None, local_ufrag="camera")
         assert peer._binding_request(wire) is False
@@ -69,12 +69,12 @@ def test_remote_candidate_checks_are_authenticated_controlled_and_bounded():
             candidate.replace(" UDP ", " TCP "),
             candidate.replace("typ host", "typ relay"),
             candidate.replace("2345", "99999"),
-            candidate.replace("192.0.2.1", "127.0.0.1"),
+            candidate.replace("192.168.50.1", "1.1.1.1"),
         ):
             responder.add_remote_candidate(invalid)
         assert len(sent) == 1
         for port in range(3000, 3100):
-            responder.add_remote_candidate(f"a=candidate:1 1 udp 1234 192.0.2.1 {port} typ host")
+            responder.add_remote_candidate(f"a=candidate:1 1 udp 1234 192.168.50.1 {port} typ host")
         assert len(sent) == 64
         responder.close()
         responder.add_remote_candidate(candidate)

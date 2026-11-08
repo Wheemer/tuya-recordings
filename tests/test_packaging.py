@@ -141,7 +141,7 @@ def test_panel_uses_inline_native_player_and_always_renders_pause_control():
     assert "await this.loadData();" in panel
     assert 'class="clip-player"' in panel
     assert "attachCameraPlayer(video, this.selectedClip" in panel
-    assert "camera-player.js?v=20261016-timeline-epoch-31" in panel
+    assert "camera-player.js?v=20261108-native-clock-32" in panel
     assert "stream_transport === \"native\"" in panel
     assert "new window.Plyr(video" in player
     assert "'mute', 'volume', 'fullscreen'" in player

@@ -63,14 +63,14 @@ class DirectSession:
             self._malformed_datagrams += 1
             return
         for segment in segments:
+            key = (segment.conversation, segment.command)
+            self._segment_counts[key] = self._segment_counts.get(key, 0) + 1
             if segment.conversation == 0x010000F3 and self._signaling_handler is not None:
                 self._signaling_handler(segment)
                 continue
             if segment.conversation not in self._conversations and len(self._conversations) >= _MAX_CONVERSATIONS:
                 self._malformed_datagrams += 1
                 continue
-            key = (segment.conversation, segment.command)
-            self._segment_counts[key] = self._segment_counts.get(key, 0) + 1
             known = segment.conversation in self._conversations
             conversation = self._conversation(segment.conversation)
             if not known and segment.conversation == VIDEO_CONVERSATION:

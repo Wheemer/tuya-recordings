@@ -82,6 +82,7 @@ BROWSER_STREAM_AUDIO_G711U = 4
 BROWSER_STREAM_AUDIO_FORMAT = 5
 BROWSER_STREAM_AUDIO_G711A = 6
 BROWSER_STREAM_AUDIO_AAC_MP4 = 7
+BROWSER_STREAM_VIDEO_FORMAT = 8
 _BROWSER_STREAM_HEADER = struct.Struct(">BQI")
 _BROWSER_STREAM_SEGMENT = struct.Struct(">IQ")
 _BROWSER_STREAM_AUDIO_FORMAT = struct.Struct(">IB")
@@ -691,7 +692,7 @@ class NativePlaybackBrowserStreamMuxer:
         self._stderr = _StderrTail(self._proc.stderr)
         self._reader.start()
 
-    def handle_event(self, event: dict[str, Any]) -> None:
+    def handle_event(self, event: dict[str, Any]) -> bool | None:
         event = validate_playback_frame_event(event, protocol=self.protocol)
         payload = event["payload"]
         frame_type = NativePlaybackFrameType(payload["type"])
@@ -723,13 +724,15 @@ class NativePlaybackBrowserStreamMuxer:
                 # inter-frame packet yields an apparently valid fMP4 stream
                 # that can play audio while Chromium never renders video.
                 if not _has_h264_decoder_config(self._h264_parameter_sets) or not _has_h264_idr(data):
-                    return
+                    return False
                 self._first_video_timestamp = int(info.get("timestamp") or 0)
                 if not parameter_sets:
                     data = self._h264_parameter_sets + data
             self._video_info = info
+            if not self._video_bytes and type(info.get("timestampScale")) is int:
+                self._emit_record(BROWSER_STREAM_VIDEO_FORMAT, 0, struct.pack(">I", info["timestampScale"]))
             self._write_video(data)
-            return
+            return True
         if self._audio_codec and self._audio_codec != codec:
             raise NativeMuxError("Camera changed audio codec during playback")
         self._audio_codec = codec
@@ -943,7 +946,7 @@ class NativePlaybackInteractiveBrowserMuxer:
         else:
             self.cleanup()
 
-    def handle_event(self, event: dict[str, Any]) -> None:
+    def handle_event(self, event: dict[str, Any]) -> bool | None:
         event = validate_playback_frame_event(
             event, protocol=NATIVE_PLAYBACK_EVENT_VERSION
         )
@@ -964,7 +967,7 @@ class NativePlaybackInteractiveBrowserMuxer:
             return
         if self._muxer is None:
             raise NativeMuxError("Interactive playback emitted media before start")
-        self._muxer.handle_event(event)
+        return self._muxer.handle_event(event)
 
     def finish(self) -> None:
         muxer, self._muxer = self._muxer, None

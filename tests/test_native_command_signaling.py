@@ -8,7 +8,7 @@ from datetime import date
 
 import pytest
 
-from test_native_relay_playback import APP_SESSION, ANSWER_KEY, OFFER_KEY, answer_sdp, camera_config
+from test_native_relay_playback import APP_SESSION, ANSWER_KEY, OFFER_KEY, StatusBroker, answer_sdp, camera_config
 from custom_components.tuya_recordings.lib import native_relay_playback as playback
 from custom_components.tuya_recordings.lib.native_command_signaling import (
     COMMAND_CONVERSATION,
@@ -34,6 +34,32 @@ def token(port=1443):
         "urls": [f"tcp4:127.0.0.1:{port}"], "username": "1900000000:fixture",
         "credential": "0123456789abcdef0123456789abcdef", "sessionId": "rendezvous",
     })
+
+
+@pytest.mark.asyncio
+async def test_signaling_tries_secondary_endpoint_only_after_dial_failure():
+    async with Peer("answer") as peer:
+        value = token(peer.port).raw.copy()
+        value["urls"] = ["tcp4:127.0.0.1:0"]
+        value["urlsEx"] = [f"tcp4:127.0.0.1:{peer.port}"]
+        peer.key = OFFER_KEY
+        c = NativeCommandSignaling(
+            token=RelayToken.from_json(value), device_id="camera-device", uid="account-uid",
+            session_id="session", key=OFFER_KEY, transmit_direct=lambda _: None,
+            on_signal=lambda _: None,
+        )
+        ready = asyncio.Event()
+        task = asyncio.create_task(c.start(ready.wait, tcp=True))
+        try:
+            async with asyncio.timeout(1):
+                while not c._tcp_ready:
+                    await asyncio.sleep(0.001)
+            assert c._connection._endpoint_attempts == 2
+            assert peer.opened == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await c.async_close()
 
 
 def message(kind="answer", sid="session", **data):
@@ -73,6 +99,8 @@ async def test_command_record_alignment_fragmentation_binding_and_media_firewall
         assert c._blocked == 2
         c._direct = writes.append
         c._direct_ready = True
+        c._tcp_ready = True
+        c._connection.write_segment = writes.append
         c.queue(json.dumps(message("candidate", candidate="x" * 2500)).encode())
         encrypted = [s.data for raw in writes for s in parse_segments(raw) if s.command == CMD_PUSH]
         plain = b"".join(decrypt_record(OFFER_KEY, value) for value in encrypted)
@@ -206,8 +234,12 @@ class Peer:
             ack = parse_handshake_frame(key, wire)
             assert authorization_field(ack["authorization"], "signature") == signer.ack_signature(signer.device_signature(random), "peer")
             writer.write(assemble_handshake_frame(
-                3, key, bytes(16), t.session_id.encode(), t.username.encode(), b'{"statuscode":200}',
+                3, key, bytes(16), t.session_id.encode(), t.username.encode(),
+                (b'{"method":"complete","statuscode":403}' if self.mode == "rejected"
+                 else b'{"method":"complete","statuscode":200}'),
             ))
+            if self.mode in {"rejected", "eof_ready"}:
+                return
             while True:
                 magic, body = await self.read(reader)
                 if magic == FRAME_MEDIA:
@@ -230,27 +262,40 @@ class Peer:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "silent", "foreign", "stall_handshake")
+    (mode, media) for mode in ("answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
-] + [("background", False)])
+] + [("background", False), ("udp_answer", True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
-    async with Peer(mode) as peer:
+    async with Peer("answer" if mode == "udp_answer" else mode) as peer:
         config = camera_config()
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
         config = replace(config, token=json.dumps(source["p2pConfig"]), config_json=json.dumps(source), app_profile_id=profile)
+        config = replace(config, sd_low_power_wake=True, wake_direct=True,
+                         sd_status_mqtt_dp="110", sd_status_mqtt_capable=True,
+                         sd_status_lan_dp="")
+        from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+        monkeypatch.setattr(playback, "CAMERA_COMMANDS", CameraCommandQueue())
         session = playback.NativeRelayPlaybackSession(config, APP_SESSION)
         peer.key = session._local.aes_key
         events = []
-        lan_peer = KcpConversation(0, session._on_direct_segment)
-        lan_media = {n: KcpConversation(n, session._on_direct_segment) for n in (1, 2)}
+        udp_transport = None
+        udp_remote = None
+        def deliver(raw):
+            if udp_transport is None:
+                session._on_direct_segment(raw)
+            else:
+                from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
+                udp_transport.sendto(raw + hmac_sha1(ANSWER_KEY, raw), udp_remote)
+        lan_peer = KcpConversation(0, deliver)
+        lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
         discovered = False
 
         def control(value):
             nonlocal discovered
             if not discovered and media:
                 discovered = True
-                session._on_direct_segment(build_segment(1, 0x52, 0, 512, 0, 0, 0))
+                deliver(build_segment(1, 0x52, 0, 512, 0, 0, 0))
             plain = decrypt_record(peer.key, value)
             if len(plain) < 20:
                 return
@@ -289,27 +334,65 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         lan_media[segment.conversation].input(segment)
             def close(self): pass
 
-        class Mqtt:
+        class Mqtt(StatusBroker):
             def __init__(self, **kw): pass
             async def async_connect(self): pass
-            async def async_send_offer(self, *a): pass
-            async def async_send_candidate(self, *a): pass
+            async def async_send_wake(self):
+                events.append("wake")
+            async def async_query_direct_dp(self, dp):
+                assert dp == "110"
+                assert events == ["wake"]
+                events.append("SD status")
+                self._dp_query[1].set_result(1)
+                return await self._dp_query[1]
+            async def async_send_offer(self, *a):
+                events.append("offer")
+            async def async_send_candidate(self, candidate):
+                nonlocal udp_remote
+                if udp_transport is not None:
+                    from test_ice_authentication import request
+                    fields = candidate.split()
+                    udp_remote = (fields[4], int(fields[5]))
+                    udp_transport.sendto(request(password=session._local.ice_password,
+                        username=f"{session._local.ice_ufrag}:camera".encode()), udp_remote)
             async def async_send_disconnect(self): pass
             async def async_close(self): pass
         monkeypatch.setattr(playback, "IceResponder", Ice)
+        if mode == "udp_answer":
+            from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import ice_responder
+            from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
+            class CameraUdp(asyncio.DatagramProtocol):
+                def datagram_received(self, data, address):
+                    if data[:2] == b"\x01\x01":
+                        return
+                    assert address == udp_remote
+                    assert data[-20:] == hmac_sha1(peer.key, data[:-20])
+                    for segment in parse_segments(data[:-20]):
+                        if segment.conversation == 0:
+                            lan_peer.input(segment)
+                        elif segment.conversation in lan_media:
+                            lan_media[segment.conversation].input(segment)
+            udp_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                CameraUdp, local_addr=("127.0.0.1", 0))
+            monkeypatch.setattr(ice_responder, "local_address", lambda: "127.0.0.1")
+            monkeypatch.setattr(playback, "IceResponder", ice_responder.IceResponder)
         monkeypatch.setattr(playback, "MotoClient", Mqtt)
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
         try:
-            if mode == "answer":
-                await session.connect(media=media, retry_offer=True)
+            if mode in {"answer", "udp_answer"}:
+                await session.connect(media=media, allow_wake=True, retry_offer=True)
                 assert session._answer_source == "command"
                 assert session._command._blocked == 3
                 assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
                 await asyncio.wait_for(peer.closed.wait(), 1)
                 page = await session.query_recordings(date(2026, 11, 8))
                 assert len(page.items) == 1
-                assert events == ["LAN key", "LAN catalog"]
+                assert events == (["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
+                                  else ["wake", "SD status", "offer", "LAN key", "LAN catalog"])
+                if mode == "udp_answer":
+                    assert session._ice._nominated.is_set()
+                assert session._sd_status_query == "report_received"
                 assert peer.opened == len(peer.offers) == 1
                 assert not session._command._tcp_ready
                 assert session._command._channel._retransmit_task is None
@@ -323,18 +406,20 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             else:
                 with pytest.raises(playback.NativeRelayPlaybackError, match="Timed out"):
                     await session.connect(media=media, retry_offer=mode != "background")
-                assert not events
+                assert events == (["offer"] if mode == "background" else ["wake", "SD status", "offer"])
                 assert peer.opened == (0 if mode == "background" else 1)
         finally:
             await session.close()
             await lan_peer.async_close()
             for channel in lan_media.values():
                 await channel.async_close()
+            if udp_transport is not None:
+                udp_transport.close()
         assert session._command is None and session._command_task is None
 
 
 @pytest.mark.asyncio
-async def test_native_command_can_bootstrap_over_lan_without_tcp():
+async def test_native_command_receives_over_lan_without_sending_push_over_ice():
     received = []
     peer = None
     c = command(
@@ -356,8 +441,10 @@ async def test_native_command_can_bootstrap_over_lan_without_tcp():
     try:
         offer = message("offer")
         offer["header"]["path"] = "relay"
-        c.queue(json.dumps(offer).encode())
         await c.start(ready, tcp=False)
+        c.queue(json.dumps(offer).encode())
+        assert not received
+        peer.send(encrypt_record(OFFER_KEY, record(message())))
         assert len(received) == 1
         assert "source=LAN, tcp_attempts=0" in c.diagnostics
         assert c._connection._writer is None
@@ -465,3 +552,117 @@ async def test_command_answer_remains_available_after_other_channels_fail():
     assert s._answer_source == "command"
     s._command = None
     await s.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,reason", [("rejected", "handshake_rejected"), ("eof_ready", "peer_eof")])
+async def test_tcp_closure_reason_is_preserved_without_reconnect(mode, reason):
+    async with Peer(mode) as peer:
+        c = NativeCommandSignaling(
+            token=token(peer.port), device_id="camera-device", uid="account-uid",
+            session_id="session", key=OFFER_KEY, transmit_direct=lambda _: None,
+            on_signal=lambda _: pytest.fail("Rejected connection must not yield an answer"),
+        )
+        peer.key = OFFER_KEY
+        ready = asyncio.Event()
+        task = asyncio.create_task(c.start(ready.wait, tcp=True))
+        try:
+            async with asyncio.timeout(1):
+                while reason not in c._connection.diagnostics or c._tcp_ready:
+                    await asyncio.sleep(0.001)
+            assert c._state != "tcp_signaling_ready"
+            assert "signals=0" in c.diagnostics
+            assert peer.opened == 1
+            if mode == "rejected":
+                assert "handshake_status=403" in c.diagnostics
+            else:
+                assert "read_stage=header, read_expected=4, read_partial=0" in c.diagnostics
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await c.async_close()
+
+
+@pytest.mark.asyncio
+async def test_apk_command_push_routing_and_tcp_sequence_wrap():
+    c = command(lambda _: None)
+    tcp, lan = [], []
+    c._connection.write_segment = tcp.append
+    c._direct = lan.append
+    c._tcp_ready = c._direct_ready = True
+    try:
+        for sequence in (0xFFFFFFFF, 0xFFFFFFFF, 0, 0, 1):
+            c._write(build_segment(COMMAND_CONVERSATION, CMD_PUSH, 0, 512, 0, sequence, 0, b"x"))
+        assert [s.sequence for raw in tcp for s in parse_segments(raw)] == [0xFFFFFFFF, 0, 1]
+        assert lan == []
+        ack = build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 0)
+        c._write(ack)
+        assert tcp[-1] == lan[-1] == ack
+        assert "tcp_duplicate_pushes_suppressed=2" in c.diagnostics
+    finally:
+        await c.async_close()
+
+
+@pytest.mark.asyncio
+async def test_direct_command_segment_remains_visible_in_routing_diagnostics():
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.direct_session import DirectSession
+    session = DirectSession(lambda _: None)
+    c = command(lambda _: None)
+    session.set_signaling_handler(c.input_direct)
+    try:
+        session.input_segment(build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 0))
+        assert f"{COMMAND_CONVERSATION}:0x52=1" in session.diagnostics
+        assert "packets=LAN:0x52=1" in c.diagnostics
+        assert "signals=0" in c.diagnostics
+    finally:
+        await session.async_close()
+        await c.async_close()
+
+
+def test_wake_confirmation_does_not_regress_after_offer_resends():
+    session = playback.NativeRelayPlaybackSession(camera_config(), APP_SESSION)
+    session._wake_status = "sent_unconfirmed"
+    session._sd_status_query = "report_received"
+    assert "wake_status=confirmed" in session.transport_diagnostics
+
+
+@pytest.mark.asyncio
+async def test_command_listener_is_attached_before_ice_gather_receives_a_packet(monkeypatch):
+    from unittest.mock import AsyncMock
+    s = playback.NativeRelayPlaybackSession(camera_config(), APP_SESSION)
+    observed = []
+
+    class Ice:
+        diagnostics = "fixture early LAN command"
+        def __init__(self, *a, **kw):
+            self.deliver = kw["on_segment"]
+        async def async_gather(self):
+            assert s._session is not None and s._command is not None
+            self.deliver(build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 0))
+            observed.append(s._session.diagnostics)
+            s._on_answer(answer_sdp(), source="fixture")
+        def set_receive_key(self, key): pass
+        def set_remote_credentials(self, *args): pass
+        def add_remote_candidate(self, value): pass
+        async def async_wait_for_nomination(self, timeout): pass
+        def send_segment(self, value): pass
+        def close(self): pass
+
+    class Mqtt:
+        def __init__(self, **kw): pass
+        async_connect = AsyncMock()
+        async_send_offer = AsyncMock()
+        async_send_candidate = AsyncMock()
+        async_send_disconnect = AsyncMock()
+        async_close = AsyncMock()
+
+    monkeypatch.setattr(playback, "IceResponder", Ice)
+    monkeypatch.setattr(playback, "MotoClient", Mqtt)
+    monkeypatch.setattr(NativeCommandSignaling, "start", AsyncMock())
+    monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
+    try:
+        await s.connect(media=False)
+        assert s._connected
+        assert f"{COMMAND_CONVERSATION}:0x52=1" in observed[0]
+    finally:
+        await s.close()

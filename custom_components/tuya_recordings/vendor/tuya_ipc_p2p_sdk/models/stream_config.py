@@ -31,7 +31,7 @@ class StreamConfig:
     device_password: str = field(repr=False)
     moto_id: str = field(repr=False)
     p2p_session: P2pSession = field(repr=False)
-    relay_token: RelayToken = field(repr=False)
+    relay_token: RelayToken | None = field(repr=False)
     security_level: int = field(default=3, repr=False)
     preconnect: bool = field(default=True, repr=False)
     ice_servers: list[JsonObject] = field(default_factory=list, repr=False)
@@ -63,7 +63,8 @@ class StreamConfig:
             # to the native SDK; it does not read this from p2pConfig.
             preconnect=True,
             p2p_session=local_session or P2pSession.from_json(require_object(p2p_config, "session")),
-            relay_token=RelayToken.from_json(require_object(p2p_config, "tcpRelay")),
+            relay_token=(RelayToken.from_json(require_object(p2p_config, "tcpRelay"))
+                         if p2p_config.get("tcpRelay") else None),
             ice_servers=object_list(p2p_config, "ices"),
             log_config=optional_object(p2p_config, "log"),
         )

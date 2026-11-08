@@ -1,5 +1,21 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-11 (2026-11-08)
+
+### Connection
+
+- Follow the APK's native command routing: send command-channel data over TCP once per sequence, while retaining direct acknowledgements. Attach answer listeners before gathering ICE candidates.
+- Preserve both signaling endpoint lists and try alternatives within one bounded dial attempt. Direct connections no longer require an optional TCP relay token.
+- Validate the final authenticated TCP handshake and report rejection, closure, and incomplete reads without exposing credentials.
+- Enforce LAN-only video and audio, including rejecting public ICE candidates and nominations. Stop unsupported security modes before opening a connection.
+
+### Playback And Safety
+
+- Match the APK's video task and audio request filters so obsolete preview and seek packets do not enter current playback.
+- Correct audio/video alignment when their timestamp clocks differ, and advertise only the audio capabilities implemented by the receiver.
+- Detect stalled video even when audio continues, and require usable video configuration before accepting startup as successful.
+- Cancel and join owned cleanup tasks, close the backend's HTTP session after its workers stop, and require valid month-catalog responses.
+
 ## Tuya Recordings v0.4.13-10 (2026-11-08)
 
 ### Connection
