@@ -103,6 +103,11 @@ class KcpConversation:
         """Return the next inbound KCP sequence expected by this conversation."""
         return self._next_receive_sequence
 
+    @property
+    def pending_count(self) -> int:
+        """Number of sent segments still waiting for transport acknowledgement."""
+        return len(self._pending)
+
     def input(self, segment: KcpSegment) -> None:
         """Feed one inbound segment for this conversation."""
         if self._closed:

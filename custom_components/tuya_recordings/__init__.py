@@ -54,7 +54,10 @@ from .http import (
     TuyaRecordingsThumbnailView,
     TuyaRecordingsTimelineView,
 )
-from .lib.commands import CameraWorkBusy, CameraWorkCancelled, MANUAL_REFRESH_ID, manual_catalog_refresh
+from .lib.commands import (
+    CameraWorkBusy, CameraWorkCancelled, MANUAL_REFRESH_ID,
+    ON_DEMAND_DAY_CATALOG, ON_DEMAND_OFFER_RETRIES, manual_catalog_refresh,
+)
 from .lib.native_setup import NativeBackendSetupError, native_app_session
 
 CONF_ENTRY_ID = "entry_id"
@@ -628,6 +631,11 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
     if not isinstance(entry_data, dict) or not isinstance(entry_data.get("client"), TuyaRecordingsClient):
         return
     client: TuyaRecordingsClient = entry_data["client"]
+    # Timers may inherit the context that registered them during a service call.
+    background_tokens = []
+    if reason != "service":
+        for variable, value in ((MANUAL_REFRESH_ID, "-"), (ON_DEMAND_DAY_CATALOG, False), (ON_DEMAND_OFFER_RETRIES, False)):
+            background_tokens.append((variable, variable.set(value)))
     try:
         if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:
             return
@@ -652,6 +660,8 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
     finally:
         if entry_data.get(DATA_CATALOG_REFRESH_TASK) is asyncio.current_task():
             entry_data.pop(DATA_CATALOG_REFRESH_TASK, None)
+        for variable, token in reversed(background_tokens):
+            variable.reset(token)
 
 
 async def _async_request_camera_work(

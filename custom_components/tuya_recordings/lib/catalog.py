@@ -19,10 +19,12 @@ def _timestamp(value) -> datetime | None:
         return None
 
 
-def catalog_camera_available(camera: dict, now: datetime) -> bool:
+def catalog_camera_available(camera: dict, now: datetime, *, manual: bool = False) -> bool:
     """Keep automatic camera work quiet after a catalog connection failure."""
     if camera.get("online") is False:
         return False
+    if manual:
+        return True
     retry_after = _timestamp(camera.get("catalogRetryAfter"))
     if retry_after is not None and retry_after > now:
         return False
@@ -39,7 +41,7 @@ def next_catalog_retry_after(camera: dict, now: datetime) -> tuple[int, datetime
     return count, now + CATALOG_FAILURE_BACKOFFS[min(count - 1, len(CATALOG_FAILURE_BACKOFFS) - 1)]
 
 
-def catalog_queries(cameras: list[dict], *, today: date, now: datetime, days: int, limit: int = 2) -> list[tuple[str, date]]:
+def catalog_queries(cameras: list[dict], *, today: date, now: datetime, days: int, limit: int = 2, manual: bool = False) -> list[tuple[str, date]]:
     """Prioritize discovery, then share time between current days and older gaps.
 
     Progress belongs to the caller's private catalog. No completed historical
@@ -53,7 +55,10 @@ def catalog_queries(cameras: list[dict], *, today: date, now: datetime, days: in
     backlog = []
     for camera in cameras:
         dev_id = camera.get("devId")
-        if not dev_id or not catalog_camera_available(camera, now):
+        if not dev_id or not catalog_camera_available(camera, now, manual=manual):
+            continue
+        if manual:
+            unseen_today.append((dev_id, today))
             continue
         scanned = camera.get("catalogDays") or {}
         if not isinstance(scanned, dict):

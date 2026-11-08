@@ -458,6 +458,22 @@ async def test_native_command_receives_over_lan_without_sending_push_over_ice():
 
 
 @pytest.mark.asyncio
+async def test_ack_only_is_not_a_signaling_answer_and_reports_pending_segments():
+    received = []
+    c = command(received.append)
+    try:
+        c._input_source = "TCP"
+        segment = parse_segments(build_segment(COMMAND_CONVERSATION, 0x52, 0, 512, 0, 0, 0))[0]
+        c._input(segment)
+        assert received == []
+        assert "signals=0" in c.diagnostics
+        assert "last_ack=TCP:sn=0:una=0" in c.diagnostics
+        assert "pending_segments=0" in c.diagnostics
+    finally:
+        await c.async_close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_native_command_handshake_joins_every_task():
     async with Peer("stall_handshake") as peer:
         c = NativeCommandSignaling(
