@@ -94,7 +94,7 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
-@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
+@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "http_wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
 @pytest.mark.parametrize("via_button", [False, True])
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("wire_preconnect", [None, False, True])
@@ -134,8 +134,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     events = []
     detail_lookup = outcome != "home"
     dual = outcome in {"lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"}
-    wake = outcome in {"wake", "no_card", "lan_delivery_fail", "lan_answer", "mqtt_and_lan_answer", "lan_answer_mqtt_status"}
-    low_power_metadata = outcome in {"wake", "no_card", "missing", "hub", "lan_delivery_fail"} or dual
+    wake = outcome in {"wake", "http_wake", "no_card", "lan_delivery_fail", "lan_answer", "mqtt_and_lan_answer", "lan_answer_mqtt_status"}
+    low_power_metadata = outcome in {"wake", "http_wake", "no_card", "missing", "hub", "lan_delivery_fail"} or dual
     lan_events = ["lan-connect"] if outcome == "lan_answer_no_wake" else ["lan-connect", "lan-query", "lan-close"] if outcome == "lan_delivery_fail" else ["lan-connect", "lan-query"] if dual else []
     from queue import SimpleQueue, Empty
     lan_replies = SimpleQueue()
@@ -167,7 +167,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                   "communication": {"communicationNode": dev, "dataModel": 1,
                                     "communicationModes": [{"type": 1, "pv": "2.3"}]},
                   "skills": {"p2pType": 2}, "dataPointInfo": {"dps": {"149": False} if wake else {}},
-                  "gatewayVerCAD": "1.0.2", "cloudOnline": True}
+                  "gatewayVerCAD": "1.0.2", "cloudOnline": None if outcome == "http_wake" else True}
         detail["private_payload"] = {"access_token": "secret-token-not-for-logs"}
         if outcome == "lan_delivery_fail" or dual:
             detail["communication"]["communicationModes"].insert(0, {"type": 0, "pv": "3.5"})
@@ -257,7 +257,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                 })
                 if outcome in {"lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"}:
                     return
-            if outcome in {"home", "wake", "missing", "hub", "lan_delivery_fail", "mqtt_and_lan_answer"} or (outcome == "resend" and len(refreshed_offers) == 2):
+            if outcome in {"home", "wake", "http_wake", "missing", "hub", "lan_delivery_fail", "mqtt_and_lan_answer"} or (outcome == "resend" and len(refreshed_offers) == 2):
                 reply = encode_payload(
                     key, 1, b"test",
                     {"header": {"type": "answer", "sessionid": header["sessionid"]},
@@ -420,9 +420,21 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS",
                         (0.35, 0.4, 0.45, 0.5) if dual else (0.03, 0.06, 0.12, 0.24))
     monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.6 if dual else 0.32)
+    def native_call(api, version, body, extra):
+        if api == "thing.m.device.dp.publish":
+            assert outcome == "http_wake" and body["dps"] == '{"110":null}'
+            events.append("sd-query")
+            broker = brokers[-1]
+            broker.loop.call_soon_threadsafe(broker.inbound.put_nowait, SimpleNamespace(
+                topic=f"smart/mb/in/{dev}",
+                payload=encode_payload(key, 1, b"test", {"devId": dev, "dps": {"110": 1}}, 0, 4, "2.3"),
+            ))
+            return True
+        return bootstrap
+
     entry_data = {
         "app_profile": profile,
-        "_native_app_call": lambda *_: bootstrap,
+        "_native_app_call": native_call,
         "native_app_session": APP_SESSION,
         "device_local_keys": {dev: config.local_key},
         "device_protocol_versions": {dev: "2.2"},
@@ -540,7 +552,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         assert offers == [b"2.2"]
         assert events == (["schema"] if via_button else []) + ["wake", "sd-query", "broker-closed"]
         return
-    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1, "missing": 1, "hub": 1, "lan_delivery_fail": 1, "lan_answer": 1, "mqtt_and_lan_answer": 1, "lan_answer_no_wake": 1, "lan_answer_mqtt_status": 1}[outcome]
+    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1, "http_wake": 1, "missing": 1, "hub": 1, "lan_delivery_fail": 1, "lan_answer": 1, "mqtt_and_lan_answer": 1, "lan_answer_no_wake": 1, "lan_answer_mqtt_status": 1}[outcome]
     assert offers == [b"2.2"] + [b"2.3"] * count
     assert refreshed_offers == [refreshed_offers[0]] * count
     if outcome == "silent":
@@ -1206,6 +1218,44 @@ async def test_http_sd_status_after_wake_waits_for_device_report(monkeypatch, ac
     )]
     assert calls[3:] == (["report"] if accepted else [])
     assert playback._sd_status_query == ("report_received" if accepted else "send_failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("online", [None, False, True])
+async def test_sd_query_preserves_inventory_route_without_new_online_report(monkeypatch, online):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    calls = []
+
+    class Broker(StatusBroker):
+        device_online = None
+
+        async def async_send_wake(self):
+            calls.append("wake")
+
+        async def async_query_direct_dp(self, dp):
+            calls.append("mqtt")
+            return 1
+
+        async def async_wait_for_dp_report(self, dp, send):
+            await send()
+            return 1
+
+    def gateway(*args):
+        calls.append("http")
+        return True
+
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True,
+        sd_status_mqtt_dp="110" if online is True else "",
+        sd_status_http_dp="" if online is True else "110", sd_status_mqtt_capable=True,
+    )
+    playback = NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
+    playback._on_demand_catalog = True
+    await playback._maybe_send_wake(Broker())
+    assert calls == ["wake", "mqtt" if online is True else "http"]
+    assert playback._sd_status_query == "report_received"
 
 
 @pytest.mark.asyncio

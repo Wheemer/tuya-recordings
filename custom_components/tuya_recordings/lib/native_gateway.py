@@ -718,7 +718,7 @@ def _sd_status_http_dp(device: dict[str, Any]) -> str:
     if not isinstance(communication, dict) or not isinstance(product, dict):
         return ""
     modes = _sd_status_modes(communication)
-    if not modes or 8 in modes or (1 in modes and device.get("cloudOnline") is not False):
+    if not modes or 8 in modes or (1 in modes and device.get("cloudOnline") is True):
         return ""
     return _sd_status_schema_id(product)
 

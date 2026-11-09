@@ -45,7 +45,7 @@ def test_sd_status_lan_send_error_uses_verified_pv_branch(pv, cadv, route):
     ([2], True, "", "110"),
     ([1, 2], True, "110", ""),
     ([1, 2], False, "", "110"),
-    ([1, 2], None, "", ""),
+    ([1, 2], None, "", "110"),
     ([0, 1, 2], False, "", "110"),
     ([8, 2], False, "", ""),
     ([0, 8, 1, 2], True, "", ""),
