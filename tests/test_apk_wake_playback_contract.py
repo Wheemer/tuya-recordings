@@ -237,7 +237,7 @@ async def test_apk_candidate_preserves_the_offer_trace_id():
     await value.async_send_candidate("candidate")
     assert sent[1] == {
         "header": {"type": "candidate", "from": "account", "to": "camera",
-                   "sessionid": "session", "moto_id": "moto", "path": "mqtt", "trace_id": "apk-trace"},
+                   "sessionid": "session", "moto_id": "moto", "trace_id": "apk-trace"},
         "msg": {"candidate": "candidate"},
     }
 

@@ -221,6 +221,9 @@ class NativeRelayPlaybackSession:
         self._wake_status = "not_requested"
         self._sd_status_query = "not_requested"
         self._sd_status_report_route = "none"
+        self._sd_status_send_route = "not_selected"
+        self._sd_status_route_basis = "not_selected"
+        self._sd_status_dispatch = "not_requested"
         self._sd_status_lan_details = "not_attempted"
         self._sd_status_prepared = False
         self._sd_status_signaling_details = "not_used"
@@ -364,7 +367,12 @@ class NativeRelayPlaybackSession:
             f"wake_capability={config.wake_capability}, wake_direct={config.wake_direct}, "
             f"wake_status={wake_status}, sd_low_power_wake={config.sd_low_power_wake}, "
             f"sd_status_query={self._sd_status_query}, connector_wake={self._connector_wake_status}, "
-            f"sd_status_report_route={self._sd_status_report_route}"
+            f"sd_status_report_route={self._sd_status_report_route}, "
+            f"sd_status_send_route={self._sd_status_send_route}, "
+            f"sd_status_route_basis={self._sd_status_route_basis}, "
+            f"sd_status_inventory_route={'mqtt' if config.sd_status_mqtt_dp else 'http' if config.sd_status_http_dp else 'none'}, "
+            f"sd_status_online_report={getattr(self._moto, 'device_online', None)}, "
+            f"sd_status_dispatch={getattr(self._moto, 'dp_query_dispatch', self._sd_status_dispatch) if self._sd_status_send_route == 'mqtt' else self._sd_status_dispatch}"
         )
 
     async def connect(
@@ -863,20 +871,25 @@ class NativeRelayPlaybackSession:
         dp = config.sd_status_mqtt_dp or config.sd_status_http_dp
         use_mqtt = bool(config.sd_status_mqtt_dp)
         online = getattr(moto, "device_online", None)
+        self._sd_status_route_basis = "inventory"
         if dp and config.sd_status_mqtt_capable and type(online) is bool:
             use_mqtt = online
+            self._sd_status_route_basis = "mqtt_online_report"
         if self._sd_status_query == "lan_send_failed":
             route = config.sd_status_lan_error_route
             if route not in {"mqtt", "http"}:
                 return
             dp = config.sd_status_lan_dp
             use_mqtt = route == "mqtt"
+            self._sd_status_route_basis = "lan_send_error"
         if not dp.isascii() or not dp.isdecimal():
             if self._sd_status_query != "lan_send_failed":
                 self._sd_status_query = "route_or_schema_unconfirmed"
             return
         self._connect_phase = "mqtt_sd_status" if use_mqtt else "http_sd_status"
         self._sd_status_query = "waiting_for_report"
+        self._sd_status_send_route = "mqtt" if use_mqtt else "http"
+        self._sd_status_dispatch = "sending"
         try:
             async with asyncio.timeout_at(deadline):
                 if use_mqtt:
@@ -887,6 +900,7 @@ class NativeRelayPlaybackSession:
             raise self._missing_sd_status_report() from None
         except (TuyaIpcP2pError, NativeGatewayError) as error:
             self._sd_status_query = "send_failed"
+            self._sd_status_dispatch = "failed"
             raise NativeRelayPlaybackError(
                 f"Camera SD status query failed ({self.transport_diagnostics})"
             ) from error
@@ -926,6 +940,9 @@ class NativeRelayPlaybackSession:
             on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
         )
         self._connect_phase = "lan_sd_status"
+        self._sd_status_send_route = "lan"
+        self._sd_status_route_basis = "inventory_lan"
+        self._sd_status_dispatch = "sending"
         self._sd_status_query = "waiting_for_report"
         self._status_lan = lan
         retained = False
@@ -935,6 +952,7 @@ class NativeRelayPlaybackSession:
                     await lan.async_connect()
                 except (NativeLanUnavailableError, OSError):
                     self._sd_status_query = "lan_unavailable"
+                    self._sd_status_dispatch = "not_sent"
                     return False
                 # The APK's query listener is device-wide: LAN dispatch may
                 # produce a report on the already-subscribed MQTT channel.
@@ -949,6 +967,7 @@ class NativeRelayPlaybackSession:
                             status = mqtt_report.result()
                             self._sd_status_report_route = "mqtt"
                         else:
+                            self._sd_status_dispatch = "sent"
                             try:
                                 status = query.result()
                             except NativeLanDpReportError:
@@ -963,6 +982,7 @@ class NativeRelayPlaybackSession:
                             await asyncio.gather(query, return_exceptions=True)
         except NativeLanSignalError:
             self._sd_status_query = "lan_send_failed"
+            self._sd_status_dispatch = "failed"
             return False
         except TimeoutError:
             raise self._missing_sd_status_report() from None
@@ -1005,6 +1025,7 @@ class NativeRelayPlaybackSession:
             raise
         if accepted is not True:
             raise NativeGatewayError("SD status query not accepted")
+        self._sd_status_dispatch = "sent"
 
     def _requires_http_token(self) -> bool:
         """Match ordinary connect_v3 token selection, never a timeout retry."""

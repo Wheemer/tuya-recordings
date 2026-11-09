@@ -507,7 +507,7 @@ def test_mqtt_offer_preserves_apk_signaling_header(version, include_metadata):
     assert published == [(302, {
         "header": {
             "type": "offer", "from": "account", "to": "camera",
-            "sessionid": "session", "moto_id": "camera-moto-id", "path": "mqtt",
+            "sessionid": "session", "moto_id": "camera-moto-id",
             "trace_id": "trace", "is_pre": 0, "p2p_skill": 1635, "security_level": 3,
         },
         "msg": {"sdp": "sdp", "preconnect": True, **metadata},

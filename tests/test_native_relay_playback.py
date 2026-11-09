@@ -236,6 +236,9 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             assert qos == 0
             assert protocol == 302
             header = body["header"]
+            # Native a81b8/aba90 -> a7084 -> P2PMQTTServiceManager -> rsv:
+            # MQTT passes the original header; only the relay copy adds path.
+            assert "path" not in header
             if header["type"] == "disconnect":
                 return
             if header["type"] == "candidate":
