@@ -115,6 +115,11 @@ class CameraCommandQueue:
             if device_id in self._wake_after:
                 self._wake_report_missing.add(device_id)
 
+    def wake_delay(self, device_id: str) -> float:
+        """Remaining shared wake reservation, without extending it."""
+        with self._condition:
+            return max(0.0, self._wake_after.get(device_id, 0) - time.monotonic())
+
     def wake_report_on_cooldown(self, device_id: str) -> bool:
         with self._condition:
             return (

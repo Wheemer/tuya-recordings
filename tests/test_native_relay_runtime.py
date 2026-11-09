@@ -66,6 +66,12 @@ def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manu
     worker = NativeRelayPlaybackWorker(
         camera_config(), APP_SESSION, playback_factory=lambda *args: Playback()
     )
+    deadlines = []
+    original_wait = worker._wait_for_work
+    async def record_wait(operation, work, **kwargs):
+        deadlines.append(kwargs.get("timeout"))
+        return await original_wait(operation, work, **kwargs)
+    worker._wait_for_work = record_wait
     request = NativePlaybackRequest(start=100, end=110)
     try:
         with on_demand_offer_retries() if manual else nullcontext():
@@ -83,6 +89,10 @@ def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manu
             **({"allow_wake": True} if kind in {"timeline", "day"} else {}),
             **({"retry_offer": True} if manual and kind != "thumbnail" else {}),
         }]
+        from custom_components.tuya_recordings.lib.native_relay_playback import WAKE_SLOT_TIMEOUT_SECONDS
+        assert deadlines == [worker._command_timeout + 60 + (
+            WAKE_SLOT_TIMEOUT_SECONDS if kind in {"timeline", "day"} else 0
+        )]
     finally:
         worker.close()
         assert worker.wait_closed(2)

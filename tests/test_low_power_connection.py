@@ -272,6 +272,7 @@ async def test_wake_throttle_or_failure_does_not_bypass_sd_query(monkeypatch, ou
     commands = CameraCommandQueue()
     if outcome == "wake_cooldown":
         assert commands.reserve_wake(config.dev_id)
+        commands._wake_after[config.dev_id] = playback_module.time.monotonic() + 0.01
     monkeypatch.setattr(playback_module, "CAMERA_COMMANDS", commands)
 
     class Broker(StatusBroker):
@@ -303,4 +304,4 @@ async def test_wake_throttle_or_failure_does_not_bypass_sd_query(monkeypatch, ou
         assert events == (["wake", "query"] if outcome == "sd_send_failure" else ["wake"])
     else:
         await playback._open_signaling("sdp", [], "trace", {}, {})
-        assert events == (["query", "offer"] if outcome == "wake_cooldown" else ["wake", "query", "offer"])
+        assert events == ["wake", "query", "offer"]

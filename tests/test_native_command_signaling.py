@@ -3,6 +3,7 @@
 import asyncio
 import json
 import struct
+import time
 from dataclasses import replace
 from datetime import date
 
@@ -336,8 +337,12 @@ class Peer:
     (mode, media, False) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
-    + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")])
+    + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
+    + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence") for automatic in (False, True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic):
+    cooldown = mode.startswith("cooldown_")
+    if cooldown:
+        mode = "no_answer_udp" if mode == "cooldown_ready" else "sd_silence"
     connect_options = {"allow_wake": True, "retry_offer": True}
     if automatic:
         from custom_components.tuya_recordings.lib.native_relay_runtime import NativeRelayPlaybackWorker
@@ -365,7 +370,20 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                          sd_status_mqtt_dp="110", sd_status_mqtt_capable=True,
                          sd_status_lan_dp="")
         from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
-        monkeypatch.setattr(playback, "CAMERA_COMMANDS", CameraCommandQueue())
+        commands = CameraCommandQueue()
+        monkeypatch.setattr(playback, "CAMERA_COMMANDS", commands)
+        if cooldown:
+            assert commands.reserve_wake(config.dev_id)
+            until = time.monotonic() + 0.05
+            commands._wake_after[config.dev_id] = until
+            config = replace(config, sd_status_lan_dp="110")
+            class UnavailableLan:
+                diagnostics = "fixture unavailable before query"
+                def __init__(self, **kwargs): pass
+                async def async_connect(self):
+                    raise playback.NativeLanUnavailableError("fixture sleeping LAN")
+                async def async_close(self): pass
+            monkeypatch.setattr(playback, "Lan302Client", UnavailableLan)
         loop = asyncio.get_running_loop()
 
         def gateway(api, version, body, extra):
@@ -466,6 +484,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
 
             async def publish(self, topic, payload, *, qos, **kwargs):
                 if topic == f"m/w/{config.dev_id}":
+                    if cooldown:
+                        assert time.monotonic() >= until
                     assert payload == crc32(config.local_key.encode()).to_bytes(4, "big")
                     assert kwargs["retain"] is False
                     self.awake = qos == 1
