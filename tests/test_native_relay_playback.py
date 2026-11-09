@@ -342,7 +342,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             command = decrypt_record(send_key, record)
             _, request, _, high, low, _ = struct.unpack_from("<IIIHHI", command)
             if high in (6, 7):
-                reply = struct.pack("<IIIHHI", 0x12345678, request, 1, high, low, 0)
+                reply = struct.pack("<IIIHHIii", 0x12345678, request, 1, high, low, 8, 0, 1)
                 self.handler(encrypt_record(ANSWER_KEY, reply))
                 if high == 7 and low == 4 and 1 in self.channels:
                     for channel, payload_type, payload in (
@@ -2417,7 +2417,7 @@ def test_stop_sends_apk_commands_in_order_and_clears_playback_state():
         (7, 3),
         (7, 5),
     ]
-    assert waited == [(0x00020008, (7, 3))]
+    assert waited == [(8, (7, 3))]
     assert not playback._playback_started
     assert playback._stream_id is None
 
@@ -2606,8 +2606,8 @@ def test_pause_and_resume_use_active_stream_without_stopping_transport():
         (7, 2),
     ]
     assert waited == [
-        (0x00020008, (7, 1)),
-        (0x00020008, (7, 2)),
+        (8, (7, 1)),
+        (0x00020009, (7, 2)),
     ]
     assert playback._connected
     assert playback._playback_started

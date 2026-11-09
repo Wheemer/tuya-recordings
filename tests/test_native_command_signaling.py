@@ -361,9 +361,11 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         lan_peer = KcpConversation(0, deliver)
         lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
         discovered = False
+        media_sequence = 0
+        playback_requests = []
 
         def control(value):
-            nonlocal discovered
+            nonlocal discovered, media_sequence
             if not discovered and media:
                 discovered = True
                 deliver(build_segment(1, 0x52, 0, 512, 0, 0, 0))
@@ -372,12 +374,17 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 return
             magic, request, _, high, low, length = struct.unpack_from("<IIIHHI", plain)
             if magic == 0x12345678 and high in (6, 7):
-                reply = struct.pack("<IIIHHI", magic, request, 1, high, low, 0)
-                lan_peer.send(encrypt_record(ANSWER_KEY, reply))
+                if high == 7:
+                    playback_requests.append((request, low))
+                # Audio open/close has no SDK completion callback.
+                if low not in (4, 5):
+                    reply = struct.pack("<IIIHHIii", magic, request, 1, high, low, 8, 0, 1)
+                    lan_peer.send(encrypt_record(ANSWER_KEY, reply))
                 if (high, low) == (7, 4):
+                    media_sequence += 1
                     for channel, pt, payload in ((1, 96, b"\x65video"), (2, 99, b"\x00\x00\xff\x7f")):
                         head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
-                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, 1, 8000, 1) + payload
+                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
                         lan_media[channel].send(encrypt_record(ANSWER_KEY, head + struct.pack("<I", len(rtp)) + rtp))
                 return
             if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
@@ -496,6 +503,20 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         audio = await session.receive_frame()
                     assert video.payload == b"\x00\x00\x00\x01\x65video"
                     assert audio.payload == b"\x00\x00\xff\x7f"
+                    await session.pause()
+                    await session.resume()
+                    await session.seek(start=100, end=110, play_time=105)
+                    async with asyncio.timeout(1):
+                        assert (await session.receive_frame()).payload == video.payload
+                        assert (await session.receive_frame()).payload == audio.payload
+                    await session.stop()
+                    # Preview stop consumes 8/9, catalog 10, then each SDK
+                    # command allocates a fresh low word; only seek changes task.
+                    assert playback_requests == [
+                        (0x0002000b, 0), (0x0002000b, 4), (12, 1),
+                        (0x0002000d, 2), (0x0003000e, 0), (0x0003000e, 4),
+                        (15, 3), (16, 5),
+                    ]
             else:
                 with pytest.raises(playback.NativeRelayPlaybackError, match="Timed out"):
                     await session.connect(media=media, retry_offer=mode != "background")
