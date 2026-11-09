@@ -281,13 +281,15 @@ def encode_playback_resume(*, stream_id: int, channel: int) -> bytes:
     )
 
 
-def encode_preview_stop(*, stream_id: int, channel: int) -> tuple[bytes, bytes]:
+def encode_preview_stop(*, stream_id: int, channel: int, audio_request_id: int | None = None) -> tuple[bytes, bytes]:
     """Encode the APK's ordered StopPreview operations (6/3 then 6/5)."""
     _uint32("stream_id", stream_id)
     _non_negative("channel", channel)
+    audio_request_id = stream_id if audio_request_id is None else audio_request_id
+    _uint32("audio_request_id", audio_request_id)
     return (
         _command(stream_id, 0, 6, 3, _AUDIO.pack(channel, 3)),
-        _command(stream_id, 0, 6, 5, _AUDIO.pack(channel, 5)),
+        _command(audio_request_id, 0, 6, 5, _AUDIO.pack(channel, 5)),
     )
 
 
@@ -317,13 +319,15 @@ def encode_thumbnail_request(
     )
 
 
-def encode_playback_stop(*, stream_id: int, channel: int) -> tuple[bytes, bytes]:
+def encode_playback_stop(*, stream_id: int, channel: int, audio_request_id: int | None = None) -> tuple[bytes, bytes]:
     """Encode Smart Life's ordered StopPlayBack operations (7/3 then 7/5)."""
     _uint32("stream_id", stream_id)
     _non_negative("channel", channel)
+    audio_request_id = stream_id if audio_request_id is None else audio_request_id
+    _uint32("audio_request_id", audio_request_id)
     return (
         _command(stream_id, 0, 7, 3, _PLAYBACK.pack(channel, 3, 0, 0, 0)),
-        _command(stream_id, 0, 7, 5, _AUDIO.pack(channel, 5)),
+        _command(audio_request_id, 0, 7, 5, _AUDIO.pack(channel, 5)),
     )
 
 

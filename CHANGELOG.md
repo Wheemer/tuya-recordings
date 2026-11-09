@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-13 (2026-11-09)
+
+### Connection
+
+- Follow the Smart Life native SDK's bounded signaling resend: replay the cached offer and ICE candidates together, without opening another TCP connection or repeating wake commands.
+- Preserve the current offer's trace ID on MQTT and native command-channel candidates, including offers initialized through HTTP.
+- Keep the HTTP SD-status query route available when cloud-online metadata is absent. Only ready or full SD cards proceed to playback.
+
+### Playback And Safety
+
+- Match the APK's request and task IDs for preview stop, playback, pause, resume, seek, and stop. Ignore video and audio belonging to an earlier playback task.
+- Check camera completion results instead of treating any matching response as success. Do not wait for audio-open or audio-stop acknowledgements that the native SDK does not require.
+- Queue video and audio stop commands in native SDK order, and validate a seek before replacing the current playback state.
+- Keep video and audio LAN-only. Existing command serialization, deadlines, cooldowns, and scheduled-work limits remain in place; no background retries are added.
+
 ## Tuya Recordings v0.4.13-12 (2026-11-08)
 
 ### Connection

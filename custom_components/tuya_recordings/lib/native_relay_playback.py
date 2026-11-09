@@ -144,7 +144,8 @@ class NativeRelayPlaybackSession:
     signaling policy, then uses MQTT only when local transport is unavailable.
     A locally reached camera is never sent a second MQTT offer after an
     unsuccessful LAN offer. It authenticates conversation zero and prepares one
-    playback conversation. No relay or retry loop exists.
+    playback conversation. Native command rendezvous is signaling-only;
+    bounded foreground MQTT resends never enable relay media.
     """
 
     def __init__(
@@ -166,6 +167,7 @@ class NativeRelayPlaybackSession:
         self._command = None
         self._command_task = None
         self._command_offer = None
+        self._command_trace_id = ""
         self._command_token = None
         self._command_candidates = []
         self._command_status = "not_started"
@@ -245,6 +247,7 @@ class NativeRelayPlaybackSession:
         self._control_payloads: dict[str, str] = {}
         self._next_request_id = 8
         self._task_id = 2
+        self._next_task_id = 2
         self._offer: SdpOffer | None = None
         self._answer: asyncio.Future[SdpAnswer] | None = None
         self._ended: asyncio.Future[NativeRelayPlaybackError] | None = None
@@ -617,6 +620,7 @@ class NativeRelayPlaybackSession:
         if self._stream_config is None:
             return
         self._command_token = tcp_token
+        self._command_trace_id = trace_id
         self._command_offer = relay_offer_frame(
             self._uid, self._stream_config.device_id, self.local_cid, trace_id,
             sdp, ice_servers, tcp_token, log_config, self._stream_config.moto_id,
@@ -666,7 +670,7 @@ class NativeRelayPlaybackSession:
     def _queue_command_candidate(self, candidate: str) -> None:
         self._command.queue(relay_candidate_frame(
             self._uid, self._stream_config.device_id, self.local_cid,
-            self._native_config.trace_id, candidate, self._stream_config.moto_id,
+            self._command_trace_id, candidate, self._stream_config.moto_id,
         ))
 
     async def _close_failed_lan(self, lan: Lan302Client) -> None:
@@ -893,11 +897,11 @@ class NativeRelayPlaybackSession:
     def _accept_sd_status_report(self, status: int) -> None:
         # Both playback presenters stop before connecting for these states.
         blocked = {2: "card_error", 4: "formatting", 5: "no_card", 7: "loading", 8: "unavailable"}
-        reason = blocked.get(status)
-        if reason is None:
+        if type(status) is int and status in {1, 3}:
             self._sd_status_query = "report_received"
             self._sd_status_prepared = True
             return
+        reason = blocked.get(status, "not_ready")
         self._sd_status_query = f"report_{reason}"
         raise NativeRelayPlaybackError(
             f"Camera SD status prevents native playback ({self.transport_diagnostics})"
@@ -1317,25 +1321,9 @@ class NativeRelayPlaybackSession:
     ) -> None:
         """Issue StartPlayBack without replacing the connected camera object."""
         del speed
-        self._reset_media_state()
-        request_id = self._allocate_request_id()
-        stream_id = playback_stream_id(task_id=self._task_id, request_id=request_id)
+        stream_id = playback_stream_id(task_id=self._next_task_id, request_id=self._next_request_id)
         if self._video is None or self._audio is None:
             raise NativeRelayPlaybackError("Native media conversations are unavailable")
-        self._stream_id = stream_id
-        self._playback_started = True
-        self._playback_paused = False
-        answer = self._require_answer()
-        self._video.set_message_handler(
-            lambda record: self._on_rtp_record(
-                _VIDEO_CONVERSATION, record, answer.aes_key
-            )
-        )
-        self._audio.set_message_handler(
-            lambda record: self._on_rtp_record(
-                _AUDIO_CONVERSATION, record, answer.aes_key
-            )
-        )
         start_command = (100, 20) if encrypted else (7, 21 if play_mode_supported else 0)
         if play_mode_supported and not encrypted:
             start_payload = encode_playback_start_fragments(
@@ -1353,6 +1341,20 @@ class NativeRelayPlaybackSession:
                 play_time=start if play_time is None else play_time,
                 encrypted=encrypted,
             )
+        answer = self._require_answer()
+        self._allocate_request_id()
+        self._task_id = self._next_task_id
+        self._next_task_id += 1
+        self._reset_media_state()
+        self._stream_id = stream_id
+        self._playback_started = True
+        self._playback_paused = False
+        self._video.set_message_handler(
+            lambda record: self._on_rtp_record(_VIDEO_CONVERSATION, record, answer.aes_key)
+        )
+        self._audio.set_message_handler(
+            lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, answer.aes_key)
+        )
         self._send_control(start_payload)
         self._send_control(encode_audio_open(stream_id=stream_id, channel=0))
         await self._wait_for_playback_responses(
@@ -1365,9 +1367,10 @@ class NativeRelayPlaybackSession:
         self._require_connected()
         if not self._playback_started or self._playback_paused:
             return
-        stream_id = self._require_stream_id()
-        self._send_control(encode_playback_pause(stream_id=stream_id, channel=0))
-        await self._wait_for_control_response(stream_id, (7, 1))
+        self._require_stream_id()
+        request_id = self._allocate_request_id()
+        self._send_control(encode_playback_pause(stream_id=request_id, channel=0))
+        await self._wait_for_control_response(request_id, (7, 1))
         self._playback_paused = True
 
     async def resume(self) -> None:
@@ -1375,7 +1378,9 @@ class NativeRelayPlaybackSession:
         self._require_connected()
         if not self._playback_started or not self._playback_paused:
             return
-        stream_id = self._require_stream_id()
+        self._require_stream_id()
+        stream_id = playback_stream_id(task_id=self._task_id, request_id=self._allocate_request_id())
+        self._stream_id = stream_id
         self._send_control(encode_playback_resume(stream_id=stream_id, channel=0))
         await self._wait_for_control_response(stream_id, (7, 2))
         self._playback_paused = False
@@ -1394,12 +1399,16 @@ class NativeRelayPlaybackSession:
         stream_id = self._stream_id
         if stream_id is None:
             raise NativeRelayPlaybackError("Active playback has no stream ID")
-        media_stop, playback_stop = encode_playback_stop(stream_id=stream_id, channel=0)
+        request_id = self._allocate_request_id()
+        media_stop, _ = encode_playback_stop(stream_id=request_id, channel=0)
         self._send_control(media_stop)
-        await self._wait_for_control_response(stream_id, (7, 3))
-        # The native SDK sends 7/5 only after 7/3 succeeds and does not wait
-        # for another response before releasing its playback state.
+        # AsyncSendCommand queues both operations; its immediate return is
+        # not the camera's completion callback.
+        _, playback_stop = encode_playback_stop(
+            stream_id=request_id, channel=0, audio_request_id=self._allocate_request_id(),
+        )
         self._send_control(playback_stop)
+        await self._wait_for_control_response(request_id, (7, 3))
         self._playback_started = False
         self._playback_paused = False
         self._stream_id = None
@@ -1413,14 +1422,17 @@ class NativeRelayPlaybackSession:
     async def _stop_preview(self) -> None:
         """Apply Smart Life's StopPreview transition before SD playback."""
         request_id = self._allocate_request_id()
-        stream_id = playback_stream_id(task_id=1, request_id=request_id)
-        video_stop, audio_stop = encode_preview_stop(
+        stream_id = request_id
+        video_stop, _ = encode_preview_stop(
             stream_id=stream_id,
             channel=0,
         )
         self._send_control_plain(video_stop)
-        await self._wait_for_control_response(stream_id, (6, 3))
+        _, audio_stop = encode_preview_stop(
+            stream_id=stream_id, channel=0, audio_request_id=self._allocate_request_id(),
+        )
         self._send_control_plain(audio_stop)
+        await self._wait_for_control_response(stream_id, (6, 3))
 
     def _reset_media_state(self) -> None:
         """Discard every decoder-bound state before a new playback stream."""
@@ -1577,6 +1589,16 @@ class NativeRelayPlaybackSession:
             self._offer_retries += 1
             try:
                 await send_offer()
+                # APK ab52c replays the outgoing cache, populated by both
+                # the offer and aba90's local-candidate callback. TCP PUSHes
+                # are not repeated; only the existing MQTT retry is used.
+                for candidate in tuple(self._command_candidates):
+                    if (self._closed or self._answer.done()
+                            or loop.time() >= deadline):
+                        return
+                    if self._ended is not None and self._ended.done():
+                        raise self._ended.result()
+                    await self._moto.async_send_candidate(candidate)
             except TuyaIpcP2pError as err:
                 self._offer_status = "retry_publish_failed"
                 raise NativeRelayPlaybackError(
@@ -1837,8 +1859,8 @@ class NativeRelayPlaybackSession:
     async def _wait_for_playback_responses(
         self, stream_id: int, *, start_command: tuple[int, int] = (7, 0)
     ) -> None:
-        """Wait for playback video and audio acknowledgements in either order."""
-        pending = {start_command, (7, 4)}
+        """Wait for StartPlayBack's callback; audio-open has no callback."""
+        pending = {start_command}
         try:
             async with asyncio.timeout(_CONTROL_RESPONSE_TIMEOUT_SECONDS):
                 while pending:
@@ -1851,6 +1873,7 @@ class NativeRelayPlaybackSession:
                         and command.control == 1
                         and key in pending
                     ):
+                        self._validate_operation_response(command)
                         pending.remove(key)
         except TimeoutError as err:
             missing = ",".join(f"{high}/{low}" for high, low in sorted(pending))
@@ -1873,12 +1896,26 @@ class NativeRelayPlaybackSession:
                         and command.control == 1
                         and (command.high_command, command.low_command) == expected
                     ):
+                        self._validate_operation_response(command)
                         return
         except TimeoutError as err:
             raise NativeRelayPlaybackError(
                 "Camera did not acknowledge playback stop command: "
                 f"{expected[0]}/{expected[1]}"
             ) from err
+
+    @staticmethod
+    def _validate_operation_response(command: NativeSimpleCommand) -> None:
+        # ThingCameraSimple has device type 0, including encrypted playback.
+        # The SDK's extended offset is selected by device type, not command.
+        offset = 4
+        if len(command.payload) < offset + 4:
+            raise NativeRelayPlaybackError("Camera control response is truncated")
+        result = int.from_bytes(command.payload[offset:offset + 4], "little", signed=True)
+        if result != 1:
+            raise NativeRelayPlaybackError(
+                f"Camera rejected command {command.high_command}/{command.low_command} (result={result})"
+            )
 
     def _fail_transport(self, error: NativeRelayPlaybackError) -> None:
         if self._ended is not None and not self._ended.done():

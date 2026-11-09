@@ -85,6 +85,7 @@ class MotoClient:
         self._session_id = session_id
         self._key = local_key.encode()
         self._moto_id = moto_id
+        self._offer_trace_id = ""
         self._on_answer = on_answer
         self._on_candidate = on_candidate
         self._on_disconnect = on_disconnect
@@ -399,6 +400,7 @@ class MotoClient:
         log_config: JsonValue,
     ) -> None:
         """Publish the offer that opens the session."""
+        self._offer_trace_id = trace_id
         header = self._header("offer", trace_id)
         header.update(
             {
@@ -419,7 +421,7 @@ class MotoClient:
         """Trickle one local ICE candidate."""
         await self._async_publish(
             SESSION_PROTOCOL,
-            {"header": self._header("candidate"), "msg": {"candidate": candidate}},
+            {"header": self._header("candidate", self._offer_trace_id), "msg": {"candidate": candidate}},
         )
 
     async def async_send_disconnect(self, close_reason: int = 4) -> None:

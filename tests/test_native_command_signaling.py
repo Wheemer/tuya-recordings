@@ -257,7 +257,7 @@ class Peer:
                 if payload["header"]["type"] != "offer":
                     continue
                 self.offers.append(payload)
-                if self.mode == "silent":
+                if self.mode in {"silent", "candidate_resend"}:
                     continue
                 if self.mode in {"nondata_answer", "batched_answer"}:
                     for body in (b"", f6_attribute(9, b"nondata"), f6_attribute(7, b"")):
@@ -333,7 +333,7 @@ class Peer:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
+    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
 ] + [("background", False), ("udp_answer", True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
@@ -361,9 +361,11 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         lan_peer = KcpConversation(0, deliver)
         lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
         discovered = False
+        media_sequence = 0
+        playback_requests = []
 
         def control(value):
-            nonlocal discovered
+            nonlocal discovered, media_sequence
             if not discovered and media:
                 discovered = True
                 deliver(build_segment(1, 0x52, 0, 512, 0, 0, 0))
@@ -372,12 +374,17 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 return
             magic, request, _, high, low, length = struct.unpack_from("<IIIHHI", plain)
             if magic == 0x12345678 and high in (6, 7):
-                reply = struct.pack("<IIIHHI", magic, request, 1, high, low, 0)
-                lan_peer.send(encrypt_record(ANSWER_KEY, reply))
+                if high == 7:
+                    playback_requests.append((request, low))
+                # Audio open/close has no SDK completion callback.
+                if low not in (4, 5):
+                    reply = struct.pack("<IIIHHIii", magic, request, 1, high, low, 8, 0, 1)
+                    lan_peer.send(encrypt_record(ANSWER_KEY, reply))
                 if (high, low) == (7, 4):
+                    media_sequence += 1
                     for channel, pt, payload in ((1, 96, b"\x65video"), (2, 99, b"\x00\x00\xff\x7f")):
                         head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
-                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, 1, 8000, 1) + payload
+                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
                         lan_media[channel].send(encrypt_record(ANSWER_KEY, head + struct.pack("<I", len(rtp)) + rtp))
                 return
             if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
@@ -389,8 +396,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
 
         class Ice:
             diagnostics = "fixture direct"
-            def __init__(self, *a, **k): pass
-            async def async_gather(self): pass
+            def __init__(self, *a, **k): self.candidate_callback = a[1]
+            async def async_gather(self):
+                if mode == "candidate_resend":
+                    self.candidate_callback("candidate:1 1 udp 2130706431 192.0.2.9 12345 typ host")
             def set_receive_key(self, value): events.append("LAN key")
             def set_remote_credentials(self, *a): pass
             def add_remote_candidate(self, value): pass
@@ -406,7 +415,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             def close(self): pass
 
         class Mqtt(StatusBroker):
-            def __init__(self, **kw): pass
+            def __init__(self, **kw): self.candidates = []
             async def async_connect(self): pass
             async def async_send_wake(self):
                 events.append("wake")
@@ -420,6 +429,13 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 events.append("offer")
             async def async_send_candidate(self, candidate):
                 nonlocal udp_remote
+                if mode == "candidate_resend":
+                    self.candidates.append(candidate)
+                    if len(self.candidates) == 2:
+                        assert peer.offers and session._command._channel.pending_count == 0
+                        assert session._command._last_ack.startswith("TCP:")
+                        assert self.candidates[0] == candidate
+                        session._on_answer(answer_sdp(), source="mqtt")
                 if udp_transport is not None:
                     from test_ice_authentication import request
                     fields = candidate.split()
@@ -450,16 +466,22 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         monkeypatch.setattr(playback, "MotoClient", Mqtt)
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
+        if mode == "candidate_resend":
+            monkeypatch.setattr(playback, "_OFFER_RETRY_OFFSETS", (0.08, 0.12, 0.16, 0.2))
         try:
-            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer"}:
+            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer", "candidate_resend"}:
                 await session.connect(media=media, allow_wake=True, retry_offer=True)
-                assert session._answer_source == "command"
-                assert session._command._blocked == 3
-                assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
+                if mode == "candidate_resend":
+                    assert session._answer_source == "mqtt" and session._offer_retries == 1
+                else:
+                    assert session._answer_source == "command"
+                    assert session._command._blocked == 3
+                    assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
                 await asyncio.wait_for(peer.closed.wait(), 1)
                 page = await session.query_recordings(date(2026, 11, 8))
                 assert len(page.items) == 1
-                assert events == (["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
+                assert events == (["wake", "SD status", "offer", "offer", "LAN key", "LAN catalog"] if mode == "candidate_resend"
+                                  else ["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
                                   else ["wake", "SD status", "offer", "LAN key", "LAN catalog"])
                 if mode == "udp_answer":
                     assert session._ice._nominated.is_set()
@@ -481,6 +503,20 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         audio = await session.receive_frame()
                     assert video.payload == b"\x00\x00\x00\x01\x65video"
                     assert audio.payload == b"\x00\x00\xff\x7f"
+                    await session.pause()
+                    await session.resume()
+                    await session.seek(start=100, end=110, play_time=105)
+                    async with asyncio.timeout(1):
+                        assert (await session.receive_frame()).payload == video.payload
+                        assert (await session.receive_frame()).payload == audio.payload
+                    await session.stop()
+                    # Preview stop consumes 8/9, catalog 10, then each SDK
+                    # command allocates a fresh low word; only seek changes task.
+                    assert playback_requests == [
+                        (0x0002000b, 0), (0x0002000b, 4), (12, 1),
+                        (0x0002000d, 2), (0x0003000e, 0), (0x0003000e, 4),
+                        (15, 3), (16, 5),
+                    ]
             else:
                 with pytest.raises(playback.NativeRelayPlaybackError, match="Timed out"):
                     await session.connect(media=media, retry_offer=mode != "background")
