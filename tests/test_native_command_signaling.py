@@ -332,11 +332,30 @@ class Peer:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
-@pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
+@pytest.mark.parametrize("mode,media,automatic", [
+    (mode, media, False) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
-    ] + [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)])
-async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
+    ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
+    + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")])
+async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic):
+    connect_options = {"allow_wake": True, "retry_offer": True}
+    if automatic:
+        from custom_components.tuya_recordings.lib.native_relay_runtime import NativeRelayPlaybackWorker
+        from custom_components.tuya_recordings.lib.commands import ON_DEMAND_DAY_CATALOG, ON_DEMAND_OFFER_RETRIES
+        assert not ON_DEMAND_DAY_CATALOG.get() and not ON_DEMAND_OFFER_RETRIES.get()
+        # Capture the real scheduled queue entry, then exercise its policy
+        # through the wire fixture on this test's event loop.
+        worker = object.__new__(NativeRelayPlaybackWorker)
+        submitted = []
+        def submit(work):
+            submitted.append(work)
+            work.results = []
+            work.done.set()
+        worker._submit = submit
+        assert worker.catalog([date(2026, 11, 8)], None) == []
+        work = submitted[0]
+        assert work.allow_wake and not work.retry_offer
+        connect_options = {"allow_wake": work.allow_wake, "retry_offer": work.retry_offer}
     async with Peer("silent" if mode.startswith("no_answer_udp") else "batched_answer" if mode == "udp_answer" else "answer" if mode in {"offline_report_http", "qos1_wake"} else mode) as peer:
         config = camera_config()
         source = json.loads(config.config_json)
@@ -532,7 +551,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             monkeypatch.setattr(playback, "_OFFER_RETRY_OFFSETS", (0.08, 0.12, 0.16, 0.2))
         try:
             if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer", "candidate_resend", "offline_report_http", "qos1_wake", "no_answer_udp"}:
-                await session.connect(media=media, allow_wake=True, retry_offer=True)
+                await session.connect(media=media, **connect_options)
                 if mode == "no_answer_udp":
                     assert not session._answer.done()
                     assert session._answer_source == "none"
@@ -599,7 +618,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert session._ended.done()
                     assert "conflicts" in str(session._ended.result())
             elif mode == "no_answer_udp_silent_control":
-                await session.connect(media=False, allow_wake=True, retry_offer=True)
+                await session.connect(media=False, **connect_options)
                 await asyncio.wait_for(peer.closed.wait(), 1)
                 with pytest.raises(TimeoutError):
                     await asyncio.wait_for(session.query_recordings(date(2026, 11, 8)), 0.08)
@@ -609,7 +628,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert session._offer_retries == 0
             elif mode == "sd_silence":
                 with pytest.raises(playback.NativeRelayPlaybackError, match="did not report SD status") as error:
-                    await session.connect(media=media, allow_wake=True, retry_offer=True)
+                    await session.connect(media=media, **connect_options)
                 assert events == ["wake", "SD status"]
                 assert peer.opened == 0 and not peer.offers
                 assert "sd_status_send_route=mqtt" in str(error.value)

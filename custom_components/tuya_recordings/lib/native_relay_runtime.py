@@ -14,7 +14,7 @@ from datetime import date
 from functools import partial
 from typing import Any
 
-from .commands import CAMERA_COMMANDS, ON_DEMAND_DAY_CATALOG, ON_DEMAND_OFFER_RETRIES
+from .commands import CAMERA_COMMANDS, ON_DEMAND_OFFER_RETRIES
 from .native_frames import NATIVE_PLAYBACK_EVENT_VERSION, NativePlaybackEventSink
 from .native_media_crypto import (
     NativeMediaCryptoError,
@@ -406,7 +406,8 @@ class NativeRelayPlaybackWorker:
         """Query recording days through the shared sequential camera session."""
         work = _CatalogWork(
             days, cancel_event, events=events, months=months,
-            allow_wake=not events and not months and ON_DEMAND_DAY_CATALOG.get(),
+            # SD readiness is a connection prerequisite, not a manual retry.
+            allow_wake=not events and not months,
         )
         self._submit(work)
         work.done.wait()

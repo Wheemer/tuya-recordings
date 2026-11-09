@@ -851,7 +851,7 @@ class TuyaRecordingsClient:
                         "Tuya Recordings catalog query started request_id=%s dev=%s day=%s "
                         "wake_scope_enabled=%s offer_resend_enabled=%s",
                         request_id, dev_id, day.isoformat(),
-                        ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get(),
+                        True, ON_DEMAND_OFFER_RETRIES.get(),
                     )
                     try:
                         clips = self._recordings_for_day(dev_id, day)
