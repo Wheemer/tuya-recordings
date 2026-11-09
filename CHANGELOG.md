@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-15 (2026-11-09)
+
+### Recording Catalog
+
+- Apply the Smart Life APK's wake and SD-readiness preparation to automatic day-catalog connections, not just manual refreshes.
+- Use fresh account availability reports to defer automatic work for cameras reported offline. These hints expire, and a successful native catalog response supersedes them.
+- Keep explicit manual refresh available despite an offline inventory report. Manual browsing and playback retain their existing connection path.
+
+### Diagnostics And Safety
+
+- Distinguish automatic queries skipped because of an offline report from queries skipped because of cache or backoff.
+- Correct SD-query diagnostics when an MQTT report arrives during a LAN query, without claiming that LAN delivery completed.
+- Preserve command serialization, wake cooldowns, failure backoff, and playback priority. No background offer resends, additional inventory polling, or media relay are added; video and audio remain LAN-only.
+
 ## Tuya Recordings v0.4.13-14 (2026-11-09)
 
 ### Connection
