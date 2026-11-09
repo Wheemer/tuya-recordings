@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-14 (2026-11-09)
+
+### Connection
+
+- Follow the Smart Life native SDK's connection-ready sequence: an authenticated, nominated LAN connection can begin native authorization and SD-card commands without waiting for a separate SDP answer.
+- Match the APK's MQTT offer and candidate headers. Keep the relay path marker on the native command-channel copy only.
+- Report whether native control started through an SDP answer or authenticated LAN nomination, and show the SD-status query route and dispatch outcome without exposing credentials.
+
+### Wake And Safety
+
+- Send the SD-playback wireless wake with the SDK's QoS 1 delivery setting. Keep generic device wake unchanged.
+- Preserve the existing wake deduplication, cooldowns, and SD-status deadline. A broker acknowledgement alone does not count as camera readiness.
+- Keep video and audio LAN-only, reject conflicting late session keys, and close signaling connections before native media begins. No background retries are added.
+
 ## Tuya Recordings v0.4.13-13 (2026-11-09)
 
 ### Connection
