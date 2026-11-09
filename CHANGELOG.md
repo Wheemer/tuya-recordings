@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-16 (2026-11-09)
+
+### Wake And SD Readiness
+
+- Correct fresh SD connections that queried status while the required wake was suppressed by cooldown. If LAN cannot confirm readiness, wait cancellably for one permitted wake before querying SD status.
+- Preserve the fast path for LAN-ready cameras without publishing an additional wake. Keep the device-wide report listener active during the wait and accept a genuine readiness report if one arrives.
+- Start the SD-report deadline after the wake-slot wait, and include that bounded wait in the outer connection budget without changing protocol deadlines.
+- Preserve wake spacing, missing-report cooldowns, cancellation, and command serialization. No detached retries are added; video and audio remain LAN-only.
+
+This prerelease addresses connection preparation. Complete recording discovery and video/audio playback on the affected cameras remain unverified.
+
 ## Tuya Recordings v0.4.13-15 (2026-11-09)
 
 ### Recording Catalog
