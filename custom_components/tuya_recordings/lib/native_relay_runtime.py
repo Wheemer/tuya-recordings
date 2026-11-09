@@ -22,7 +22,7 @@ from .native_media_crypto import (
     decrypt_playback_frame,
 )
 from .native_relay_media import playback_stream_frame
-from .native_relay_playback import NativeRelayPlaybackSession
+from .native_relay_playback import NativeRelayPlaybackSession, WAKE_SLOT_TIMEOUT_SECONDS
 from .native_session import NativeCameraSessionConfig, NativePlaybackRequest
 from .native_thumbnail import NativeThumbnailReady
 
@@ -563,7 +563,9 @@ class NativeRelayPlaybackWorker:
                     await self._wait_for_work(
                         playback.connect(media=wanted_mode == "media", **connect_options),
                         work,
-                        timeout=self._command_timeout + 60,
+                        timeout=self._command_timeout + 60 + (
+                            WAKE_SLOT_TIMEOUT_SECONDS if connect_options.get("allow_wake") else 0
+                        ),
                         # A cancelled connect must close before priority work.
                         cancellable=True,
                     )

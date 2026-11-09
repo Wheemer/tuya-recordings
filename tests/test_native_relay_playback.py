@@ -49,6 +49,55 @@ class StatusBroker:
         await self.async_send_wake()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["lan_ready", "cancel_wait", "report_during_wait"])
+async def test_sd_cooldown_preserves_lan_fast_path_and_cancellable_wait(monkeypatch, outcome):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+
+    commands = CameraCommandQueue()
+    monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", commands)
+    config = replace(camera_config(), wake_direct=True, sd_low_power_wake=True,
+                     sd_status_mqtt_dp="110", sd_status_lan_dp="110" if outcome == "lan_ready" else "")
+    assert commands.reserve_wake(config.dev_id)
+    playback = NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._on_demand_catalog = True
+    calls = []
+    class Broker(StatusBroker):
+        async def async_send_wake(self):
+            pytest.fail("No wake may be published inside the cooldown")
+        async def async_query_direct_dp(self, dp):
+            pytest.fail("No MQTT SD query may precede its allowed wake")
+    broker = Broker()
+    async def lan_ready(dp, deadline, moto):
+        calls.append("LAN status")
+        playback._accept_sd_status_report(1)
+        return True
+    monkeypatch.setattr(playback, "_try_lan_sd_status", lan_ready)
+    task = asyncio.create_task(playback._maybe_send_wake(broker))
+    try:
+        if outcome == "lan_ready":
+            await asyncio.wait_for(task, 0.2)
+            assert calls == ["LAN status"]
+        else:
+            async with asyncio.timeout(1):
+                while playback._connect_phase != "wait_wake_cooldown":
+                    await asyncio.sleep(0)
+            assert playback._sd_status_deadline is None
+            if outcome == "cancel_wait":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                broker._dp_query[1].set_result(1)
+                await asyncio.wait_for(task, 0.2)
+        assert not commands.wake_report_on_cooldown(config.dev_id)
+        assert broker._dp_query is None
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def camera_config():
     p2p_config = {
         "expire": 4102444800,
@@ -807,9 +856,13 @@ async def test_wake_only_for_confirmed_direct_on_demand_catalog(
         playback._on_demand_catalog = allowed
         await playback._open_signaling("sdp", [], "trace", {}, {})
         assert (playback._retry_offer is not None) == allowed
+        # Shorten only the fixture's next reservation, retaining a distinct
+        # per-request wake before its SD query on non-LAN connections.
+        if "wake" in expected:
+            relay_module.CAMERA_COMMANDS._wake_after[config.dev_id] = relay_module.time.monotonic() + 0.01
     if "wake" in expected:
         expected = ["subscribe", "wake", "sd_status", "offer"]
-        assert calls == [*expected, "subscribe", "sd_status", "offer"]
+        assert calls == [*expected, *expected]
     else:
         assert calls == [*expected, "subscribe", "offer"]
 

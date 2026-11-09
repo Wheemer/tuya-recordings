@@ -107,6 +107,7 @@ _DISCONNECT_GRACE_SECONDS = 0.3
 _CLOSE_STEP_TIMEOUT_SECONDS = 2.0
 _HTTP_TOKEN_TIMEOUT_SECONDS = 15.0
 _LOGGER = logging.getLogger(__name__)
+WAKE_SLOT_TIMEOUT_SECONDS = 61.0
 
 
 def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
@@ -227,6 +228,8 @@ class NativeRelayPlaybackSession:
         self._sd_status_dispatch = "not_requested"
         self._sd_status_lan_details = "not_attempted"
         self._sd_status_prepared = False
+        self._sd_wake_reserved = False
+        self._sd_lan_prechecked = False
         self._sd_status_signaling_details = "not_used"
         self._sd_status_deadline: float | None = None
         self._session: DirectSession | None = None
@@ -780,6 +783,9 @@ class NativeRelayPlaybackSession:
         if self._connector_wake_sent:
             self._connector_wake_status = "shared_sd_wake"
             return
+        if self._sd_status_prepared:
+            self._connector_wake_status = "sd_ready"
+            return
         if config.wake_capability not in {"low_power", "remote", "low_power_and_remote", "wireless"}:
             self._connector_wake_status = "not_eligible"
             return
@@ -813,9 +819,24 @@ class NativeRelayPlaybackSession:
         if eligible and dp.isascii() and dp.isdecimal():
             # One device listener survives wake, connection, dispatch, socket
             # teardown and fallback. Nested same-task operations borrow it.
-            self._sd_status_deadline = asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
             try:
                 with moto.dp_report_listener(dp) as report:
+                    if (not self._connector_wake_sent
+                            and not CAMERA_COMMANDS.wake_report_on_cooldown(config.dev_id)
+                            and CAMERA_COMMANDS.wake_delay(config.dev_id) > 0):
+                        # A reachable LAN camera may already be ready. Preserve
+                        # that fast path without publishing another wake.
+                        if config.sd_status_lan_dp.isascii() and config.sd_status_lan_dp.isdecimal():
+                            self._sd_status_deadline = asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
+                            if await self._try_lan_sd_status(config.sd_status_lan_dp, self._sd_status_deadline, moto):
+                                self._wake_status = "not_needed_lan_ready"
+                                return
+                            self._sd_lan_prechecked = True
+                            self._sd_status_deadline = None
+                        await self._wait_for_sd_wake_slot(report)
+                    # Waiting for a safety reservation is not a missing SD
+                    # report. Start the APK's report deadline after that wait.
+                    self._sd_status_deadline = asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
                     async with asyncio.timeout_at(self._sd_status_deadline):
                         await self._perform_sd_wake(moto, report)
             except TimeoutError:
@@ -824,6 +845,26 @@ class NativeRelayPlaybackSession:
                 self._sd_status_deadline = None
         else:
             await self._perform_sd_wake(moto)
+
+    async def _wait_for_sd_wake_slot(self, report: asyncio.Future[int]) -> None:
+        """Wait for one allowed wake; never query a sleeping peer instead."""
+        dev_id = self._native_config.dev_id
+        self._connect_phase = "wait_wake_cooldown"
+        self._wake_status = "waiting_cooldown"
+        # The reservation is at most one minute. A concurrent reservation must
+        # not turn this foreground operation into an unbounded retry loop.
+        try:
+            async with asyncio.timeout(WAKE_SLOT_TIMEOUT_SECONDS):
+                while not report.done():
+                    if CAMERA_COMMANDS.reserve_wake(dev_id):
+                        self._sd_wake_reserved = True
+                        return
+                    await asyncio.wait((report,), timeout=CAMERA_COMMANDS.wake_delay(dev_id))
+        except TimeoutError as err:
+            self._wake_status = "cooldown_wait_timeout"
+            raise NativeRelayPlaybackError(
+                f"Camera wake cooldown did not become available ({self.transport_diagnostics})"
+            ) from err
 
     async def _perform_sd_wake(self, moto: MotoClient, report: asyncio.Future[int] | None = None) -> None:
         config = self._native_config
@@ -845,7 +886,8 @@ class NativeRelayPlaybackSession:
         if not config.wake_direct:
             self._wake_status = "direct_target_unconfirmed"
             return
-        send_wake = not self._connector_wake_sent and CAMERA_COMMANDS.reserve_wake(config.dev_id)
+        send_wake = not self._connector_wake_sent and (self._sd_wake_reserved or CAMERA_COMMANDS.reserve_wake(config.dev_id))
+        self._sd_wake_reserved = False
         self._connect_phase = "mqtt_wake"
         self._wake_status = "sent_unconfirmed" if self._connector_wake_sent else "cooldown"
         try:
@@ -865,7 +907,7 @@ class NativeRelayPlaybackSession:
             self._accept_sd_status_report(report.result())
             return
         deadline = self._sd_status_deadline or asyncio.get_running_loop().time() + _SD_STATUS_TIMEOUT_SECONDS
-        if config.sd_status_lan_dp.isascii() and config.sd_status_lan_dp.isdecimal():
+        if not self._sd_lan_prechecked and config.sd_status_lan_dp.isascii() and config.sd_status_lan_dp.isdecimal():
             if await self._try_lan_sd_status(config.sd_status_lan_dp, deadline, moto):
                 return
             if report is not None and report.done():
