@@ -612,7 +612,7 @@ async def _async_request_catalog_refresh(
 
     task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
     if reason == "service" and task is not None and not task.done():
-        # A scheduled pass has no foreground wake permission. Finish it first;
+        # A scheduled pass has no foreground retry permission. Finish it first;
         # never promote, cancel, or mistake it for the user's manual request.
         await asyncio.shield(task)
         if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:

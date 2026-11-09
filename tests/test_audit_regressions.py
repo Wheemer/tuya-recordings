@@ -103,6 +103,49 @@ def test_stale_response_never_renews_catalog_freshness(tmp_path):
     assert abs((datetime.fromisoformat(saved["expiresAt"]) - expiry).total_seconds()) < 0.01
 
 
+@pytest.mark.parametrize("online", [False, True, None, 0, "false"])
+def test_inventory_availability_gates_only_fresh_automatic_work(monkeypatch, tmp_path, caplog, online):
+    import logging
+    from unittest.mock import Mock
+    import custom_components.tuya_recordings.client as module
+    from custom_components.tuya_recordings.lib.commands import manual_catalog_refresh
+
+    clock = [100.0]
+    caplog.set_level(logging.DEBUG, logger="custom_components.tuya_recordings")
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    gateway = Mock()
+    gateway.device_connection_inventory_data.return_value = (
+        {"camera": "key"}, {"camera": "2.3"},
+        [{"devId": "camera", "category": "sp", "name": "Camera", "online": online}],
+    )
+    monkeypatch.setattr(module, "NativeAppGatewayClient", Mock(return_value=gateway))
+    monkeypatch.setattr(module, "build_recordings_backend", Mock(return_value=Mock()))
+    client = TuyaRecordingsClient({}, recordings_backend=Mock(), cache_path=tmp_path / "index.json")
+    client.lookback_days = 1
+    client.refresh_inventory({"native_app_session": {"device_fingerprint": "fixture"}})
+    query = Mock(return_value=[])
+    monkeypatch.setattr(client, "_recordings_for_day", query)
+    result = client.refresh_background_catalog(1)
+    assert query.call_count == (0 if online is False else 1)
+    assert result["cameras"][0]["online"] is (False if online is False else True)
+    assert ("reason=reported_offline" in caplog.text) is (online is False)
+    # Explicit user action must not inherit a possibly inaccurate offline gate.
+    with manual_catalog_refresh():
+        client.refresh_background_catalog(1)
+    assert query.call_count == (1 if online is False else 2)
+    assert client._camera_availability["camera"][1] is True
+    assert client._camera_devices()[0]["online"] is None
+    assert gateway.device_connection_inventory_data.call_count == 1
+    # Expiry permits a bounded automatic probe, without a new inventory API call.
+    clock[0] += module.CACHE_TTL.total_seconds()
+    client._camera_index_cache["cameras"][0]["catalogDays"] = {}
+    assert client._camera_availability["camera"][0] <= clock[0]
+    client.refresh_background_catalog(1)
+    assert client._camera_availability["camera"][0] > clock[0]
+    assert query.call_count == (2 if online is False else 3)
+    assert gateway.device_connection_inventory_data.call_count == 1
+
+
 def test_inventory_refresh_rotates_backend_once_and_closes_gateway(monkeypatch):
     from unittest.mock import Mock
     import custom_components.tuya_recordings.client as module

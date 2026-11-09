@@ -439,7 +439,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     monkeypatch.setattr(relay_module, "CAMERA_COMMANDS", CameraCommandQueue())
     monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS",
                         (0.35, 0.4, 0.45, 0.5) if dual else (0.03, 0.06, 0.12, 0.24))
-    monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.6 if dual else 0.32)
+    # Leave scheduling headroom when asserting every shortened resend fires.
+    monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 1.0 if outcome == "silent" else 0.6 if dual else 0.32)
     def native_call(api, version, body, extra):
         if api == "thing.m.device.dp.publish":
             assert outcome == "http_wake" and body["dps"] == '{"110":null}'
@@ -1195,6 +1196,9 @@ async def test_lan_sd_query_uses_device_wide_mqtt_listener_and_joins_cleanup(mon
         assert await task is True
         assert playback._sd_status_query == "report_received"
         assert playback._sd_status_report_route == ("mqtt" if outcome == "mqtt_report" else "lan")
+        assert playback._sd_status_dispatch == (
+            "report_received_delivery_unconfirmed" if outcome == "mqtt_report" else "sent"
+        )
     assert mqtt._dp_query is None
     assert stopped.is_set() and playback._status_lan is None
     assert calls.count("lan-query") == 1
