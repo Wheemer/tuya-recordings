@@ -163,6 +163,7 @@ class TuyaRecordingsClient:
         self._closed = False
         self._hass = hass
         self._camera_inventory: dict[str, str] | None = None
+        self._camera_availability: dict[str, tuple[float, bool]] = {}
         self._camera_inventory_source = "unconfigured"
         self._lifecycle_lock = threading.RLock()
         self._cloud_pause_event = threading.Event()
@@ -812,6 +813,12 @@ class TuyaRecordingsClient:
                 index = {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "cameras": cameras}
                 by_id = {camera["devId"]: camera for camera in cameras}
                 manual = ON_DEMAND_DAY_CATALOG.get()
+                if not manual:
+                    observed_at = time.monotonic()
+                    for camera in cameras:
+                        evidence = self._camera_availability.get(camera["devId"])
+                        if evidence is not None and observed_at < evidence[0]:
+                            camera["online"] = evidence[1]
                 eligible = cameras
                 if manual:
                     eligible = [camera for camera in cameras if time.monotonic() >= self._manual_catalog_after.get(camera["devId"], 0)]
@@ -825,6 +832,7 @@ class TuyaRecordingsClient:
                             "Tuya Recordings catalog query skipped request_id=%s dev=%s reason=%s "
                             "retained_error=%s last_error_at=%s retry_after=%s",
                             request_id, camera["devId"],
+                            "reported_offline" if not manual and camera.get("online") is False else
                             "manual_cooldown" if manual and time.monotonic() < self._manual_catalog_after.get(camera["devId"], 0) else "cache_or_backoff",
                             bool(camera.get("bridgeStatus", {}).get("error")),
                             camera.get("catalogErrorAt", "none"), camera.get("catalogRetryAfter", "none"),
@@ -851,12 +859,17 @@ class TuyaRecordingsClient:
                         "Tuya Recordings catalog query started request_id=%s dev=%s day=%s "
                         "wake_scope_enabled=%s offer_resend_enabled=%s",
                         request_id, dev_id, day.isoformat(),
-                        ON_DEMAND_DAY_CATALOG.get(), ON_DEMAND_OFFER_RETRIES.get(),
+                        True, ON_DEMAND_OFFER_RETRIES.get(),
                     )
                     try:
                         clips = self._recordings_for_day(dev_id, day)
                         if active.is_set():
                             raise CameraWorkCancelled("Recording catalog pass cancelled")
+                        # A real native response supersedes account availability.
+                        camera["online"] = True
+                        self._camera_availability[dev_id] = (
+                            time.monotonic() + CACHE_TTL.total_seconds(), True,
+                        )
                         camera["clips"] = self._reconcile_catalog(dev_id, clips, camera["clips"], [day.isoformat()])
                         saved_days = camera.get("catalogDays")
                         scanned = dict(saved_days) if isinstance(saved_days, dict) else {}
@@ -1722,6 +1735,14 @@ class TuyaRecordingsClient:
                 raise
             self._backend = replacement
             self.set_camera_inventory(updates[CONF_DEVICE_INVENTORY])
+            # Keep only fresh account evidence, never persisted offline locks.
+            expiry = time.monotonic() + CACHE_TTL.total_seconds()
+            self._camera_availability = {
+                device["devId"]: (expiry, device["online"])
+                for device in devices
+                if device.get("devId") in updates[CONF_DEVICE_INVENTORY]
+                and type(device.get("online")) is bool
+            }
             for dev_id, wake in updates[CONF_DEVICE_WAKE_CAPABILITIES].items():
                 LOGGER.info(
                     "Tuya Recordings refreshed SD wake metadata request_id=%s dev=%s mqtt_pv=%s "

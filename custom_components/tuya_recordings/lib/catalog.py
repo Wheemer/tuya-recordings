@@ -21,10 +21,10 @@ def _timestamp(value) -> datetime | None:
 
 def catalog_camera_available(camera: dict, now: datetime, *, manual: bool = False) -> bool:
     """Keep automatic camera work quiet after a catalog connection failure."""
-    if camera.get("online") is False:
-        return False
     if manual:
         return True
+    if camera.get("online") is False:
+        return False
     retry_after = _timestamp(camera.get("catalogRetryAfter"))
     if retry_after is not None and retry_after > now:
         return False

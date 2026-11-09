@@ -80,7 +80,7 @@ def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manu
                     worker.catalog([date(2026, 11, 3)], None, events=kind == "events", months=kind == "month")
         assert calls == [{
             "media": kind in {"clip", "timeline"},
-            **({"allow_wake": True} if kind == "timeline" else {}),
+            **({"allow_wake": True} if kind in {"timeline", "day"} else {}),
             **({"retry_offer": True} if manual and kind != "thumbnail" else {}),
         }]
     finally:

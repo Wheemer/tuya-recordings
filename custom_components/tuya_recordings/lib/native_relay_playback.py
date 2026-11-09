@@ -970,6 +970,12 @@ class NativeRelayPlaybackSession:
                         if mqtt_report in done:
                             status = mqtt_report.result()
                             self._sd_status_report_route = "mqtt"
+                            # A device-wide report proves readiness, not that
+                            # the concurrent LAN dispatch completed.
+                            self._sd_status_dispatch = (
+                                "report_received_delivery_unconfirmed" if query is not None
+                                else "not_needed_report_available"
+                            )
                         else:
                             self._sd_status_dispatch = "sent"
                             try:
