@@ -382,12 +382,19 @@ class MotoClient:
 
     async def async_send_wake(self) -> None:
         """Send one APK low-power wake to the verified direct target."""
+        await self._async_publish_wake(qos=0)
+
+    async def async_send_playback_wake(self) -> None:
+        """Match rul.wakeupLowPowerDevice -> publishWirelessWake (QoS 1)."""
+        await self._async_publish_wake(qos=1)
+
+    async def _async_publish_wake(self, *, qos: int) -> None:
         if self._client is None or self._subscription not in {"granted_qos_0", "granted_qos_1"}:
             raise TuyaIpcP2pConnectionError("MQTT is not ready for a camera wake")
         try:
             await self._client.publish(
                 f"m/w/{self._device_id}", crc32(self._key).to_bytes(4, "big"),
-                qos=0, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
+                qos=qos, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
             )
         except aiomqtt.MqttError as error:
             raise TuyaIpcP2pConnectionError("Native camera wake send failed") from error

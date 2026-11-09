@@ -45,6 +45,9 @@ class StatusBroker:
     _dp_query_owner = None
     _reader_failure = "none"
 
+    async def async_send_playback_wake(self):
+        await self.async_send_wake()
+
 
 def camera_config():
     p2p_config = {
@@ -210,7 +213,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
 
         async def publish(self, topic, payload, *, qos, **kwargs):
             if topic == f"m/w/{dev}":
-                assert wake and qos == 0 and kwargs["retain"] is False
+                assert wake and qos == 1 and kwargs["retain"] is False
                 assert payload == crc32(key).to_bytes(4, "big")
                 events.append("wake")
                 if outcome == "lan_answer_mqtt_status":

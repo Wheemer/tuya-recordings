@@ -28,7 +28,7 @@ from ..vendor.tuya_ipc_p2p_sdk.crypto import (
     encrypt_record,
     random_alphanumeric,
 )
-from ..vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pError
+from ..vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pError, TuyaIpcP2pProtocolError
 from ..vendor.tuya_ipc_p2p_sdk.signaling import (
     MotoClient,
     SdpAnswer,
@@ -200,6 +200,7 @@ class NativeRelayPlaybackSession:
         self._lan_answers_alive = False
         self._mqtt_answers_alive = False
         self._answer_source = "none"
+        self._direct_control_ready = False
         self._duplicate_answers = 0
         self._answer_channel_failures: dict[str, str] = {}
         self._lan_answer_attempted = False
@@ -330,6 +331,7 @@ class NativeRelayPlaybackSession:
         return (
             f"transport=direct-ice, signaling={self._signaling_path}, relay=disabled, "
             f"connected={self._connected}, "
+            f"control_bootstrap={'authenticated_lan' if self._direct_control_ready else 'sdp_answer' if self._answer_status == 'accepted' else 'waiting'}, "
             f"session=({session_status}), "
             f"ice=({ice_status}), control=(records={self._control_records},"
             f"decode_failures={self._control_decode_failures},commands={commands}), "
@@ -448,16 +450,18 @@ class NativeRelayPlaybackSession:
                 tcp=media or self._on_demand_catalog or self._retry_mqtt_offer,
             )
             await self._ice.async_gather()
-            self._connect_phase = "wait_answer"
-            answer = await self._wait_for_answer()
+            self._connect_phase = "wait_connection"
+            answer = await self._wait_for_connection()
             if self._command is not None:
                 if not await _bounded_cleanup(self._command.finish_bootstrap()):
                     raise NativeRelayPlaybackError("Native signaling TCP cleanup timed out")
             if self._ended.done():
                 raise self._ended.result()
-            self._ice.set_receive_key(answer.aes_key)
-            self._ice.set_remote_credentials(answer.ice_ufrag, answer.ice_password)
-            for candidate in (*self._remote_candidates, *answer.candidates):
+            receive_key = self._receive_key()
+            self._ice.set_receive_key(receive_key)
+            if answer is not None:
+                self._ice.set_remote_credentials(answer.ice_ufrag, answer.ice_password)
+            for candidate in (*self._remote_candidates, *(answer.candidates if answer is not None else ())):
                 self._ice.add_remote_candidate(candidate)
             self._remote_candidates.clear()
             self._connect_phase = "ice_nomination"
@@ -469,7 +473,7 @@ class NativeRelayPlaybackSession:
             self._connect_phase = "native_control"
             self._control = self._session.control
             self._control.set_message_handler(
-                lambda record: self._on_control_record(record, answer.aes_key)
+                lambda record: self._on_control_record(record, receive_key)
             )
             credential = auth_credential(config.device_password, config.local_key)
             packets = (
@@ -496,12 +500,12 @@ class NativeRelayPlaybackSession:
                 # now and discard only completed preview frames in start().
                 self._video.set_message_handler(
                     lambda record: self._on_rtp_record(
-                        _VIDEO_CONVERSATION, record, answer.aes_key
+                        _VIDEO_CONVERSATION, record, receive_key
                     )
                 )
                 self._audio.set_message_handler(
                     lambda record: self._on_rtp_record(
-                        _AUDIO_CONVERSATION, record, answer.aes_key
+                        _AUDIO_CONVERSATION, record, receive_key
                     )
                 )
                 await self._stop_preview()
@@ -847,7 +851,7 @@ class NativeRelayPlaybackSession:
         try:
             if send_wake:
                 self._wake_status = "sending"
-                await moto.async_send_wake()
+                await moto.async_send_playback_wake()
         except TuyaIpcP2pError:
             self._wake_status = "send_failed"
         else:
@@ -1362,7 +1366,7 @@ class NativeRelayPlaybackSession:
                 play_time=start if play_time is None else play_time,
                 encrypted=encrypted,
             )
-        answer = self._require_answer()
+        receive_key = self._receive_key()
         self._allocate_request_id()
         self._task_id = self._next_task_id
         self._next_task_id += 1
@@ -1371,10 +1375,10 @@ class NativeRelayPlaybackSession:
         self._playback_started = True
         self._playback_paused = False
         self._video.set_message_handler(
-            lambda record: self._on_rtp_record(_VIDEO_CONVERSATION, record, answer.aes_key)
+            lambda record: self._on_rtp_record(_VIDEO_CONVERSATION, record, receive_key)
         )
         self._audio.set_message_handler(
-            lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, answer.aes_key)
+            lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, receive_key)
         )
         self._send_control(start_payload)
         self._send_control(encode_audio_open(stream_id=stream_id, channel=0))
@@ -1575,6 +1579,29 @@ class NativeRelayPlaybackSession:
         self._stream_id = None
         await self.close()
 
+    async def _wait_for_connection(self) -> SdpAnswer | None:
+        """Native a81b8 completes on ready ICE; SDP reception is independent."""
+        answer_task = asyncio.create_task(self._wait_for_answer())
+        direct_task = asyncio.create_task(self._ice.async_wait_for_nomination(_ANSWER_TIMEOUT_SECONDS))
+        try:
+            done, _ = await asyncio.wait((answer_task, direct_task), return_when=asyncio.FIRST_COMPLETED)
+            if answer_task in done:
+                return answer_task.result()
+            if direct_task.exception() is None and getattr(self._ice, "is_nominated", False) is True:
+                if self._ended.done():
+                    raise self._ended.result()
+                if self._answer.done():
+                    return self._answer.result()
+                self._direct_control_ready = True
+                _LOGGER.debug("Native LAN control ready before SDP answer: %s", self.transport_diagnostics)
+                return None
+            return await answer_task
+        finally:
+            for task in (answer_task, direct_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(answer_task, direct_task, return_exceptions=True)
+
     async def _wait_for_answer(self) -> SdpAnswer:
         assert self._answer is not None
         retry_offer, self._retry_offer = self._retry_offer, None
@@ -1588,7 +1615,7 @@ class NativeRelayPlaybackSession:
                 return await asyncio.shield(self._answer)
         except TimeoutError as err:
             raise NativeRelayPlaybackError(
-                f"Timed out waiting for a usable native IMM answer ({self.transport_diagnostics})"
+                f"Timed out waiting for a usable native IMM answer or authenticated LAN nomination ({self.transport_diagnostics})"
             ) from err
 
     async def _resend_offer(
@@ -1634,12 +1661,17 @@ class NativeRelayPlaybackSession:
             self._duplicate_answers += 1
             return
         try:
-            answer.set_result(parse_answer(sdp))
+            parsed = parse_answer(sdp)
+            if self._direct_control_ready and parsed.aes_key != self._require_offer().aes_key:
+                raise TuyaIpcP2pProtocolError("Late SDP answer conflicts with established native session key")
+            answer.set_result(parsed)
         except TuyaIpcP2pError as err:
             self._answer_status = "invalid_sdp"
             answer.set_exception(NativeRelayPlaybackError(
                 f"Invalid native IMM answer: {err} ({self.transport_diagnostics})"
             ))
+            if self._direct_control_ready:
+                self._fail_transport(answer.exception())
         else:
             self._answer_status = "accepted"
             self._answer_source = source
@@ -1684,6 +1716,12 @@ class NativeRelayPlaybackSession:
         if self._closed:
             return
         self._answer_channel_failures[transport] = reason
+        if self._connected and self._direct_control_ready:
+            if transport == "MQTT":
+                self._mqtt_answers_alive = False
+            else:
+                self._lan_answers_alive = False
+            return
         if transport == "MQTT":
             self._mqtt_answers_alive = False
             if self._lan_answers_alive or (
@@ -1971,6 +2009,13 @@ class NativeRelayPlaybackSession:
         if self._offer is None:
             raise NativeRelayPlaybackError("Native IMM offer is unavailable")
         return self._offer
+
+    def _receive_key(self) -> bytes:
+        # Native level-3 a2f4c initializes channel contexts from the local
+        # session key before any answer is received. Never synthesize SDP.
+        if self._direct_control_ready:
+            return self._require_offer().aes_key
+        return self._require_answer().aes_key
 
     def _require_answer(self) -> SdpAnswer:
         answer = self._answer

@@ -169,6 +169,11 @@ class IceResponder(asyncio.DatagramProtocol):
         self._closed = False
         self._blocked_non_lan = 0
 
+    @property
+    def is_nominated(self) -> bool:
+        """A LAN peer passed authenticated STUN nomination for this session."""
+        return not self._closed and self._nominated.is_set()
+
     def set_remote_credentials(self, ufrag: str, password: str) -> None:
         """Install peer credentials before processing its candidate checklist."""
         if self._closed:

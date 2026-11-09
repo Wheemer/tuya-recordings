@@ -145,7 +145,8 @@ async def test_direct_dp_query_waits_for_matching_report(monkeypatch, outcome):
 
 
 @pytest.mark.asyncio
-async def test_wake_matches_apk_wire_format():
+@pytest.mark.parametrize("method,qos", [("async_send_wake", 0), ("async_send_playback_wake", 1)])
+async def test_wake_matches_apk_wire_format(method, qos):
     sent = []
 
     async def publish(topic, payload, **options):
@@ -159,11 +160,11 @@ async def test_wake_matches_apk_wire_format():
     )
     client._client = SimpleNamespace(publish=publish)
     with pytest.raises(TuyaIpcP2pConnectionError, match="not ready"):
-        await client.async_send_wake()
+        await getattr(client, method)()
     client._subscription = "granted_qos_1"
-    await client.async_send_wake()
+    await getattr(client, method)()
     assert sent == [
-        ("m/w/camera", bytes.fromhex("cbf43926"), {"qos": 0, "retain": False, "timeout": 15}),
+        ("m/w/camera", bytes.fromhex("cbf43926"), {"qos": qos, "retain": False, "timeout": 15}),
     ]
 
 
