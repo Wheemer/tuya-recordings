@@ -257,7 +257,7 @@ class Peer:
                 if payload["header"]["type"] != "offer":
                     continue
                 self.offers.append(payload)
-                if self.mode == "silent":
+                if self.mode in {"silent", "candidate_resend"}:
                     continue
                 if self.mode in {"nondata_answer", "batched_answer"}:
                     for body in (b"", f6_attribute(9, b"nondata"), f6_attribute(7, b"")):
@@ -333,7 +333,7 @@ class Peer:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("mode,media", [
-    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
+    (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
 ] + [("background", False), ("udp_answer", True)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
@@ -389,8 +389,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
 
         class Ice:
             diagnostics = "fixture direct"
-            def __init__(self, *a, **k): pass
-            async def async_gather(self): pass
+            def __init__(self, *a, **k): self.candidate_callback = a[1]
+            async def async_gather(self):
+                if mode == "candidate_resend":
+                    self.candidate_callback("candidate:1 1 udp 2130706431 192.0.2.9 12345 typ host")
             def set_receive_key(self, value): events.append("LAN key")
             def set_remote_credentials(self, *a): pass
             def add_remote_candidate(self, value): pass
@@ -406,7 +408,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             def close(self): pass
 
         class Mqtt(StatusBroker):
-            def __init__(self, **kw): pass
+            def __init__(self, **kw): self.candidates = []
             async def async_connect(self): pass
             async def async_send_wake(self):
                 events.append("wake")
@@ -420,6 +422,13 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 events.append("offer")
             async def async_send_candidate(self, candidate):
                 nonlocal udp_remote
+                if mode == "candidate_resend":
+                    self.candidates.append(candidate)
+                    if len(self.candidates) == 2:
+                        assert peer.offers and session._command._channel.pending_count == 0
+                        assert session._command._last_ack.startswith("TCP:")
+                        assert self.candidates[0] == candidate
+                        session._on_answer(answer_sdp(), source="mqtt")
                 if udp_transport is not None:
                     from test_ice_authentication import request
                     fields = candidate.split()
@@ -450,16 +459,22 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         monkeypatch.setattr(playback, "MotoClient", Mqtt)
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
+        if mode == "candidate_resend":
+            monkeypatch.setattr(playback, "_OFFER_RETRY_OFFSETS", (0.08, 0.12, 0.16, 0.2))
         try:
-            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer"}:
+            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer", "candidate_resend"}:
                 await session.connect(media=media, allow_wake=True, retry_offer=True)
-                assert session._answer_source == "command"
-                assert session._command._blocked == 3
-                assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
+                if mode == "candidate_resend":
+                    assert session._answer_source == "mqtt" and session._offer_retries == 1
+                else:
+                    assert session._answer_source == "command"
+                    assert session._command._blocked == 3
+                    assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
                 await asyncio.wait_for(peer.closed.wait(), 1)
                 page = await session.query_recordings(date(2026, 11, 8))
                 assert len(page.items) == 1
-                assert events == (["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
+                assert events == (["wake", "SD status", "offer", "offer", "LAN key", "LAN catalog"] if mode == "candidate_resend"
+                                  else ["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
                                   else ["wake", "SD status", "offer", "LAN key", "LAN catalog"])
                 if mode == "udp_answer":
                     assert session._ice._nominated.is_set()

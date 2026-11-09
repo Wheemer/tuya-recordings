@@ -1577,6 +1577,16 @@ class NativeRelayPlaybackSession:
             self._offer_retries += 1
             try:
                 await send_offer()
+                # APK ab52c replays the outgoing cache, populated by both
+                # the offer and aba90's local-candidate callback. TCP PUSHes
+                # are not repeated; only the existing MQTT retry is used.
+                for candidate in tuple(self._command_candidates):
+                    if (self._closed or self._answer.done()
+                            or loop.time() >= deadline):
+                        return
+                    if self._ended is not None and self._ended.done():
+                        raise self._ended.result()
+                    await self._moto.async_send_candidate(candidate)
             except TuyaIpcP2pError as err:
                 self._offer_status = "retry_publish_failed"
                 raise NativeRelayPlaybackError(

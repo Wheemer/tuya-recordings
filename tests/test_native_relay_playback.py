@@ -94,7 +94,7 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
-@pytest.mark.parametrize("outcome", ["home", "resend", "silent", "wake", "http_wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
+@pytest.mark.parametrize("outcome", ["home", "resend", "candidate_resend", "silent", "wake", "http_wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
 @pytest.mark.parametrize("via_button", [False, True])
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
 @pytest.mark.parametrize("wire_preconnect", [None, False, True])
@@ -134,8 +134,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     events = []
     detail_lookup = outcome != "home"
     dual = outcome in {"lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"}
-    wake = outcome in {"wake", "http_wake", "no_card", "lan_delivery_fail", "lan_answer", "mqtt_and_lan_answer", "lan_answer_mqtt_status"}
-    low_power_metadata = outcome in {"wake", "http_wake", "no_card", "missing", "hub", "lan_delivery_fail"} or dual
+    wake = outcome in {"wake", "http_wake", "candidate_resend", "no_card", "lan_delivery_fail", "lan_answer", "mqtt_and_lan_answer", "lan_answer_mqtt_status"}
+    low_power_metadata = outcome in {"wake", "http_wake", "candidate_resend", "no_card", "missing", "hub", "lan_delivery_fail"} or dual
     lan_events = ["lan-connect"] if outcome == "lan_answer_no_wake" else ["lan-connect", "lan-query", "lan-close"] if outcome == "lan_delivery_fail" else ["lan-connect", "lan-query"] if dual else []
     from queue import SimpleQueue, Empty
     lan_replies = SimpleQueue()
@@ -144,6 +144,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     key = config.local_key.encode()
     send_key = None
     brokers = []
+    candidates = []
 
     def inventory_call(self, api, version, post, app_session=None, extra_params=None):
         assert self.app_profile_id == profile
@@ -237,6 +238,17 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             header = body["header"]
             if header["type"] == "disconnect":
                 return
+            if header["type"] == "candidate":
+                assert outcome == "candidate_resend"
+                candidates.append(body)
+                if len(candidates) == 2:
+                    reply = encode_payload(
+                        key, 1, b"test",
+                        {"header": {"type": "answer", "sessionid": header["sessionid"]},
+                         "msg": {"sdp": answer_sdp()}}, 0, 302, "2.3",
+                    )
+                    self.inbound.put_nowait(SimpleNamespace(topic=f"smart/mb/in/{dev}", payload=reply))
+                return
             assert header["type"] == "offer"
             # The native builder reads the token boolean, not connect_v3's
             # independently enabled preconnection optimization.
@@ -278,9 +290,11 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             nonlocal send_key
             send_key = kwargs["send_key"]
             self.receive_key = None
+            self.candidate_callback = _candidate
 
         async def async_gather(self):
-            pass
+            if outcome == "candidate_resend":
+                self.candidate_callback("candidate:1 1 udp 2130706431 192.0.2.9 12345 typ host")
 
         def set_receive_key(self, value):
             assert value == ANSWER_KEY
@@ -552,7 +566,9 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
         assert offers == [b"2.2"]
         assert events == (["schema"] if via_button else []) + ["wake", "sd-query", "broker-closed"]
         return
-    count = {"home": 1, "resend": 2, "silent": 5, "wake": 1, "http_wake": 1, "missing": 1, "hub": 1, "lan_delivery_fail": 1, "lan_answer": 1, "mqtt_and_lan_answer": 1, "lan_answer_no_wake": 1, "lan_answer_mqtt_status": 1}[outcome]
+    count = {"home": 1, "resend": 2, "candidate_resend": 2, "silent": 5, "wake": 1, "http_wake": 1, "missing": 1, "hub": 1, "lan_delivery_fail": 1, "lan_answer": 1, "mqtt_and_lan_answer": 1, "lan_answer_no_wake": 1, "lan_answer_mqtt_status": 1}[outcome]
+    if outcome == "candidate_resend":
+        assert len(candidates) == 2 and candidates[0] == candidates[1]
     assert offers == [b"2.2"] + [b"2.3"] * count
     assert refreshed_offers == [refreshed_offers[0]] * count
     if outcome == "silent":
@@ -1722,6 +1738,60 @@ async def test_failed_transport_cleanup_retains_ownership_and_can_be_retried(mon
     await playback.close()
     assert playback._session is None
     assert calls.count("close") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["silence", "offer_answer", "candidate_answer", "cancel", "failure"])
+async def test_cached_candidate_retries_are_bounded_and_stop_immediately(monkeypatch, outcome):
+    playback = session()
+    loop = asyncio.get_running_loop()
+    playback._answer = loop.create_future()
+    playback._ended = loop.create_future()
+    playback._command_candidates = ["candidate-one", "candidate-two"]
+    calls = []
+    answer = object()
+
+    async def offer():
+        calls.append("offer")
+        if outcome == "offer_answer":
+            playback._answer.set_result(answer)
+
+    class Broker:
+        async def async_send_candidate(self, value):
+            calls.append(value)
+            if outcome == "candidate_answer":
+                playback._answer.set_result(answer)
+            elif outcome == "cancel":
+                raise asyncio.CancelledError
+            elif outcome == "failure":
+                raise relay_module.TuyaIpcP2pError("candidate publish failed")
+
+    playback._moto = Broker()
+    playback._retry_offer = (loop.time(), offer)
+    monkeypatch.setattr(relay_module, "_OFFER_RETRY_OFFSETS", (0.01, 0.02, 0.04, 0.06))
+    monkeypatch.setattr(relay_module, "_ANSWER_TIMEOUT_SECONDS", 0.08)
+    try:
+        if outcome == "silence":
+            with pytest.raises(NativeRelayPlaybackError, match="Timed out"):
+                await playback._wait_for_answer()
+            assert calls == ["offer", "candidate-one", "candidate-two"] * 4
+        elif outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await playback._wait_for_answer()
+            assert calls == ["offer", "candidate-one"]
+        elif outcome == "failure":
+            with pytest.raises(NativeRelayPlaybackError, match="retry failed"):
+                await playback._wait_for_answer()
+            assert calls == ["offer", "candidate-one"]
+        else:
+            assert await playback._wait_for_answer() is answer
+            assert calls == (["offer"] if outcome == "offer_answer" else ["offer", "candidate-one"])
+        count = len(calls)
+        await asyncio.sleep(0.02)
+        assert len(calls) == count
+    finally:
+        playback._answer.cancel()
+        playback._ended.cancel()
 
 
 def test_download_thumbnail_uses_smart_life_event_image_command_without_playback():
