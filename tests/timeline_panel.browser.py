@@ -83,6 +83,27 @@ def main() -> None:
                 "document.querySelector('tuya-recordings-panel').shadowRoot.querySelectorAll('.recording-segment').length === 2",
                 timeout=10_000,
             )
+            selection = page.evaluate(
+                """async () => {
+                  const live = document.querySelector('tuya-recordings-panel');
+                  const probe = document.createElement('tuya-recordings-panel');
+                  const online = live.data.cameras[0];
+                  const offline = {dev_id:'offline',name:'Offline',online:false,
+                    playback_mode:'timeline',clips:[],dates:[],recording_ranges:[]};
+                  const empty = {...offline,dev_id:'empty',name:'Empty',online:true};
+                  const data = {...live.data,cameras:[offline,empty,online]};
+                  probe._hass = {...live._hass,callApi:async () => data};
+                  await probe.loadData();
+                  const initial = probe.selectedCamera;
+                  const ranges = probe.recordingRanges.length;
+                  probe.selectedCamera = 'offline';
+                  await probe.loadData();
+                  const explicit = probe.selectedCamera;
+                  probe.stopPlayback();
+                  return {initial,ranges,explicit};
+                }"""
+            )
+            assert selection == {"initial": "fixture", "ranges": 2, "explicit": "offline"}, selection
             drag_report = page.evaluate(
                 """async () => {
                   const panel = document.querySelector('tuya-recordings-panel');

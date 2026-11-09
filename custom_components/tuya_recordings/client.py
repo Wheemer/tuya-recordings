@@ -83,6 +83,7 @@ from .lib.native_gateway import (
     KNOWN_CAMERA_CATEGORY_HINTS,
     NativeAppGatewayClient,
     NativeGatewayAuthError,
+    NativeGatewayDeviceOfflineError,
     is_camera_inventory_record,
 )
 
@@ -168,6 +169,7 @@ class TuyaRecordingsClient:
         self._lifecycle_lock = threading.RLock()
         self._cloud_pause_event = threading.Event()
         self._background_pause_event = threading.Event()
+        self._catalog_cancel_event = threading.Event()
         self._media_cancel_event = threading.Event()
         self._thumbnail_cancel_event = threading.Event()
         self._media_sync_lock = threading.Lock()
@@ -260,6 +262,16 @@ class TuyaRecordingsClient:
         """Capture playback suspension with any mode-specific cancellation."""
         with self._lifecycle_lock:
             return Cancellation(self._cloud_pause_event, self._background_pause_event, *events)
+
+    def interrupt_catalog_refresh(self) -> None:
+        """Cancel only the captured catalog generation, not playback or caching."""
+        with self._lifecycle_lock:
+            self._catalog_cancel_event.set()
+            self._catalog_cancel_event = threading.Event()
+
+    def catalog_work_cancellation(self) -> Cancellation:
+        with self._lifecycle_lock:
+            return self.background_work_cancellation(self._catalog_cancel_event)
 
     @property
     def media_sync_enabled(self) -> bool:
@@ -791,7 +803,7 @@ class TuyaRecordingsClient:
 
     def refresh_background_catalog(self, limit: int = 2) -> dict[str, Any]:
         """Persist a small catalog pass before the background image worker runs."""
-        cancellation = self.background_work_cancellation()
+        cancellation = self.catalog_work_cancellation()
         self._raise_if_cloud_paused()
         if not self._refresh_lock.acquire(blocking=False):
             raise CameraWorkBusy("Recording catalog refresh is already active")
@@ -813,12 +825,13 @@ class TuyaRecordingsClient:
                 index = {"source": INDEX_SOURCE, "generatedAt": now.isoformat(), "cameras": cameras}
                 by_id = {camera["devId"]: camera for camera in cameras}
                 manual = ON_DEMAND_DAY_CATALOG.get()
-                if not manual:
-                    observed_at = time.monotonic()
-                    for camera in cameras:
-                        evidence = self._camera_availability.get(camera["devId"])
-                        if evidence is not None and observed_at < evidence[0]:
-                            camera["online"] = evidence[1]
+                observed_at = time.monotonic()
+                for camera in cameras:
+                    evidence = self._camera_availability.get(camera["devId"])
+                    if evidence is not None and observed_at < evidence[0]:
+                        # Preserve reported state in the displayed snapshot.
+                        # Explicit manual queries still bypass this hint.
+                        camera["online"] = evidence[1]
                 eligible = cameras
                 if manual:
                     eligible = [camera for camera in cameras if time.monotonic() >= self._manual_catalog_after.get(camera["devId"], 0)]
@@ -880,17 +893,42 @@ class TuyaRecordingsClient:
                         camera.pop("catalogErrorCount", None)
                         camera.pop("catalogRetryAfter", None)
                         camera["bridgeStatus"] = {"error": "", "listedCount": len(camera["clips"]), "daysChecked": sorted(camera["catalogDays"], reverse=True)}
+                        ranges = [(start, end) for clip in clips
+                                  if type(start := clip.get("start")) is int
+                                  and type(end := clip.get("end")) is int and end > start]
                         log(
-                            "Tuya Recordings catalog query succeeded request_id=%s dev=%s day=%s clips=%s",
+                            "Tuya Recordings catalog query succeeded request_id=%s dev=%s day=%s "
+                            "ranges=%s range_seconds=%s first_start=%s last_end=%s",
                             request_id, dev_id, day.isoformat(), len(clips),
+                            sum(end - start for start, end in ranges),
+                            min((start for start, _ in ranges), default=None),
+                            max((end for _, end in ranges), default=None),
                         )
                     except (CameraWorkBusy, CameraWorkCancelled, TuyaRecordingsAuthError):
                         raise
                     except Exception as error:
-                        LOGGER.exception(
-                            "Tuya Recordings catalog query failed request_id=%s dev=%s day=%s fresh_attempt=True",
-                            request_id, dev_id, day.isoformat(),
-                        )
+                        if active.is_set():
+                            raise CameraWorkCancelled("Recording catalog pass interrupted") from error
+                        cause = error
+                        seen = set()
+                        while cause is not None and id(cause) not in seen:
+                            if isinstance(cause, NativeGatewayDeviceOfflineError):
+                                break
+                            seen.add(id(cause))
+                            cause = cause.__cause__
+                        offline = isinstance(cause, NativeGatewayDeviceOfflineError)
+                        if offline:
+                            camera["online"] = False
+                            self._camera_availability[dev_id] = (time.monotonic() + CACHE_TTL.total_seconds(), False)
+                            LOGGER.info(
+                                "Tuya Recordings catalog unavailable request_id=%s dev=%s day=%s reason=DEVICE_OFFLINE retained_clips=%s",
+                                request_id, dev_id, day.isoformat(), len(camera["clips"]),
+                            )
+                        else:
+                            LOGGER.exception(
+                                "Tuya Recordings catalog query failed request_id=%s dev=%s day=%s fresh_attempt=True",
+                                request_id, dev_id, day.isoformat(),
+                            )
                         failed_cameras.add(dev_id)
                         failed_at = datetime.now(timezone.utc)
                         failure_count, retry_after = next_catalog_retry_after(camera, failed_at)
@@ -898,7 +936,8 @@ class TuyaRecordingsClient:
                         camera["catalogErrorCount"] = failure_count
                         camera["catalogRetryAfter"] = retry_after.isoformat()
                         camera["bridgeStatus"] = {
-                            "error": str(error),
+                            "error": "" if offline else str(error),
+                            "status": "offline" if offline else "error",
                             "listedCount": len(camera["clips"]),
                             "retryAfter": camera["catalogRetryAfter"],
                         }
@@ -1737,12 +1776,16 @@ class TuyaRecordingsClient:
             self.set_camera_inventory(updates[CONF_DEVICE_INVENTORY])
             # Keep only fresh account evidence, never persisted offline locks.
             expiry = time.monotonic() + CACHE_TTL.total_seconds()
-            self._camera_availability = {
+            retained_availability = {
+                dev_id: value for dev_id, value in self._camera_availability.items()
+                if dev_id in updates[CONF_DEVICE_INVENTORY] and value[0] > time.monotonic()
+            }
+            self._camera_availability = {**retained_availability, **{
                 device["devId"]: (expiry, device["online"])
                 for device in devices
                 if device.get("devId") in updates[CONF_DEVICE_INVENTORY]
                 and type(device.get("online")) is bool
-            }
+            }}
             for dev_id, wake in updates[CONF_DEVICE_WAKE_CAPABILITIES].items():
                 LOGGER.info(
                     "Tuya Recordings refreshed SD wake metadata request_id=%s dev=%s mqtt_pv=%s "

@@ -149,7 +149,11 @@ class TuyaRecordingsPanel extends HTMLElement {
       if (this.selectedAccount) params.set("entry_id", this.selectedAccount);
       const cameras = data.cameras || [];
       if (!this.selectedCamera || !cameras.some((camera) => camera.dev_id === this.selectedCamera)) {
-        this.selectedCamera = cameras[0]?.dev_id || "";
+        const available = cameras.filter((camera) => camera.online !== false);
+        const initial = available.find((camera) =>
+          camera.recording_ranges?.length || camera.clips?.length || camera.dates?.length
+        ) || available[0] || cameras[0];
+        this.selectedCamera = initial?.dev_id || "";
       }
       if (data.on_demand) {
         this.selectedDate = data.selected_date;
@@ -636,7 +640,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           <label>
             Camera
             <select id="camera" ${cameras.length === 0 || this.loading ? "disabled" : ""}>
-              ${cameras.map((item) => `<option value="${this.escape(item.dev_id)}" ${item.dev_id === this.selectedCamera ? "selected" : ""}>${this.escape(item.name)}</option>`).join("")}
+              ${cameras.map((item) => `<option value="${this.escape(item.dev_id)}" ${item.dev_id === this.selectedCamera ? "selected" : ""}>${this.escape(item.name)}${item.online === false ? " (Offline)" : ""}</option>`).join("")}
             </select>
           </label>
           ${this.data?.on_demand ? `<div class="field date-field">

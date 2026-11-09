@@ -57,6 +57,7 @@ from .http import (
 from .lib.commands import (
     CameraWorkBusy, CameraWorkCancelled, MANUAL_REFRESH_ID,
     ON_DEMAND_DAY_CATALOG, ON_DEMAND_OFFER_RETRIES, manual_catalog_refresh,
+    camera_work_scope,
 )
 from .lib.native_setup import NativeBackendSetupError, native_app_session
 
@@ -412,9 +413,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
                     if task is not None and not task.done():
                         _LOGGER.info(
-                            "Tuya Recordings manual refresh waiting for existing catalog pass request_id=%s",
+                            "Tuya Recordings manual refresh interrupting catalog pass and waiting for cleanup request_id=%s",
                             MANUAL_REFRESH_ID.get(),
                         )
+                        entry_data["client"].interrupt_catalog_refresh()
                         await asyncio.shield(task)
                     if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or _entry_cloud_paused(entry_data):
                         _LOGGER.info(
@@ -611,9 +613,13 @@ async def _async_request_catalog_refresh(
         return
 
     task = entry_data.get(DATA_CATALOG_REFRESH_TASK)
+    manual_lock = entry_data.get(DATA_MANUAL_REFRESH_LOCK)
+    if reason != "service" and manual_lock is not None and manual_lock.locked():
+        return
     if reason == "service" and task is not None and not task.done():
-        # A scheduled pass has no foreground retry permission. Finish it first;
-        # never promote, cancel, or mistake it for the user's manual request.
+        # Cooperatively stop the worker and join its transport cleanup before
+        # beginning a distinct manual request. Do not cancel the executor task.
+        client.interrupt_catalog_refresh()
         await asyncio.shield(task)
         if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client.cloud_activity_paused:
             return
@@ -642,12 +648,14 @@ async def _async_run_catalog_refresh(hass: HomeAssistant, entry_id: str, reason:
         refresh = client.refresh_background_catalog
         if reason == "service":
             refresh = manual_catalog_refresh()(refresh)
+        refresh = camera_work_scope(client.catalog_work_cancellation())(refresh)
         result = await hass.async_add_executor_job(copy_context().run, refresh, CATALOG_SYNC_DAYS_PER_PASS)
         cameras = result.get("cameras", []) if isinstance(result, dict) else []
         _LOGGER.info(
-            "Tuya Recordings catalog pass finished entry=%s source=%s request_id=%s cameras=%s failures=%s",
+            "Tuya Recordings catalog pass finished entry=%s source=%s request_id=%s cameras=%s failures=%s offline=%s",
             entry_id, reason, MANUAL_REFRESH_ID.get(), len(cameras),
             sum(bool(camera.get("bridgeStatus", {}).get("error")) for camera in cameras),
+            sum(camera.get("bridgeStatus", {}).get("status") == "offline" for camera in cameras),
         )
         if not client.cloud_activity_paused:
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_id)

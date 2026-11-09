@@ -155,6 +155,10 @@ class NativeGatewayAuthError(NativeGatewayError):
     """Tuya mobile app session is invalid or expired."""
 
 
+class NativeGatewayDeviceOfflineError(NativeGatewayError):
+    """The gateway explicitly rejected a command with DEVICE_OFFLINE."""
+
+
 class NativeGatewayProtocolError(NativeGatewayError):
     """Tuya consumer-app mobile gateway response was malformed."""
 
@@ -556,7 +560,8 @@ class NativeAppGatewayClient:
         error_code = _optional_str(envelope, "errorCode")
         if error_code or envelope.get("success") is False:
             message = _optional_str(envelope, "errorMsg") or "request rejected"
-            error = NativeGatewayAuthError if error_code in {"USER_SESSION_INVALID", "USER_SESSION_EXPIRED"} else NativeGatewayError
+            error = (NativeGatewayDeviceOfflineError if error_code == "DEVICE_OFFLINE" else
+                     NativeGatewayAuthError if error_code in {"USER_SESSION_INVALID", "USER_SESSION_EXPIRED"} else NativeGatewayError)
             raise error(f"{api}: {error_code or 'error'} {message}")
         if result is None:
             raise NativeGatewayProtocolError(f"Failed to call {api}: empty result")
