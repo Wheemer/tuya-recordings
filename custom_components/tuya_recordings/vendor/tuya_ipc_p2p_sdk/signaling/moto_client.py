@@ -118,6 +118,7 @@ class MotoClient:
         self._subscription = "not_attempted"
         self._reader_failure = "none"
         self.device_online: bool | None = None
+        self.dp_query_dispatch = "not_requested"
         self.low_power_connect: bool | None = None
         self.low_power_wake_confirmed = False
         self._low_power_change_time: int | None = None
@@ -311,11 +312,21 @@ class MotoClient:
 
     async def async_query_direct_dp(self, dp_id: str) -> int:
         """Query one schema DP and wait for a report, not the publish acknowledgement."""
+        return await self.async_wait_for_dp_report(
+            dp_id, lambda: self.async_send_dp_query(dp_id),
+        )
+
+    async def async_send_dp_query(self, dp_id: str) -> None:
+        """Dispatch once; the caller owns the matching device report listener."""
         if self._protocol_version == "1.1":
             raise TuyaIpcP2pConnectionError("PV 1.1 does not serialize a null DP query")
-        return await self.async_wait_for_dp_report(
-            dp_id, lambda: self._async_publish(_DP_QUERY_PROTOCOL, {"dps": {dp_id: None}}),
-        )
+        self.dp_query_dispatch = "sending"
+        try:
+            await self._async_publish(_DP_QUERY_PROTOCOL, {"dps": {dp_id: None}})
+        except BaseException:
+            self.dp_query_dispatch = "cancelled_or_failed"
+            raise
+        self.dp_query_dispatch = "sent"
 
     @contextmanager
     def dp_report_listener(self, dp_id: str):
@@ -371,12 +382,19 @@ class MotoClient:
 
     async def async_send_wake(self) -> None:
         """Send one APK low-power wake to the verified direct target."""
+        await self._async_publish_wake(qos=0)
+
+    async def async_send_playback_wake(self) -> None:
+        """Match rul.wakeupLowPowerDevice -> publishWirelessWake (QoS 1)."""
+        await self._async_publish_wake(qos=1)
+
+    async def _async_publish_wake(self, *, qos: int) -> None:
         if self._client is None or self._subscription not in {"granted_qos_0", "granted_qos_1"}:
             raise TuyaIpcP2pConnectionError("MQTT is not ready for a camera wake")
         try:
             await self._client.publish(
                 f"m/w/{self._device_id}", crc32(self._key).to_bytes(4, "big"),
-                qos=0, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
+                qos=qos, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
             )
         except aiomqtt.MqttError as error:
             raise TuyaIpcP2pConnectionError("Native camera wake send failed") from error
@@ -449,7 +467,6 @@ class MotoClient:
             "to": self._device_id,
             "sessionid": self._session_id,
             "moto_id": self._moto_id,
-            "path": "mqtt",
         }
         if trace_id:
             header["trace_id"] = trace_id

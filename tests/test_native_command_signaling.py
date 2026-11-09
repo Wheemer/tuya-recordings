@@ -8,7 +8,7 @@ from datetime import date
 
 import pytest
 
-from test_native_relay_playback import APP_SESSION, ANSWER_KEY, OFFER_KEY, StatusBroker, answer_sdp, camera_config
+from test_native_relay_playback import APP_SESSION, ANSWER_KEY, OFFER_KEY, answer_sdp, camera_config
 from custom_components.tuya_recordings.lib import native_relay_playback as playback
 from custom_components.tuya_recordings.lib.native_command_signaling import (
     COMMAND_CONVERSATION,
@@ -335,9 +335,9 @@ class Peer:
 @pytest.mark.parametrize("mode,media", [
     (mode, media) for mode in ("answer", "batched_answer", "nondata_answer", "candidate_resend", "silent", "foreign", "stall_handshake", "eof_ready", "rejected")
     for media in (False, True)
-] + [("background", False), ("udp_answer", True)])
+    ] + [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media):
-    async with Peer("batched_answer" if mode == "udp_answer" else mode) as peer:
+    async with Peer("silent" if mode.startswith("no_answer_udp") else "batched_answer" if mode == "udp_answer" else "answer" if mode in {"offline_report_http", "qos1_wake"} else mode) as peer:
         config = camera_config()
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
@@ -347,17 +347,33 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                          sd_status_lan_dp="")
         from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
         monkeypatch.setattr(playback, "CAMERA_COMMANDS", CameraCommandQueue())
-        session = playback.NativeRelayPlaybackSession(config, APP_SESSION)
+        loop = asyncio.get_running_loop()
+
+        def gateway(api, version, body, extra):
+            assert mode == "offline_report_http"
+            assert (api, version, body, extra) == (
+                "thing.m.device.dp.publish", "1.0",
+                {"devId": config.dev_id, "gwId": config.dev_id, "dps": '{"110":null}'}, {},
+            )
+            events.append("SD status")
+            assert session._moto._dp_query is not None
+            loop.call_soon_threadsafe(session._moto._consume, encode_payload(config.local_key.encode(),
+                1, b"test", {"devId": config.dev_id, "dps": {"110": 1}}, 0, 4, "2.3"))
+            return True
+
+        session = playback.NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
         peer.key = session._local.aes_key
+        receive_key = peer.key if mode.startswith("no_answer_udp") else ANSWER_KEY
         events = []
         udp_transport = None
         udp_remote = None
+        nomination_task = None
         def deliver(raw):
             if udp_transport is None:
                 session._on_direct_segment(raw)
             else:
                 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
-                udp_transport.sendto(raw + hmac_sha1(ANSWER_KEY, raw), udp_remote)
+                udp_transport.sendto(raw + hmac_sha1(receive_key, raw), udp_remote)
         lan_peer = KcpConversation(0, deliver)
         lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
         discovered = False
@@ -379,19 +395,21 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 # Audio open/close has no SDK completion callback.
                 if low not in (4, 5):
                     reply = struct.pack("<IIIHHIii", magic, request, 1, high, low, 8, 0, 1)
-                    lan_peer.send(encrypt_record(ANSWER_KEY, reply))
+                    lan_peer.send(encrypt_record(receive_key, reply))
                 if (high, low) == (7, 4):
                     media_sequence += 1
                     for channel, pt, payload in ((1, 96, b"\x65video"), (2, 99, b"\x00\x00\xff\x7f")):
                         head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
                         rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
-                        lan_media[channel].send(encrypt_record(ANSWER_KEY, head + struct.pack("<I", len(rtp)) + rtp))
+                        lan_media[channel].send(encrypt_record(receive_key, head + struct.pack("<I", len(rtp)) + rtp))
                 return
             if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
                 events.append("LAN catalog")
+                if mode == "no_answer_udp_silent_control":
+                    return
                 payload = struct.pack("<9I", 0, 2026, 11, 8, 1, 0, 100, 110, 0)
                 reply = struct.pack("<IIIHHI", 0x12345678, request, 1, 3, 1, len(payload)) + payload
-                lan_peer.send(encrypt_record(ANSWER_KEY, reply))
+                lan_peer.send(encrypt_record(receive_key, reply))
         lan_peer.set_message_handler(control)
 
         class Ice:
@@ -414,38 +432,80 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         lan_media[segment.conversation].input(segment)
             def close(self): pass
 
-        class Mqtt(StatusBroker):
-            def __init__(self, **kw): self.candidates = []
-            async def async_connect(self): pass
-            async def async_send_wake(self):
-                events.append("wake")
-            async def async_query_direct_dp(self, dp):
-                assert dp == "110"
-                assert events == ["wake"]
-                events.append("SD status")
-                self._dp_query[1].set_result(1)
-                return await self._dp_query[1]
-            async def async_send_offer(self, *a):
-                events.append("offer")
+        from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.moto_client import MotoClient
+        from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelope import decode_payload, encode_payload
+        from types import SimpleNamespace
+        from zlib import crc32
+
+        class Mqtt(MotoClient):
+            async def async_connect(self):
+                self.candidates = []
+                self.awake = False
+                self._subscription = "granted_qos_1"
+                self._broker_status = "connected"
+                self._client = SimpleNamespace(publish=self.publish)
+
+            async def publish(self, topic, payload, *, qos, **kwargs):
+                if topic == f"m/w/{config.dev_id}":
+                    assert payload == crc32(config.local_key.encode()).to_bytes(4, "big")
+                    assert kwargs["retain"] is False
+                    self.awake = qos == 1
+                    if mode != "qos1_wake":
+                        assert qos == 1
+                    events.append("wake")
+                    if mode == "offline_report_http":
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "online": False}, 0, 1, "2.3"))
+                    return
+                assert topic == f"smart/mb/out/{config.dev_id}"
+                protocol, body = decode_payload(config.local_key.encode(), payload)
+                if protocol == 5:
+                    assert qos == 1 and body == {"dps": {"110": None}}
+                    assert events == ["wake"]
+                    events.append("SD status")
+                    if mode != "sd_silence" and (mode != "qos1_wake" or self.awake):
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "dps": {"110": 1}}, 0, 4, "2.3"))
+                    return
+                assert protocol == 302 and qos == 0
+                # Native JSON is passed unchanged to publishDevice by rsv.
+                assert "path" not in body["header"]
+                if body["header"]["type"] == "offer":
+                    events.append("offer")
+
             async def async_send_candidate(self, candidate):
-                nonlocal udp_remote
+                nonlocal udp_remote, nomination_task
+                await super().async_send_candidate(candidate)
                 if mode == "candidate_resend":
                     self.candidates.append(candidate)
                     if len(self.candidates) == 2:
                         assert peer.offers and session._command._channel.pending_count == 0
                         assert session._command._last_ack.startswith("TCP:")
                         assert self.candidates[0] == candidate
-                        session._on_answer(answer_sdp(), source="mqtt")
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"header": {"type": "answer", "sessionid": self._session_id},
+                             "msg": {"sdp": answer_sdp()}}, 0, 302, "2.3"))
                 if udp_transport is not None:
                     from test_ice_authentication import request
                     fields = candidate.split()
                     udp_remote = (fields[4], int(fields[5]))
-                    udp_transport.sendto(request(password=session._local.ice_password,
-                        username=f"{session._local.ice_ufrag}:camera".encode()), udp_remote)
-            async def async_send_disconnect(self): pass
-            async def async_close(self): pass
+                    async def nominate():
+                        if mode.startswith("no_answer_udp"):
+                            async with asyncio.timeout(1):
+                                while not peer.offers or session._command._channel.pending_count:
+                                    await asyncio.sleep(0.001)
+                            assert session._command._last_ack.startswith("TCP:")
+                        else:
+                            async with asyncio.timeout(1):
+                                while not session._answer.done():
+                                    await asyncio.sleep(0.001)
+                        udp_transport.sendto(request(password=session._local.ice_password,
+                            username=f"{session._local.ice_ufrag}:camera".encode()), udp_remote)
+                    nomination_task = asyncio.create_task(nominate())
+            async def async_close(self):
+                self._client = None
         monkeypatch.setattr(playback, "IceResponder", Ice)
-        if mode == "udp_answer":
+        if mode in {"udp_answer", "no_answer_udp", "no_answer_udp_silent_control"}:
             from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import ice_responder
             from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
             class CameraUdp(asyncio.DatagramProtocol):
@@ -466,12 +526,21 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         monkeypatch.setattr(playback, "MotoClient", Mqtt)
         monkeypatch.setattr(playback, "_ANSWER_TIMEOUT_SECONDS", 0.3)
         monkeypatch.setattr(playback, "_DISCONNECT_GRACE_SECONDS", 0)
+        if mode in {"sd_silence", "qos1_wake"}:
+            monkeypatch.setattr(playback, "_SD_STATUS_TIMEOUT_SECONDS", 0.08)
         if mode == "candidate_resend":
             monkeypatch.setattr(playback, "_OFFER_RETRY_OFFSETS", (0.08, 0.12, 0.16, 0.2))
         try:
-            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer", "candidate_resend"}:
+            if mode in {"answer", "batched_answer", "nondata_answer", "udp_answer", "candidate_resend", "offline_report_http", "qos1_wake", "no_answer_udp"}:
                 await session.connect(media=media, allow_wake=True, retry_offer=True)
-                if mode == "candidate_resend":
+                if mode == "no_answer_udp":
+                    assert not session._answer.done()
+                    assert session._answer_source == "none"
+                    assert "control_bootstrap=authenticated_lan" in session.transport_diagnostics
+                    session._on_signaling_failure("fixture broker loss")
+                    assert not session._ended.done()
+                    assert not session._mqtt_answers_alive
+                elif mode == "candidate_resend":
                     assert session._answer_source == "mqtt" and session._offer_retries == 1
                 else:
                     assert session._answer_source == "command"
@@ -481,11 +550,17 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 page = await session.query_recordings(date(2026, 11, 8))
                 assert len(page.items) == 1
                 assert events == (["wake", "SD status", "offer", "offer", "LAN key", "LAN catalog"] if mode == "candidate_resend"
-                                  else ["wake", "SD status", "offer", "LAN catalog"] if mode == "udp_answer"
+                                  else ["wake", "SD status", "offer", "LAN catalog"] if mode in {"udp_answer", "no_answer_udp"}
                                   else ["wake", "SD status", "offer", "LAN key", "LAN catalog"])
-                if mode == "udp_answer":
+                if mode in {"udp_answer", "no_answer_udp"}:
                     assert session._ice._nominated.is_set()
                 assert session._sd_status_query == "report_received"
+                if mode == "offline_report_http":
+                    assert session._sd_status_send_route == "http"
+                    assert session._sd_status_route_basis == "mqtt_online_report"
+                    assert session._sd_status_dispatch == "sent"
+                    assert "sd_status_inventory_route=mqtt" in session.transport_diagnostics
+                    assert "sd_status_online_report=False" in session.transport_diagnostics
                 assert peer.opened == len(peer.offers) == 1
                 if mode in {"batched_answer", "udp_answer"}:
                     assert peer.batched_frames == 1
@@ -517,12 +592,41 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         (0x0002000d, 2), (0x0003000e, 0), (0x0003000e, 4),
                         (15, 3), (16, 5),
                     ]
+                if mode == "no_answer_udp":
+                    # A late conflicting key must not silently switch the live
+                    # authenticated stream or leak either key into diagnostics.
+                    session._on_answer(answer_sdp(), source="mqtt")
+                    assert session._ended.done()
+                    assert "conflicts" in str(session._ended.result())
+            elif mode == "no_answer_udp_silent_control":
+                await session.connect(media=False, allow_wake=True, retry_offer=True)
+                await asyncio.wait_for(peer.closed.wait(), 1)
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(session.query_recordings(date(2026, 11, 8)), 0.08)
+                assert not session._answer.done()
+                assert session._control_records == 0
+                assert events == ["wake", "SD status", "offer", "LAN catalog"]
+                assert session._offer_retries == 0
+            elif mode == "sd_silence":
+                with pytest.raises(playback.NativeRelayPlaybackError, match="did not report SD status") as error:
+                    await session.connect(media=media, allow_wake=True, retry_offer=True)
+                assert events == ["wake", "SD status"]
+                assert peer.opened == 0 and not peer.offers
+                assert "sd_status_send_route=mqtt" in str(error.value)
+                assert "sd_status_route_basis=inventory" in str(error.value)
+                assert "sd_status_dispatch=sent" in str(error.value)
+                assert "sd_status_inventory_route=mqtt" in str(error.value)
+                assert "sd_status_online_report=None" in str(error.value)
+                assert "offer=not_sent" in str(error.value)
             else:
                 with pytest.raises(playback.NativeRelayPlaybackError, match="Timed out"):
                     await session.connect(media=media, retry_offer=mode != "background")
                 assert events == (["offer"] if mode == "background" else ["wake", "SD status", "offer"])
                 assert peer.opened == (0 if mode == "background" else 1)
         finally:
+            if nomination_task is not None:
+                nomination_task.cancel()
+                await asyncio.gather(nomination_task, return_exceptions=True)
             await session.close()
             await lan_peer.async_close()
             for channel in lan_media.values():

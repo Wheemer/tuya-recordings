@@ -28,7 +28,7 @@ from ..vendor.tuya_ipc_p2p_sdk.crypto import (
     encrypt_record,
     random_alphanumeric,
 )
-from ..vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pError
+from ..vendor.tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pError, TuyaIpcP2pProtocolError
 from ..vendor.tuya_ipc_p2p_sdk.signaling import (
     MotoClient,
     SdpAnswer,
@@ -200,6 +200,7 @@ class NativeRelayPlaybackSession:
         self._lan_answers_alive = False
         self._mqtt_answers_alive = False
         self._answer_source = "none"
+        self._direct_control_ready = False
         self._duplicate_answers = 0
         self._answer_channel_failures: dict[str, str] = {}
         self._lan_answer_attempted = False
@@ -221,6 +222,9 @@ class NativeRelayPlaybackSession:
         self._wake_status = "not_requested"
         self._sd_status_query = "not_requested"
         self._sd_status_report_route = "none"
+        self._sd_status_send_route = "not_selected"
+        self._sd_status_route_basis = "not_selected"
+        self._sd_status_dispatch = "not_requested"
         self._sd_status_lan_details = "not_attempted"
         self._sd_status_prepared = False
         self._sd_status_signaling_details = "not_used"
@@ -327,6 +331,7 @@ class NativeRelayPlaybackSession:
         return (
             f"transport=direct-ice, signaling={self._signaling_path}, relay=disabled, "
             f"connected={self._connected}, "
+            f"control_bootstrap={'authenticated_lan' if self._direct_control_ready else 'sdp_answer' if self._answer_status == 'accepted' else 'waiting'}, "
             f"session=({session_status}), "
             f"ice=({ice_status}), control=(records={self._control_records},"
             f"decode_failures={self._control_decode_failures},commands={commands}), "
@@ -364,7 +369,12 @@ class NativeRelayPlaybackSession:
             f"wake_capability={config.wake_capability}, wake_direct={config.wake_direct}, "
             f"wake_status={wake_status}, sd_low_power_wake={config.sd_low_power_wake}, "
             f"sd_status_query={self._sd_status_query}, connector_wake={self._connector_wake_status}, "
-            f"sd_status_report_route={self._sd_status_report_route}"
+            f"sd_status_report_route={self._sd_status_report_route}, "
+            f"sd_status_send_route={self._sd_status_send_route}, "
+            f"sd_status_route_basis={self._sd_status_route_basis}, "
+            f"sd_status_inventory_route={'mqtt' if config.sd_status_mqtt_dp else 'http' if config.sd_status_http_dp else 'none'}, "
+            f"sd_status_online_report={getattr(self._moto, 'device_online', None)}, "
+            f"sd_status_dispatch={getattr(self._moto, 'dp_query_dispatch', self._sd_status_dispatch) if self._sd_status_send_route == 'mqtt' else self._sd_status_dispatch}"
         )
 
     async def connect(
@@ -440,16 +450,18 @@ class NativeRelayPlaybackSession:
                 tcp=media or self._on_demand_catalog or self._retry_mqtt_offer,
             )
             await self._ice.async_gather()
-            self._connect_phase = "wait_answer"
-            answer = await self._wait_for_answer()
+            self._connect_phase = "wait_connection"
+            answer = await self._wait_for_connection()
             if self._command is not None:
                 if not await _bounded_cleanup(self._command.finish_bootstrap()):
                     raise NativeRelayPlaybackError("Native signaling TCP cleanup timed out")
             if self._ended.done():
                 raise self._ended.result()
-            self._ice.set_receive_key(answer.aes_key)
-            self._ice.set_remote_credentials(answer.ice_ufrag, answer.ice_password)
-            for candidate in (*self._remote_candidates, *answer.candidates):
+            receive_key = self._receive_key()
+            self._ice.set_receive_key(receive_key)
+            if answer is not None:
+                self._ice.set_remote_credentials(answer.ice_ufrag, answer.ice_password)
+            for candidate in (*self._remote_candidates, *(answer.candidates if answer is not None else ())):
                 self._ice.add_remote_candidate(candidate)
             self._remote_candidates.clear()
             self._connect_phase = "ice_nomination"
@@ -461,7 +473,7 @@ class NativeRelayPlaybackSession:
             self._connect_phase = "native_control"
             self._control = self._session.control
             self._control.set_message_handler(
-                lambda record: self._on_control_record(record, answer.aes_key)
+                lambda record: self._on_control_record(record, receive_key)
             )
             credential = auth_credential(config.device_password, config.local_key)
             packets = (
@@ -488,12 +500,12 @@ class NativeRelayPlaybackSession:
                 # now and discard only completed preview frames in start().
                 self._video.set_message_handler(
                     lambda record: self._on_rtp_record(
-                        _VIDEO_CONVERSATION, record, answer.aes_key
+                        _VIDEO_CONVERSATION, record, receive_key
                     )
                 )
                 self._audio.set_message_handler(
                     lambda record: self._on_rtp_record(
-                        _AUDIO_CONVERSATION, record, answer.aes_key
+                        _AUDIO_CONVERSATION, record, receive_key
                     )
                 )
                 await self._stop_preview()
@@ -839,7 +851,7 @@ class NativeRelayPlaybackSession:
         try:
             if send_wake:
                 self._wake_status = "sending"
-                await moto.async_send_wake()
+                await moto.async_send_playback_wake()
         except TuyaIpcP2pError:
             self._wake_status = "send_failed"
         else:
@@ -863,20 +875,25 @@ class NativeRelayPlaybackSession:
         dp = config.sd_status_mqtt_dp or config.sd_status_http_dp
         use_mqtt = bool(config.sd_status_mqtt_dp)
         online = getattr(moto, "device_online", None)
+        self._sd_status_route_basis = "inventory"
         if dp and config.sd_status_mqtt_capable and type(online) is bool:
             use_mqtt = online
+            self._sd_status_route_basis = "mqtt_online_report"
         if self._sd_status_query == "lan_send_failed":
             route = config.sd_status_lan_error_route
             if route not in {"mqtt", "http"}:
                 return
             dp = config.sd_status_lan_dp
             use_mqtt = route == "mqtt"
+            self._sd_status_route_basis = "lan_send_error"
         if not dp.isascii() or not dp.isdecimal():
             if self._sd_status_query != "lan_send_failed":
                 self._sd_status_query = "route_or_schema_unconfirmed"
             return
         self._connect_phase = "mqtt_sd_status" if use_mqtt else "http_sd_status"
         self._sd_status_query = "waiting_for_report"
+        self._sd_status_send_route = "mqtt" if use_mqtt else "http"
+        self._sd_status_dispatch = "sending"
         try:
             async with asyncio.timeout_at(deadline):
                 if use_mqtt:
@@ -887,6 +904,7 @@ class NativeRelayPlaybackSession:
             raise self._missing_sd_status_report() from None
         except (TuyaIpcP2pError, NativeGatewayError) as error:
             self._sd_status_query = "send_failed"
+            self._sd_status_dispatch = "failed"
             raise NativeRelayPlaybackError(
                 f"Camera SD status query failed ({self.transport_diagnostics})"
             ) from error
@@ -926,6 +944,9 @@ class NativeRelayPlaybackSession:
             on_failure=lambda reason: self._on_signaling_failure(reason, transport="LAN"),
         )
         self._connect_phase = "lan_sd_status"
+        self._sd_status_send_route = "lan"
+        self._sd_status_route_basis = "inventory_lan"
+        self._sd_status_dispatch = "sending"
         self._sd_status_query = "waiting_for_report"
         self._status_lan = lan
         retained = False
@@ -935,6 +956,7 @@ class NativeRelayPlaybackSession:
                     await lan.async_connect()
                 except (NativeLanUnavailableError, OSError):
                     self._sd_status_query = "lan_unavailable"
+                    self._sd_status_dispatch = "not_sent"
                     return False
                 # The APK's query listener is device-wide: LAN dispatch may
                 # produce a report on the already-subscribed MQTT channel.
@@ -949,6 +971,7 @@ class NativeRelayPlaybackSession:
                             status = mqtt_report.result()
                             self._sd_status_report_route = "mqtt"
                         else:
+                            self._sd_status_dispatch = "sent"
                             try:
                                 status = query.result()
                             except NativeLanDpReportError:
@@ -963,6 +986,7 @@ class NativeRelayPlaybackSession:
                             await asyncio.gather(query, return_exceptions=True)
         except NativeLanSignalError:
             self._sd_status_query = "lan_send_failed"
+            self._sd_status_dispatch = "failed"
             return False
         except TimeoutError:
             raise self._missing_sd_status_report() from None
@@ -1005,6 +1029,7 @@ class NativeRelayPlaybackSession:
             raise
         if accepted is not True:
             raise NativeGatewayError("SD status query not accepted")
+        self._sd_status_dispatch = "sent"
 
     def _requires_http_token(self) -> bool:
         """Match ordinary connect_v3 token selection, never a timeout retry."""
@@ -1341,7 +1366,7 @@ class NativeRelayPlaybackSession:
                 play_time=start if play_time is None else play_time,
                 encrypted=encrypted,
             )
-        answer = self._require_answer()
+        receive_key = self._receive_key()
         self._allocate_request_id()
         self._task_id = self._next_task_id
         self._next_task_id += 1
@@ -1350,10 +1375,10 @@ class NativeRelayPlaybackSession:
         self._playback_started = True
         self._playback_paused = False
         self._video.set_message_handler(
-            lambda record: self._on_rtp_record(_VIDEO_CONVERSATION, record, answer.aes_key)
+            lambda record: self._on_rtp_record(_VIDEO_CONVERSATION, record, receive_key)
         )
         self._audio.set_message_handler(
-            lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, answer.aes_key)
+            lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, receive_key)
         )
         self._send_control(start_payload)
         self._send_control(encode_audio_open(stream_id=stream_id, channel=0))
@@ -1554,6 +1579,29 @@ class NativeRelayPlaybackSession:
         self._stream_id = None
         await self.close()
 
+    async def _wait_for_connection(self) -> SdpAnswer | None:
+        """Native a81b8 completes on ready ICE; SDP reception is independent."""
+        answer_task = asyncio.create_task(self._wait_for_answer())
+        direct_task = asyncio.create_task(self._ice.async_wait_for_nomination(_ANSWER_TIMEOUT_SECONDS))
+        try:
+            done, _ = await asyncio.wait((answer_task, direct_task), return_when=asyncio.FIRST_COMPLETED)
+            if answer_task in done:
+                return answer_task.result()
+            if direct_task.exception() is None and getattr(self._ice, "is_nominated", False) is True:
+                if self._ended.done():
+                    raise self._ended.result()
+                if self._answer.done():
+                    return self._answer.result()
+                self._direct_control_ready = True
+                _LOGGER.debug("Native LAN control ready before SDP answer: %s", self.transport_diagnostics)
+                return None
+            return await answer_task
+        finally:
+            for task in (answer_task, direct_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(answer_task, direct_task, return_exceptions=True)
+
     async def _wait_for_answer(self) -> SdpAnswer:
         assert self._answer is not None
         retry_offer, self._retry_offer = self._retry_offer, None
@@ -1567,7 +1615,7 @@ class NativeRelayPlaybackSession:
                 return await asyncio.shield(self._answer)
         except TimeoutError as err:
             raise NativeRelayPlaybackError(
-                f"Timed out waiting for a usable native IMM answer ({self.transport_diagnostics})"
+                f"Timed out waiting for a usable native IMM answer or authenticated LAN nomination ({self.transport_diagnostics})"
             ) from err
 
     async def _resend_offer(
@@ -1613,12 +1661,17 @@ class NativeRelayPlaybackSession:
             self._duplicate_answers += 1
             return
         try:
-            answer.set_result(parse_answer(sdp))
+            parsed = parse_answer(sdp)
+            if self._direct_control_ready and parsed.aes_key != self._require_offer().aes_key:
+                raise TuyaIpcP2pProtocolError("Late SDP answer conflicts with established native session key")
+            answer.set_result(parsed)
         except TuyaIpcP2pError as err:
             self._answer_status = "invalid_sdp"
             answer.set_exception(NativeRelayPlaybackError(
                 f"Invalid native IMM answer: {err} ({self.transport_diagnostics})"
             ))
+            if self._direct_control_ready:
+                self._fail_transport(answer.exception())
         else:
             self._answer_status = "accepted"
             self._answer_source = source
@@ -1663,6 +1716,12 @@ class NativeRelayPlaybackSession:
         if self._closed:
             return
         self._answer_channel_failures[transport] = reason
+        if self._connected and self._direct_control_ready:
+            if transport == "MQTT":
+                self._mqtt_answers_alive = False
+            else:
+                self._lan_answers_alive = False
+            return
         if transport == "MQTT":
             self._mqtt_answers_alive = False
             if self._lan_answers_alive or (
@@ -1950,6 +2009,13 @@ class NativeRelayPlaybackSession:
         if self._offer is None:
             raise NativeRelayPlaybackError("Native IMM offer is unavailable")
         return self._offer
+
+    def _receive_key(self) -> bytes:
+        # Native level-3 a2f4c initializes channel contexts from the local
+        # session key before any answer is received. Never synthesize SDP.
+        if self._direct_control_ready:
+            return self._require_offer().aes_key
+        return self._require_answer().aes_key
 
     def _require_answer(self) -> SdpAnswer:
         answer = self._answer
