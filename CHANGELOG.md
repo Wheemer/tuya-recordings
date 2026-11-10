@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-18 (2026-11-10)
+
+### SD Playback
+
+- Follow the Smart Life native SDK's SD connection sequence: authenticate and prepare the video/audio readers without starting a live preview first.
+- Remove the preview-start, video-channel wait, and preview-stop prerequisite before SD playback. Start the recording directly, keeping the readers ready for media that arrives before the start acknowledgement.
+- Preserve the connected session for seeking and pause/resume. Video and audio remain LAN-only, without transcoding or additional background retries.
+
+### Diagnostics
+
+- Include the active SD task, stream identity, video/audio frame counts, and media-buffer state when playback times out.
+- Distinguish media decryption, framing, stale-task, RTP, and H.264 decoding-stage failures instead of silently discarding that evidence.
+- Log the requested recording bounds and native start acknowledgement separately from connection readiness.
+
 ## Tuya Recordings v0.4.13-17 (2026-11-10)
 
 ### Recording Catalog
