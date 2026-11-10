@@ -14,11 +14,26 @@ import pytest
 
 from test_native_relay_playback import session, answer_sdp, ANSWER_KEY
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import encrypt_record
+from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.control import authentication_sequence
 from custom_components.tuya_recordings.lib.native_simple import (
     NativeSimpleCommand,
     NativeSimpleError,
 )
 from custom_components.tuya_recordings.lib import native_relay_playback as native
+
+
+def test_apk_sd_authentication_does_not_start_live_preview():
+    # SendAuthorizationInfo @0042386c: auth, client version 10/0,
+    # capability exchange 21/0. No video setup or preview operations.
+    auth, version, capabilities = authentication_sequence("f" * 32)
+    assert auth == (
+        struct.pack("<II", 0x12345678, 1)
+        + b"admin" + bytes(27) + b"f" * 32 + bytes(32)
+    )
+    assert version == struct.pack("<IIIHHII", 0x12345678, 0, 0, 10, 0, 4, 0x10001)
+    payload = (b'{"cmd":"capability_exchange_req","protocol_version":1,'
+               b'"data":{"capabilities":{"opus_encode":0,"opus_decode":0}}}\x00')
+    assert capabilities == struct.pack("<IIIHHI", 0x12345678, 0, 0, 21, 0, len(payload)) + payload
 
 
 def connected():
@@ -156,11 +171,10 @@ async def test_apk_simple_camera_success_result_is_after_channel(command):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preview", [False, True])
-async def test_apk_stop_queues_both_commands_before_completion(monkeypatch, preview):
+async def test_apk_stop_queues_both_commands_before_completion(monkeypatch):
     value = connected()
     monkeypatch.setattr(native, "_CONTROL_RESPONSE_TIMEOUT_SECONDS", 0.02)
-    high = 6 if preview else 7
+    high = 7
     sent = []
 
     def camera(packet):
@@ -172,11 +186,7 @@ async def test_apk_stop_queues_both_commands_before_completion(monkeypatch, prev
             value._control_messages.put_nowait(NativeSimpleCommand(9, 1, high, 3, struct.pack("<ii", 0, 1)))
 
     value._send_control = camera
-    value._send_control_plain = camera
-    if preview:
-        await value._stop_preview()
-    else:
-        await value.stop()
+    await value.stop()
     assert sent == [(9, 3), (10, 5)]
 
 

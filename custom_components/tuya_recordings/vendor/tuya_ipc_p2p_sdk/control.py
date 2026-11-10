@@ -77,12 +77,18 @@ def _uint32(value: int) -> bytes:
     return (value & 0xFFFFFFFF).to_bytes(4, "little")
 
 
-def session_sequence(credential: str, username: str = AUTH_USERNAME) -> tuple[bytes, ...]:
-    """Return authentication and capability setup without starting preview."""
+def authentication_sequence(credential: str, username: str = AUTH_USERNAME) -> tuple[bytes, ...]:
+    """Match native SendAuthorizationInfo without issuing preview operations."""
     return (
         build_auth(username, credential),
         build_command(0, 0, 0x0A, _uint32(0x00010001)),
         build_command(0, 0, 0x15, _CAPABILITY_PAYLOAD),
+    )
+
+
+def session_sequence(credential: str, username: str = AUTH_USERNAME) -> tuple[bytes, ...]:
+    """Return the live-view client's authentication and video setup."""
+    return authentication_sequence(credential, username) + (
         build_command(2, 0, 0x02, _uint32(0)),
         build_command(0x00010004, 0, 0x09, _uint32(0) + _uint32(4)),
     )

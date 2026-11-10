@@ -20,8 +20,7 @@ from ..vendor.tuya_ipc_p2p_sdk.models.relay_token import RelayToken
 from ..vendor.tuya_ipc_p2p_sdk.signaling.relay_frames import relay_candidate_frame, relay_offer_frame
 from ..vendor.tuya_ipc_p2p_sdk.control import (
     auth_credential,
-    session_sequence,
-    start_sequence,
+    authentication_sequence,
 )
 from ..vendor.tuya_ipc_p2p_sdk.crypto import (
     decrypt_record,
@@ -83,7 +82,6 @@ from .native_simple import (
     encode_playback_pause,
     encode_playback_resume,
     encode_playback_stop,
-    encode_preview_stop,
     encode_thumbnail_request,
     playback_stream_id,
 )
@@ -94,7 +92,6 @@ _SD_STATUS_TIMEOUT_SECONDS = 30.0
 # Absolute elapsed thresholds from the APK's native connection-state timer.
 _OFFER_RETRY_OFFSETS = (1.5, 3.0, 6.0, 12.0)
 _DIRECT_NOMINATION_TIMEOUT_SECONDS = 10.0
-_MEDIA_CHANNEL_TIMEOUT_SECONDS = 20.0
 _CONTROL_RESPONSE_TIMEOUT_SECONDS = 8.0
 _THUMBNAIL_RESPONSE_TIMEOUT_SECONDS = 15.0
 _RENDEZVOUS_SUFFIX_LENGTH = 8
@@ -245,9 +242,9 @@ class NativeRelayPlaybackSession:
             _AUDIO_CONVERSATION: NativeSimpleMediaParser(),
         }
         self._rtp_packets: dict[tuple[int, int, int], int] = {}
+        self._media_drops: dict[str, int] = {}
         self._rtp_codec_info: dict[int, int] = {}
         self._media_stream_packets: dict[int, int] = {}
-        self._preview_sequences: tuple[int, int] | None = None
         self._h264 = NativeH264RtpDepacketizer()
         self._video_frame_number = 0
         self._audio_frame_number = 0
@@ -340,8 +337,11 @@ class NativeRelayPlaybackSession:
             f"decode_failures={self._control_decode_failures},commands={commands}), "
             f"media_samples=({samples}), rtp=({rtp}), "
             f"media_stream_packets={self._media_stream_packets or 'none'}, "
-            f"sequences=({self._preview_sequences or 'none'}->"
-            f"{self._media_sequences()}), "
+            f"playback_media=(started={self._playback_started}, task={self._task_id}, "
+            f"stream={self._stream_id}, video_frames={self._video_frame_number}, "
+            f"audio_frames={self._audio_frame_number}, drops={self._media_drops or 'none'}, "
+            f"buffered={{{', '.join(f'{key}: {value.buffered_bytes}' for key, value in sorted(self._rtp_parsers.items()))}}}), "
+            f"sequences=({self._media_sequences()}), "
             f"codec_info={self._rtp_codec_info or 'none'}, "
             f"signaling_details=({getattr(self._moto, 'diagnostics', 'unavailable')}), "
             f"command_signaling=({getattr(self._command, 'diagnostics', self._command_status)}), "
@@ -479,28 +479,11 @@ class NativeRelayPlaybackSession:
                 lambda record: self._on_control_record(record, receive_key)
             )
             credential = auth_credential(config.device_password, config.local_key)
-            packets = (
-                start_sequence(credential) if media else session_sequence(credential)
-            )
-            for packet in packets:
-                self._send_control_plain(packet)
-
             if media:
-                self._connect_phase = "preview_transition"
-                # Smart Life establishes preview as task 1, then allocates task 2
-                # for playback on the same continuously serviced conversations.
-                self._video = await self._session.async_wait_for_video(
-                    _MEDIA_CHANNEL_TIMEOUT_SECONDS
-                )
+                # The APK's SD model connects without starting live preview.
+                # Its readers wait for media from StartPlayBack, not vice versa.
+                self._video = self._session.conversation(_VIDEO_CONVERSATION)
                 self._audio = self._session.conversation(_AUDIO_CONVERSATION)
-                self._preview_sequences = (
-                    self._video.receive_sequence,
-                    self._audio.receive_sequence,
-                )
-                # The Smart Life playback model stops its bootstrap preview
-                # before StartPlayBack. Tuya keeps RTP sequence and FU-A state
-                # continuous across that transition, so parse preview packets
-                # now and discard only completed preview frames in start().
                 self._video.set_message_handler(
                     lambda record: self._on_rtp_record(
                         _VIDEO_CONVERSATION, record, receive_key
@@ -511,7 +494,8 @@ class NativeRelayPlaybackSession:
                         _AUDIO_CONVERSATION, record, receive_key
                     )
                 )
-                await self._stop_preview()
+            for packet in authentication_sequence(credential):
+                self._send_control_plain(packet)
             self._connected = True
             self._connect_phase = "connected"
             _LOGGER.debug("Native SD handshake complete: %s", self.transport_diagnostics)
@@ -1428,11 +1412,21 @@ class NativeRelayPlaybackSession:
         self._audio.set_message_handler(
             lambda record: self._on_rtp_record(_AUDIO_CONVERSATION, record, receive_key)
         )
+        _LOGGER.debug(
+            "Native SD playback command: command=%s/%s stream=%s task=%s "
+            "start=%s end=%s position=%s",
+            *start_command, stream_id, self._task_id, start, end,
+            start if play_time is None else play_time,
+        )
         self._send_control(start_payload)
         self._send_control(encode_audio_open(stream_id=stream_id, channel=0))
         await self._wait_for_playback_responses(
             stream_id,
             start_command=start_command,
+        )
+        _LOGGER.debug(
+            "Native SD playback acknowledged: stream=%s task=%s video_frames=%s audio_frames=%s",
+            stream_id, self._task_id, self._video_frame_number, self._audio_frame_number,
         )
 
     async def pause(self) -> None:
@@ -1492,26 +1486,12 @@ class NativeRelayPlaybackSession:
             raise NativeRelayPlaybackError("Active playback has no stream ID")
         return stream_id
 
-    async def _stop_preview(self) -> None:
-        """Apply Smart Life's StopPreview transition before SD playback."""
-        request_id = self._allocate_request_id()
-        stream_id = request_id
-        video_stop, _ = encode_preview_stop(
-            stream_id=stream_id,
-            channel=0,
-        )
-        self._send_control_plain(video_stop)
-        _, audio_stop = encode_preview_stop(
-            stream_id=stream_id, channel=0, audio_request_id=self._allocate_request_id(),
-        )
-        self._send_control_plain(audio_stop)
-        await self._wait_for_control_response(stream_id, (6, 3))
-
     def _reset_media_state(self) -> None:
         """Discard every decoder-bound state before a new playback stream."""
         self._media_frames = asyncio.Queue(maxsize=_MEDIA_QUEUE_LIMIT)
         self._parser = NativePlaybackStreamParser()
         self._rtp_packets.clear()
+        self._media_drops.clear()
         self._rtp_codec_info.clear()
         self._media_stream_packets.clear()
         self._raw_media_samples.clear()
@@ -1842,7 +1822,11 @@ class NativeRelayPlaybackSession:
         try:
             plaintext = decrypt_record(receive_key, record)
             packets = self._rtp_parsers[conversation].feed(plaintext)
-        except (TuyaIpcP2pError, NativeSimpleRtpError):
+        except TuyaIpcP2pError:
+            self._count_media_drop("decrypt")
+            return
+        except NativeSimpleRtpError:
+            self._count_media_drop("framing")
             return
         if conversation not in self._raw_media_samples:
             self._raw_media_samples[conversation] = (
@@ -1857,6 +1841,7 @@ class NativeRelayPlaybackSession:
                 # ThingPlayTask admits video by task, audio by full request ID.
                 if (conversation == _VIDEO_CONVERSATION and packet.stream_id >> 16 != self._task_id
                         or conversation == _AUDIO_CONVERSATION and packet.stream_id != self._stream_id):
+                    self._count_media_drop(f"stale_task_ch{conversation}")
                     continue
             if packet.codec_info:
                 self._rtp_codec_info[conversation] = (
@@ -1865,6 +1850,7 @@ class NativeRelayPlaybackSession:
             try:
                 rtp = parse_rtp_packet(packet.payload)
             except NativeSimpleRtpError:
+                self._count_media_drop("rtp_header")
                 continue
             unit_type = rtp.payload[0] & 0x1F if rtp.payload else -1
             key = (conversation, rtp.payload_type, unit_type)
@@ -1918,10 +1904,12 @@ class NativeRelayPlaybackSession:
                 conversation != _VIDEO_CONVERSATION
                 or rtp.payload_type != _VIDEO_RTP_PAYLOAD_TYPE
             ):
+                self._count_media_drop(f"unsupported_ch{conversation}_pt{rtp.payload_type}")
                 continue
             try:
                 access_units = self._h264.push(rtp, presentation_timestamp=packet.camera_timestamp or rtp.timestamp)
             except NativeSimpleRtpError:
+                self._count_media_drop("h264_depacketize")
                 continue
             for access_unit, timestamp in zip(access_units, self._h264.completed_timestamps, strict=True):
                 self._video_frame_number += 1
@@ -1943,6 +1931,9 @@ class NativeRelayPlaybackSession:
                     ),
                     "media",
                 )
+
+    def _count_media_drop(self, reason: str) -> None:
+        self._media_drops[reason] = self._media_drops.get(reason, 0) + 1
 
     async def _receive_or_transport_failure(self, queue: asyncio.Queue[Any]) -> Any:
         failure = self._ended
@@ -1985,7 +1976,8 @@ class NativeRelayPlaybackSession:
         except TimeoutError as err:
             missing = ",".join(f"{high}/{low}" for high, low in sorted(pending))
             raise NativeRelayPlaybackError(
-                f"Camera did not acknowledge playback commands: {missing}"
+                f"Camera did not acknowledge playback commands: {missing} "
+                f"({self.transport_diagnostics})"
             ) from err
 
     async def _wait_for_control_response(
