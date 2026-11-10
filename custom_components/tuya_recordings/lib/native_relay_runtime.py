@@ -1257,7 +1257,8 @@ class NativeRelayRuntimeSession:
                 if loop.time() >= video_deadline:
                     media_seen = "video stalled" if saw_video else "audio but no video" if saw_audio else "no media (no usable video)"
                     raise NativeRelayRuntimeError(
-                        f"Camera returned {media_seen} before the playback deadline"
+                        f"Camera returned {media_seen} before the playback deadline "
+                        f"({getattr(playback, 'transport_diagnostics', 'transport diagnostics unavailable')})"
                     )
                 if receive_task is None:
                     receive_task = asyncio.create_task(playback.receive_frame())

@@ -1631,10 +1631,11 @@ def test_empty_video_does_not_satisfy_first_frame_deadline():
             self.frames.put_nowait(wire_frame(b"", frame_type=1))
 
     playback = EmptyPlayback()
+    playback.transport_diagnostics = "playback_media=(task=2, drops={'stale_task_ch1': 3})"
     session = NativeRelayRuntimeSession(
         camera_config(), app_session=APP_SESSION, first_frame_timeout=0.01
     )
-    with pytest.raises(NativeRelayRuntimeError, match="no media"):
+    with pytest.raises(NativeRelayRuntimeError, match="no media.*stale_task_ch1"):
         asyncio.run(
             session._interactive_connected(
                 playback,

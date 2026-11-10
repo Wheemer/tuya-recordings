@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import base64
 import struct
 import subprocess
@@ -33,7 +34,7 @@ FRONTEND = ROOT / "custom_components" / "tuya_recordings" / "frontend"
 HEADER = struct.Struct(">BQI")
 
 
-def native_browser_stream(path: Path) -> bytes:
+def native_browser_stream(path: Path, audio_codec: str = "pcm_s16le") -> bytes:
     """Build the same fMP4 record stream the native camera path emits."""
     subprocess.run(
         [
@@ -72,7 +73,8 @@ def native_browser_stream(path: Path) -> bytes:
     # Keep native audio alive beyond the deliberate browser-stall regression
     # below. A short fixture can end naturally before the 1.5-second stall
     # detector runs, which would hide a broken audio-stop path.
-    pcm_s16le = struct.pack("<hhhh", 0, 8192, -8192, 16384) * 16_000
+    audio_payload = (b"\xff\x80\x00\x7f" * 8_000 if audio_codec == "g711u"
+                     else struct.pack("<hhhh", 0, 8192, -8192, 16384) * 16_000)
     with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
         muxer.handle_event(event(NativePlaybackFrameType.STARTED))
         with av.open(str(path), format="h264") as source:
@@ -94,16 +96,16 @@ def native_browser_stream(path: Path) -> bytes:
             ))
         muxer.handle_event(event(
             NativePlaybackFrameType.MEDIA_CODEC,
-            pcm_s16le,
+            audio_payload,
             {
                 "avChannel": 1,
                 "frameNo": 2,
-                "codecId": 0xFFFE,
-                "codecName": "pcm_s16le",
+                "codecId": 133 if audio_codec == "g711u" else 0xFFFE,
+                "codecName": audio_codec,
                 "isKeyFrame": False,
                 "timestamp": 90000,
                 "timestampScale": 90000,
-                "sampleRate": 16000,
+                "sampleRate": 8000 if audio_codec == "g711u" else 16000,
                 "channels": 1,
                 "frameInfoBase64": "",
             },
@@ -114,9 +116,9 @@ def record(kind: int, timestamp: int, payload: bytes = b"") -> bytes:
     return HEADER.pack(kind, timestamp, len(payload)) + payload
 
 
-def main() -> None:
+def main(audio_codec: str = "pcm_s16le") -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        stream = native_browser_stream(Path(temporary) / "fixture.h264")
+        stream = native_browser_stream(Path(temporary) / "fixture.h264", audio_codec)
         # Deliver enough fragments to start Chromium, then withhold the rest
         # until the test has observed a genuine buffered-media starvation.
         stall_resume = threading.Event()
@@ -774,8 +776,10 @@ def main() -> None:
     assert report["switching"] is False
     assert report["audioStarts"] == 2
     assert report["playingEvents"] == 2
-    assert report["firstAudioSamples"] == [0, 0.25, -0.25, 0.5]
-    assert report["audioSampleRates"] == [16000, 16000]
+    expected_samples = [0, 32124 / 32768, -32124 / 32768, 0] if audio_codec == "g711u" else [0, 0.25, -0.25, 0.5]
+    assert report["firstAudioSamples"] == expected_samples
+    expected_rate = 8000 if audio_codec == "g711u" else 16000
+    assert report["audioSampleRates"] == [expected_rate, expected_rate]
     assert report["audioChannelCounts"] == [1, 1]
     assert report["videoFrameCallbacks"] >= 2
     assert report["time"] > 0.2
@@ -825,4 +829,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audio-codec", choices=("all", "pcm_s16le", "g711u"), default="all")
+    selected = parser.parse_args().audio_codec
+    for codec in ("pcm_s16le", "g711u") if selected == "all" else (selected,):
+        main(codec)

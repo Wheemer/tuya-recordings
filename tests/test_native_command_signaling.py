@@ -4,10 +4,15 @@ import asyncio
 import json
 import struct
 import time
+import re
+import io
+import queue
+from fractions import Fraction
 from dataclasses import replace
 from datetime import date
 
 import pytest
+import av
 
 from test_native_relay_playback import APP_SESSION, ANSWER_KEY, OFFER_KEY, answer_sdp, camera_config
 from custom_components.tuya_recordings.lib import native_relay_playback as playback
@@ -15,6 +20,10 @@ from custom_components.tuya_recordings.lib.native_command_signaling import (
     COMMAND_CONVERSATION,
     NativeCommandSignaling,
 )
+from custom_components.tuya_recordings.lib.native_relay_runtime import NativeRelayRuntimeSession, NativeRelayRuntimeError
+from custom_components.tuya_recordings.lib.native_frames import NATIVE_PLAYBACK_EVENT_VERSION, playback_frame_event
+from custom_components.tuya_recordings.lib.native_mux import NativePlaybackBrowserStreamMuxer
+from custom_components.tuya_recordings.lib.native_session import NativePlaybackRequest
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import decrypt_record, encrypt_record
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.models.relay_token import RelayToken
@@ -36,6 +45,26 @@ def token(port=1443):
         "urls": [f"tcp4:127.0.0.1:{port}"], "username": "1900000000:fixture",
         "credential": "0123456789abcdef0123456789abcdef", "sessionId": "rendezvous",
     })
+
+
+@pytest.fixture(scope="module")
+def decodable_media():
+    """Independent codec fixture, not the production encoder/packet builder."""
+    encoder = av.CodecContext.create("libx264", "w")
+    encoder.width = encoder.height = 16
+    encoder.pix_fmt = "yuv420p"
+    encoder.time_base = Fraction(1, 25)
+    encoder.options = {"preset": "ultrafast", "tune": "zerolatency"}
+    frame = av.VideoFrame(16, 16, "yuv420p")
+    for plane in frame.planes:
+        plane.update(bytes([128]) * plane.buffer_size)
+    frame.pts = 0
+    encoded = b"".join(bytes(packet) for packet in encoder.encode(frame) + encoder.encode(None))
+    units = [unit for unit in re.split(b"\x00\x00\x00?\x01", encoded) if unit]
+    assert {unit[0] & 31 for unit in units} >= {7, 8, 5}
+    stap = b"\x78" + b"".join(struct.pack(">H", len(unit)) + unit for unit in units)
+    annex_b = b"".join(b"\x00\x00\x00\x01" + unit for unit in units)
+    return stap, annex_b, b"\x80\x00" * 80
 
 
 @pytest.mark.asyncio
@@ -339,7 +368,7 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence") for automatic in (False, True)])
-async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic):
+async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
     cooldown = mode.startswith("cooldown_")
     if cooldown:
         mode = "no_answer_udp" if mode == "cooldown_ready" else "sd_silence"
@@ -413,32 +442,36 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 udp_transport.sendto(raw + hmac_sha1(receive_key, raw), udp_remote)
         lan_peer = KcpConversation(0, deliver)
         lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
-        discovered = False
         media_sequence = 0
         playback_requests = []
+        bootstrap_commands = []
+        suppress_sd_media = False
 
         def control(value):
-            nonlocal discovered, media_sequence
-            if not discovered and media:
-                discovered = True
-                deliver(build_segment(1, 0x52, 0, 512, 0, 0, 0))
+            nonlocal media_sequence
             plain = decrypt_record(peer.key, value)
             if len(plain) < 20:
                 return
             magic, request, _, high, low, length = struct.unpack_from("<IIIHHI", plain)
+            if magic == 0x12345678:
+                bootstrap_commands.append((high, low))
             if magic == 0x12345678 and high in (6, 7):
                 if high == 7:
                     playback_requests.append((request, low))
+                if not suppress_sd_media and (high, low) in {(7, 0), (7, 4)}:
+                    if low == 0:
+                        media_sequence += 1
+                    # Native readers must already exist: video can precede
+                    # StartPlayBack's callback, and audio-open has no callback.
+                    samples = ((1, 96, decodable_media[0]),) if low == 0 else ((2, 0, decodable_media[2]),)
+                    for channel, pt, payload in samples:
+                        head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
+                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
+                        lan_media[channel].send(encrypt_record(receive_key, head + struct.pack("<I", len(rtp)) + rtp))
                 # Audio open/close has no SDK completion callback.
                 if low not in (4, 5):
                     reply = struct.pack("<IIIHHIii", magic, request, 1, high, low, 8, 0, 1)
                     lan_peer.send(encrypt_record(receive_key, reply))
-                if (high, low) == (7, 4):
-                    media_sequence += 1
-                    for channel, pt, payload in ((1, 96, b"\x65video"), (2, 99, b"\x00\x00\xff\x7f")):
-                        head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
-                        rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
-                        lan_media[channel].send(encrypt_record(receive_key, head + struct.pack("<I", len(rtp)) + rtp))
                 return
             if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
                 events.append("LAN catalog")
@@ -611,12 +644,44 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert not session._command._tcp_ready
                 assert session._command._channel._retransmit_task is None
                 if media:
+                    assert not any(high in (6, 9) for high, _ in bootstrap_commands), "SD connection must not start or stop a preview"
+                    assert session._video.receive_sequence == session._audio.receive_sequence == 0
                     await session.start(start=100, end=110)
                     async with asyncio.timeout(1):
                         video = await session.receive_frame()
                         audio = await session.receive_frame()
-                    assert video.payload == b"\x00\x00\x00\x01\x65video"
-                    assert audio.payload == b"\x00\x00\xff\x7f"
+                    assert video.payload == decodable_media[1]
+                    assert audio.payload == decodable_media[2]
+                    decoded_video = av.CodecContext.create("h264", "r").decode(av.Packet(video.payload))
+                    assert len(decoded_video) == 1
+                    assert (decoded_video[0].width, decoded_video[0].height) == (16, 16)
+                    assert audio.codec_info.codec == 133
+                    decoder = av.CodecContext.create("pcm_mulaw", "r")
+                    decoder.sample_rate = 8000
+                    decoder.layout = "mono"
+                    decoded_audio = decoder.decode(av.Packet(audio.payload))
+                    assert sum(frame.samples for frame in decoded_audio) == 160
+                    assert any(bytes(decoded_audio[0].planes[0]))
+                    # Exercise the production conversion and browser packaging,
+                    # not just the transport's receive queue.
+                    chunks = []
+                    with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
+                        for frame in (video, audio):
+                            converted = NativeRelayRuntimeSession._convert_frame(frame, {}, "")
+                            muxer.handle_event(playback_frame_event(converted, protocol=NATIVE_PLAYBACK_EVENT_VERSION))
+                    packed = b"".join(chunks)
+                    records = []
+                    offset = 0
+                    while offset < len(packed):
+                        kind, timestamp, size = struct.unpack_from(">BQI", packed, offset)
+                        offset += 13
+                        records.append((kind, timestamp, packed[offset:offset + size]))
+                        offset += size
+                    assert offset == len(packed)
+                    assert b"".join(data for kind, _, data in records if kind == 4) == audio.payload
+                    mp4 = b"".join(data for kind, _, data in records if kind == 1)
+                    with av.open(io.BytesIO(mp4), format="mp4") as source:
+                        assert len(list(source.decode(video=0))) == 1
                     await session.pause()
                     await session.resume()
                     await session.seek(start=100, end=110, play_time=105)
@@ -624,13 +689,52 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         assert (await session.receive_frame()).payload == video.payload
                         assert (await session.receive_frame()).payload == audio.payload
                     await session.stop()
-                    # Preview stop consumes 8/9, catalog 10, then each SDK
-                    # command allocates a fresh low word; only seek changes task.
+                    # Catalog consumes 8; no preview commands consume IDs.
+                    # Only seek changes the task's high word.
                     assert playback_requests == [
-                        (0x0002000b, 0), (0x0002000b, 4), (12, 1),
-                        (0x0002000d, 2), (0x0003000e, 0), (0x0003000e, 4),
-                        (15, 3), (16, 5),
+                        (0x00020009, 0), (0x00020009, 4), (10, 1),
+                        (0x0002000b, 2), (0x0003000c, 0), (0x0003000c, 4),
+                        (13, 3), (14, 5),
                     ]
+                    # Run the real interactive orchestration on the same LAN
+                    # object, including its threaded event sink and stop path.
+                    commands = queue.Queue()
+                    interactive_events = []
+                    interactive_chunks = []
+                    with NativePlaybackBrowserStreamMuxer(interactive_chunks.append) as muxer:
+                        def emit(event):
+                            interactive_events.append(event)
+                            accepted = muxer.handle_event(event)
+                            if sum(e["payload"]["type"] == "media-codec" for e in interactive_events) == 2:
+                                commands.put(("stop", None))
+                            return accepted
+                        runtime = NativeRelayRuntimeSession(config, app_session=APP_SESSION)
+                        async with asyncio.timeout(2):
+                            await runtime._interactive_connected(
+                                session, NativePlaybackRequest(start=100, end=110), emit, commands,
+                            )
+                    assert [event["payload"]["type"] for event in interactive_events] == [
+                        "started", "media-codec", "media-codec", "finished",
+                    ]
+                    assert b"".join(interactive_chunks).startswith(b"TRS3")
+                    assert not session._playback_started
+                    # A valid start callback without SD media must time out,
+                    # stop once, and never open another preview/connection.
+                    suppress_sd_media = True
+                    silent_events = []
+                    runtime = NativeRelayRuntimeSession(
+                        config, app_session=APP_SESSION, first_frame_timeout=0.02,
+                    )
+                    with pytest.raises(NativeRelayRuntimeError, match="no media.*video_frames=0, audio_frames=0"):
+                        await runtime._interactive_connected(
+                            session, NativePlaybackRequest(start=100, end=110),
+                            silent_events.append, queue.Queue(),
+                        )
+                    assert [event["payload"]["type"] for event in silent_events] == ["started"]
+                    assert not session._playback_started
+                    assert [low for _, low in playback_requests[-4:]] == [0, 4, 3, 5]
+                    assert peer.opened == 1
+                    assert not any(high in (6, 9) for high, _ in bootstrap_commands)
                 if mode == "no_answer_udp":
                     # A late conflicting key must not silently switch the live
                     # authenticated stream or leak either key into diagnostics.
