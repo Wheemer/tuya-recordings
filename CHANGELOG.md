@@ -1,5 +1,21 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-17 (2026-11-10)
+
+### Recording Catalog
+
+- Handle an explicit Tuya `DEVICE_OFFLINE` response as camera unavailability: retain existing recordings, respect backoff, and report offline state separately from protocol failures. Unexpected failures still include their tracebacks.
+- Let manual refresh cooperatively interrupt an automatic catalog pass and wait for transport cleanup before starting its own request. Scheduled catalog work defers while that manual refresh is running.
+- Preserve fresh offline state for skipped cameras in the displayed catalog. Explicit manual queries can still test reachability rather than treating an inventory report as a permanent block.
+
+### Panel And Diagnostics
+
+- Prefer an available camera with recording data on initial panel load instead of blindly selecting the first, possibly empty offline camera. Keep explicit user selections and label cameras reported offline.
+- Log recording range counts, summed range durations, and first/last timestamps rather than describing returned ranges as individual video files.
+- Preserve the existing native playback path, LAN-only media, wake spacing, and command serialization. No new camera polling or retries are added.
+
+These fixes do not establish complete SD-card discovery or video/audio playback on the affected cameras; those hardware results remain unverified.
+
 ## Tuya Recordings v0.4.13-16 (2026-11-09)
 
 ### Wake And SD Readiness

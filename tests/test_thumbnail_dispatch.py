@@ -66,6 +66,54 @@ class PerCameraCatalogBackend(FakeAvailableBackend):
         ]
 
 
+@pytest.mark.parametrize("typed", [True, False])
+def test_explicit_offline_retains_catalog_without_hiding_other_errors(monkeypatch, tmp_path, caplog, typed):
+    import logging
+    from datetime import datetime, timezone
+    from custom_components.tuya_recordings.http import build_panel_data
+    from custom_components.tuya_recordings.lib.native_gateway import NativeGatewayDeviceOfflineError, NativeGatewayError
+
+    client = TuyaRecordingsClient({}, cache_path=tmp_path / "index.json", recordings_backend=FakeAvailableBackend())
+    client.media_sync_enabled = False
+    client.set_camera_inventory({"offline": "Offline", "online": "Online"})
+    today = datetime.now(timezone.utc).date().isoformat()
+    client._camera_index_cache = {"cameras": [{"devId": "offline", "clips": [{"start": 100, "end": 110, "date": today}]}]}
+    def query(dev_id, day):
+        if dev_id == "offline":
+            try:
+                raise (NativeGatewayDeviceOfflineError if typed else NativeGatewayError)("DEVICE_OFFLINE")
+            except NativeGatewayError as cause:
+                raise RuntimeError("native preparation failed") from cause
+        return [{"start": 200, "end": 210, "date": day.isoformat()}]
+    monkeypatch.setattr(client, "_recordings_for_day", query)
+    caplog.set_level(logging.DEBUG, logger="custom_components.tuya_recordings")
+    index = client.refresh_background_catalog(2)
+    offline, online = index["cameras"]
+    assert len(offline["clips"]) == 1 and len(online["clips"]) == 1
+    assert bool(offline["bridgeStatus"]["error"]) is (not typed)
+    assert ("reason=DEVICE_OFFLINE" in caplog.text) is typed
+    assert ("catalog query failed" in caplog.text) is (not typed)
+    if typed:
+        assert offline["online"] is False
+        assert offline["bridgeStatus"]["status"] == "offline"
+        from custom_components.tuya_recordings.lib.commands import manual_catalog_refresh
+        with manual_catalog_refresh():
+            snapshot = client.refresh_background_catalog(0)
+        assert snapshot["cameras"][0]["online"] is False
+        assert snapshot["cameras"][0]["bridgeStatus"]["status"] == "offline"
+        calls = []
+        monkeypatch.setattr(client, "_recordings_for_day", lambda *args: calls.append(args))
+        client.refresh_background_catalog(1)
+        assert not any(args[0] == "offline" for args in calls)
+    panel = build_panel_data(client, index)
+    assert panel["cameras"][1]["playback_mode"] == "timeline"
+    assert len(panel["cameras"][1]["recording_ranges"]) == 1
+    item = panel["cameras"][1]["recording_ranges"][0]
+    assert item["playback_url"] and item["stream_transport"] == "native"
+    assert today in panel["cameras"][1]["dates"]
+    assert "ranges=1 range_seconds=10 first_start=200 last_end=210" in caplog.text
+
+
 def test_catalog_failure_is_backed_off_per_camera_without_blocking_others():
     client = TuyaRecordingsClient({}, recordings_backend=PerCameraCatalogBackend())
     client.set_camera_inventory(

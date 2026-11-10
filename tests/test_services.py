@@ -119,6 +119,61 @@ def test_scheduled_catalog_drops_inherited_manual_context(monkeypatch):
     assert observed == [("-", False, False)]
 
 
+@pytest.mark.parametrize("queued", [False, True])
+def test_manual_interrupts_catalog_and_joins_before_its_own_query(monkeypatch, tmp_path, queued):
+    import threading
+    from custom_components.tuya_recordings.lib.commands import camera_work_scope
+
+    client = TuyaRecordingsClient({}, cache_path=tmp_path / "index.json")
+    client.set_camera_inventory({"camera": "Camera"})
+    client.lookback_days = 1
+    started = threading.Event()
+    calls = []
+    monkeypatch.setattr(integration, "_client_recording_backend_available", lambda _: True)
+    monkeypatch.setattr(integration, "async_dispatcher_send", Mock())
+    def query(dev_id, day):
+        if ON_DEMAND_DAY_CATALOG.get():
+            calls.append("manual")
+            return []
+        with camera_work_scope() as cancellation:
+            calls.append("automatic")
+            started.set()
+            for _ in range(200):
+                if cancellation.is_set():
+                    calls.append("cleanup")
+                    raise RuntimeError("cancelled native request closed")
+                threading.Event().wait(0.01)
+        pytest.fail("Manual request did not interrupt the active catalog")
+    monkeypatch.setattr(client, "_recordings_for_day", query)
+    async def scenario():
+        executor_entered = asyncio.Event()
+        release_executor = asyncio.Event()
+        invocations = 0
+        async def execute(function, *args):
+            nonlocal invocations
+            invocations += 1
+            if queued and invocations == 1:
+                executor_entered.set()
+                await release_executor.wait()
+            return await asyncio.to_thread(function, *args)
+        data = {"client": client}
+        hass = SimpleNamespace(data={DOMAIN: {"entry": data}},
+                               async_add_executor_job=execute, async_create_task=asyncio.create_task)
+        await integration._async_request_catalog_refresh(hass, "entry", "catalog_cycle")
+        if queued:
+            await asyncio.wait_for(executor_entered.wait(), 2)
+        else:
+            assert await asyncio.to_thread(started.wait, 2)
+        manual = asyncio.create_task(integration._async_request_catalog_refresh(hass, "entry", "service", wait=True))
+        await asyncio.sleep(0)
+        release_executor.set()
+        await asyncio.wait_for(manual, 3)
+        assert calls == (["manual"] if queued else ["automatic", "cleanup", "manual"])
+        assert not client.background_work_paused
+        assert not client._camera_index_cache["cameras"][0].get("catalogRetryAfter")
+    asyncio.run(scenario())
+
+
 def test_manual_catalog_waits_for_scheduled_pass_then_runs_with_its_own_scope(monkeypatch):
     import threading
 

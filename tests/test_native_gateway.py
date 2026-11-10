@@ -553,6 +553,20 @@ def test_device_local_keys_rejects_malformed_home_list(monkeypatch, homes):
         )
 
 
+@pytest.mark.parametrize("code,expected", [("DEVICE_OFFLINE", "offline"), ("OTHER_ERROR", "error")])
+def test_only_exact_gateway_offline_code_has_offline_type(code, expected):
+    from custom_components.tuya_recordings.lib.native_gateway import NativeGatewayDeviceOfflineError
+    gateway = NativeAppGatewayClient()
+    try:
+        with pytest.raises(NativeGatewayError) as error:
+            gateway._unwrap("thing.m.device.dp.publish", "unused", json.dumps({
+                "success": False, "errorCode": code, "errorMsg": "DEVICE_OFFLINE",
+            }))
+        assert isinstance(error.value, NativeGatewayDeviceOfflineError) is (expected == "offline")
+    finally:
+        gateway.session.close()
+
+
 def test_session_invalid_error_maps_to_auth_error():
     client = NativeAppGatewayClient(
         session=FakeSession(envelope={"success": False, "errorCode": "USER_SESSION_INVALID", "errorMsg": "expired"})
