@@ -24,7 +24,7 @@ jobs:
         timeout-minutes: 3
         run: python -m pip install --timeout 20 -r requirements-test.txt
       - name: Install Chromium system dependencies
-        timeout-minutes: 3
+        timeout-minutes: 6
         run: python -m playwright install-deps chromium
       - name: Install system FFmpeg
         timeout-minutes: 2
