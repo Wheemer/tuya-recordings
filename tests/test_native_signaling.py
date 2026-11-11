@@ -289,7 +289,7 @@ def test_mqtt_modern_reply_uses_wire_pv_and_requires_matching_session(sent_pv, r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_pv", ["1.1", "2.1", "2.2", "2.3"])
-@pytest.mark.parametrize("status", [1, "1"])
+@pytest.mark.parametrize("status", [1, "1", 1.0, "1.0", "1e0"])
 async def test_dp_report_decoder_uses_received_pv_without_changing_offer_pv(monkeypatch, reply_pv, status):
     key = b"0123456789abcdef"
     client = MotoClient(
@@ -317,7 +317,13 @@ async def test_dp_report_decoder_uses_received_pv_without_changing_offer_pv(monk
 
 @pytest.mark.parametrize(("value", "expected"), [
     (0, 0), ("0", 0), (" 5 ", 5), (True, None), ("true", None), (None, None),
-    ("", None), ("null", None), (1.5, None), ("1.5", None), ("[]", None),
+    ("", None), ("null", None), (1.0, 1), (1.5, 1), ("1.5", 1), ("1e0", 1),
+    (-1.5, -1), ("-1.5", -1), (float("nan"), None), (float("inf"), None),
+    ("NaN", None), ("Infinity", None), ("1e9999999999999999999999", None), ("[]", None),
+    ('"1"', 1), ('"+1"', 1), ('"01"', 1), ('"1.5"', None), ('" 1 "', None),
+    ('"true"', None), ('"2147483648"', None),
+    (2147483647.9, 2147483647), (-2147483648.9, -2147483648),
+    (2147483648.0, None), (-2147483649.0, None),
     ("{}", None), (2**31, None), ("2147483648", None), ("9" * 100, None),
 ])
 def test_dp_status_integer_conversion_is_bounded(value, expected):

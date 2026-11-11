@@ -10,6 +10,7 @@ permissive mapping.
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 
 from .exceptions import TuyaIpcP2pProtocolError
 
@@ -76,9 +77,22 @@ def dp_integer(value: JsonValue) -> int | None:
         if len(value) > 32:
             return None
         try:
-            value = json.loads(value)
-        except ValueError:
+            value = json.loads(value, parse_float=Decimal)
+        except (ValueError, InvalidOperation):
             return None
+        if isinstance(value, str):
+            digits = value[1:] if value.startswith(("+", "-")) else value
+            if not digits.isascii() or not digits.isdecimal():
+                return None
+            value = int(value)
+    # DpStaticHelper.parseObject -> IntegerCodec converts decimal JSON numbers
+    # with Number.intValue (truncate toward zero), not an integer type check.
+    if type(value) is float:
+        value = Decimal(str(value))
+    if isinstance(value, Decimal):
+        if not value.is_finite() or not -(1 << 31) - 1 < value < (1 << 31):
+            return None
+        value = int(value)
     return value if type(value) is int and -(1 << 31) <= value < (1 << 31) else None
 
 

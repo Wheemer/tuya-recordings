@@ -100,7 +100,7 @@ def test_unmatched_or_malformed_connection_report_does_not_confirm(data):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["ready", "no_card", "low_power_only", "awake_only"])
+@pytest.mark.parametrize("outcome", ["ready", "decimal_ready", "no_card", "decimal_no_card", "low_power_only", "awake_only"])
 async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
     config = replace(
         camera_config(), wake_direct=True, wake_capability="low_power",
@@ -147,8 +147,9 @@ async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
                 if outcome != "low_power_only":
                     self.put({"devId": config.dev_id, "online": True,
                               "lowPowerConnect": False, "lastConnectChangeTime": 100})
-                if outcome in {"ready", "no_card"}:
-                    self.put({"devId": config.dev_id, "dps": {"110": 1 if outcome == "ready" else 5}}, 4)
+                if outcome in {"ready", "decimal_ready", "no_card", "decimal_no_card"}:
+                    status = 5.0 if outcome == "decimal_no_card" else 5 if outcome == "no_card" else "1.0" if outcome == "decimal_ready" else 1
+                    self.put({"devId": config.dev_id, "dps": {"110": status}}, 4)
                 return
             assert protocol == 302
             events.append(data["header"]["type"])
@@ -162,7 +163,7 @@ async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
 
     monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
     try:
-        if outcome == "ready":
+        if outcome in {"ready", "decimal_ready"}:
             await playback._open_signaling("sdp", [], "trace", {}, {})
             assert events == ["wake", "sd-query", "offer"]
             assert "wake_status=confirmed" in playback.transport_diagnostics
@@ -170,7 +171,7 @@ async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
             with pytest.raises(playback_module.NativeRelayPlaybackError):
                 await playback._open_signaling("sdp", [], "trace", {}, {})
             assert events == ["wake", "sd-query"]
-            assert playback._sd_status_query == ("report_no_card" if outcome == "no_card" else "report_timeout")
+            assert playback._sd_status_query == ("report_no_card" if outcome in {"no_card", "decimal_no_card"} else "report_timeout")
         assert len(brokers) == 1
         assert playback._moto._dp_query is None
         assert playback._moto._dp_query_owner is None
@@ -179,6 +180,39 @@ async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
         await playback._moto.async_close()
     assert events[-1] == "closed"
     assert playback._moto._reader is None
+
+
+@pytest.mark.asyncio
+async def test_sd_report_diagnostics_distinguish_missing_key_invalid_shape_and_value():
+    client = make_client()
+    with client.dp_report_listener("110") as report:
+        receive(client, {"devId": "camera-device", "dps": {"111": 1}}, 4)
+        receive(client, {"devId": "camera-device", "dps": {"110": True}}, 4)
+        receive(client, {"devId": "camera-device", "dps": []}, 4)
+        assert not report.done()
+        assert client._inbound["dp_report_requested_key_missing"] == 1
+        assert client._inbound["dp_report_invalid_value_bool"] == 1
+        assert client._inbound["dp_report_invalid_dps_shape"] == 1
+        assert client._inbound["dp_report_missing_or_non_integer"] == 3
+        assert "dp_query=110, dp_report_keys=()" in client.diagnostics
+        receive(client, {"devId": "camera-device", "dps": {"110": "1.0"}}, 4)
+        assert report.result() == 1
+        assert "dp_report_keys=('110',)" in client.diagnostics
+
+
+@pytest.mark.asyncio
+async def test_sd_report_diagnostic_keys_are_numeric_bounded_and_not_values():
+    client = make_client()
+    with client.dp_report_listener("110"):
+        values = {str(i): "private-value" for i in range(100, 140)}
+        values["password"] = "secret"
+        values["110"] = True
+        receive(client, {"devId": "camera-device", "dps": values}, 4)
+        assert len(client._last_dp_report_keys) == 16
+        assert all(key.isdecimal() for key in client._last_dp_report_keys)
+        assert "password" not in client.diagnostics
+        assert "secret" not in client.diagnostics
+        assert "private-value" not in client.diagnostics
 
 
 @pytest.mark.asyncio

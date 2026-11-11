@@ -525,6 +525,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     if mode != "qos1_wake":
                         assert qos == 1
                     events.append("wake")
+                    if mode == "answer" and media:
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "online": True, "lowPowerConnect": True,
+                             "lastConnectChangeTime": 100}, 0, 1, "2.3"))
                     if mode == "offline_report_http":
                         self._consume(encode_payload(config.local_key.encode(), 1, b"test",
                             {"devId": config.dev_id, "online": False}, 0, 1, "2.3"))
@@ -535,9 +539,13 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert qos == 1 and body == {"dps": {"110": None}}
                     assert events == ["wake"]
                     events.append("SD status")
+                    if mode == "answer" and media:
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "online": True, "lowPowerConnect": False,
+                             "lastConnectChangeTime": 101}, 0, 1, "2.3"))
                     if mode != "sd_silence" and (mode != "qos1_wake" or self.awake):
                         self._consume(encode_payload(config.local_key.encode(), 1, b"test",
-                            {"devId": config.dev_id, "dps": {"110": 1}}, 0, 4, "2.3"))
+                            {"devId": config.dev_id, "dps": {"110": 1.0 if profile == "smart_life" else "1.0"}}, 0, 4, "2.3"))
                     return
                 assert protocol == 302 and qos == 0
                 # Native JSON is passed unchanged to publishDevice by rsv.
@@ -644,6 +652,9 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert not session._command._tcp_ready
                 assert session._command._channel._retransmit_task is None
                 if media:
+                    if mode == "answer":
+                        assert session._moto.low_power_wake_confirmed
+                        assert session._moto.low_power_connect is False
                     assert not any(high in (6, 9) for high, _ in bootstrap_commands), "SD connection must not start or stop a preview"
                     assert session._video.receive_sequence == session._audio.receive_sequence == 0
                     await session.start(start=100, end=110)
