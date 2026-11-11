@@ -119,6 +119,8 @@ class MotoClient:
         self._reader_failure = "none"
         self.device_online: bool | None = None
         self.dp_query_dispatch = "not_requested"
+        self._last_dp_query = "none"
+        self._last_dp_report_keys: tuple[str, ...] = ()
         self.low_power_connect: bool | None = None
         self.low_power_wake_confirmed = False
         self._low_power_change_time: int | None = None
@@ -136,6 +138,7 @@ class MotoClient:
                 f"protocols={protocols or 'none'}, "
                 f"device_online={self.device_online}, low_power_connect={self.low_power_connect}, "
                 f"low_power_wake_confirmed={self.low_power_wake_confirmed}, "
+                f"dp_query={self._last_dp_query}, dp_report_keys={self._last_dp_report_keys}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
 
     async def async_connect(self) -> None:
@@ -303,12 +306,24 @@ class MotoClient:
             self._inbound["dp_report_child"] += 1
             return
         dps = data.get("dps")
+        if not isinstance(dps, dict):
+            self._last_dp_report_keys = ()
+            self._inbound["dp_report_invalid_dps_shape"] += 1
+        else:
+            self._last_dp_report_keys = tuple(sorted(
+                key for key in dps if isinstance(key, str) and len(key) <= 10
+                and key.isascii() and key.isdecimal()
+            )[:16])
+            if dp_id not in dps:
+                self._inbound["dp_report_requested_key_missing"] += 1
         value = dp_integer(dps.get(dp_id)) if isinstance(dps, dict) else None
         if value is not None:
             self._inbound["dp_report_accepted"] += 1
             reply.set_result(value)
         else:
             self._inbound["dp_report_missing_or_non_integer"] += 1
+            if isinstance(dps, dict) and dp_id in dps:
+                self._inbound[f"dp_report_invalid_value_{type(dps[dp_id]).__name__}"] += 1
 
     async def async_query_direct_dp(self, dp_id: str) -> int:
         """Query one schema DP and wait for a report, not the publish acknowledgement."""
@@ -339,6 +354,8 @@ class MotoClient:
         if self._reader_failure != "none":
             raise TuyaIpcP2pConnectionError("Device DP report channel stopped")
         reply = asyncio.get_running_loop().create_future()
+        self._last_dp_query = dp_id if (len(dp_id) <= 10 and dp_id.isascii() and dp_id.isdecimal()) else "invalid"
+        self._last_dp_report_keys = ()
         self._dp_query = (dp_id, reply)
         self._dp_query_owner = asyncio.current_task()
         try:
