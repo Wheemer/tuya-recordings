@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-19 (2026-11-11)
+
+### SD Status
+
+- Match the Smart Life APK's integer conversion for decimal SD-status values such as `1.0` and `"1.0"`, instead of rejecting a valid report and waiting until timeout.
+- Handle JSON-quoted integer values while retaining bounds and rejecting malformed values, booleans, and non-finite numbers. No-card and other non-ready states still prevent connection.
+
+### Diagnostics
+
+- Distinguish a missing requested DP, an invalid report shape, and a rejected value type when waiting for SD status.
+- Include the requested DP and a bounded list of numeric report keys without exposing report values or credentials.
+- Preserve wake/query counts, cooldowns, transport routing, LAN-only media, and the existing video/audio playback path. No new retries or polling are added.
+
 ## Tuya Recordings v0.4.13-18 (2026-11-10)
 
 ### SD Playback
