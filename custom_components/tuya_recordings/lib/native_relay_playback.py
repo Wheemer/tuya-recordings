@@ -884,6 +884,10 @@ class NativeRelayPlaybackSession:
             if send_wake:
                 self._connector_wake_sent = True
                 self._wake_status = "sent_unconfirmed"
+                # getDp selects the live route after justSendAwakeDevice.
+                # A failed cooldown probe describes the sleeping peer, not
+                # whether LAN can dispatch after this newly published wake.
+                self._sd_lan_prechecked = False
         # Wake publication is not the SD query's completion callback. The APK
         # still dispatches getDp; throttling a repeat wake must not bypass it.
         if report is not None and report.done():
