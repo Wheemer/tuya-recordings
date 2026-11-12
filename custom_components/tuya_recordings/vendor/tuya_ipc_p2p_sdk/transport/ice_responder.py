@@ -168,6 +168,10 @@ class IceResponder(asyncio.DatagramProtocol):
         self._tie_breaker = secrets.token_bytes(8)
         self._closed = False
         self._blocked_non_lan = 0
+        self._received_datagrams = 0
+        self._ignored_endpoint = 0
+        self._ignored_short = 0
+        self._ignored_no_handler = 0
 
     @property
     def is_nominated(self) -> bool:
@@ -290,6 +294,7 @@ class IceResponder(asyncio.DatagramProtocol):
         transport = self._transport
         if transport is None:
             return
+        self._received_datagrams += 1
         if not _lan_address(addr[0]):
             self._blocked_non_lan += 1
             return
@@ -316,7 +321,14 @@ class IceResponder(asyncio.DatagramProtocol):
                 addr,
             )
             return
-        if len(data) <= 20 or self._on_segment is None or addr != self._remote:
+        if len(data) <= 20:
+            self._ignored_short += 1
+            return
+        if self._on_segment is None:
+            self._ignored_no_handler += 1
+            return
+        if addr != self._remote:
+            self._ignored_endpoint += 1
             return
         segment, tag = data[:-20], data[-20:]
         if not any(
@@ -354,6 +366,8 @@ class IceResponder(asyncio.DatagramProtocol):
         return (
             f"bindings={self._binding_requests}, nominated={self._remote is not None}, "
             f"segments={self._received_segments}, "
+            f"datagrams={self._received_datagrams}, ignored_endpoint={self._ignored_endpoint}, "
+            f"ignored_short={self._ignored_short}, ignored_no_handler={self._ignored_no_handler}, "
             f"blocked_non_lan={self._blocked_non_lan}, "
             f"auth_failures={self._authentication_failures}, "
             f"remote_candidates={len(self._remote_candidates)}, checks_sent={len(self._checked_candidates)}"

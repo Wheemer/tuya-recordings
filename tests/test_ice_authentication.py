@@ -45,6 +45,9 @@ def test_authenticated_media_from_other_address_is_not_delivered():
         assert delivered == []
         responder.datagram_received(wire, responder._remote)
         assert delivered == [segment]
+        assert "datagrams=2" in responder.diagnostics
+        assert "ignored_endpoint=1" in responder.diagnostics
+        assert "segments=1" in responder.diagnostics
     asyncio.run(run())
 
 

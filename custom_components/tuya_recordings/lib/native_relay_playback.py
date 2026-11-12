@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 import logging
 import secrets
 import time
@@ -230,6 +231,9 @@ class NativeRelayPlaybackSession:
         self._sd_lan_attempts = 0
         self._sd_lan_connect_failures = 0
         self._stop_incomplete = False
+        self._playback_responses: list[str] = []
+        self._playback_bounds: tuple[int, int] | None = None
+        self._fragment_end = "not_received"
         self._sd_status_signaling_details = "not_used"
         self._sd_status_deadline: float | None = None
         self._session: DirectSession | None = None
@@ -380,6 +384,8 @@ class NativeRelayPlaybackSession:
             f"sd_status_route_basis={self._sd_status_route_basis}, "
             f"sd_status_lan_attempts={self._sd_lan_attempts}, "
             f"sd_status_lan_connect_failures={self._sd_lan_connect_failures}, "
+            f"playback_responses={','.join(self._playback_responses) or 'none'}, "
+            f"fragment_end={self._fragment_end}, "
             f"sd_status_inventory_route={'mqtt' if config.sd_status_mqtt_dp else 'http' if config.sd_status_http_dp else 'none'}, "
             f"sd_status_online_report={getattr(self._moto, 'device_online', None)}, "
             f"sd_status_dispatch={getattr(self._moto, 'dp_query_dispatch', self._sd_status_dispatch) if self._sd_status_send_route == 'mqtt' else self._sd_status_dispatch}"
@@ -1417,6 +1423,9 @@ class NativeRelayPlaybackSession:
         self._next_task_id += 1
         self._reset_media_state()
         self._stream_id = stream_id
+        self._playback_bounds = (start, end)
+        self._playback_responses.clear()
+        self._fragment_end = "not_received"
         self._playback_started = True
         self._playback_paused = False
         self._video.set_message_handler(
@@ -1814,6 +1823,21 @@ class NativeRelayPlaybackSession:
             return
         for command in commands:
             classified = f"{command.high_command}/{command.low_command}"
+            if command.control == 1 and command.high_command == 7:
+                if command.low_command in (0, 21) and self._stream_id is not None:
+                    if command.request_id >> 16 == self._stream_id >> 16:
+                        status = (
+                            int.from_bytes(command.payload[4:8], "little", signed=True)
+                            if len(command.payload) >= 8 else "truncated"
+                        )
+                        self._playback_responses.append(f"{classified}:{status}")
+                        del self._playback_responses[:-8]
+                elif command.low_command == 6:
+                    if len(command.payload) < 16:
+                        self._fragment_end = "truncated"
+                    else:
+                        bounds = struct.unpack_from("<ii", command.payload, 8)
+                        self._fragment_end = "matched_range" if bounds == self._playback_bounds else "other_range"
             self._control_commands[classified] = (
                 self._control_commands.get(classified, 0) + 1
             )
