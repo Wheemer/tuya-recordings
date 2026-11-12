@@ -49,6 +49,43 @@ def connected():
 
 
 @pytest.mark.asyncio
+async def test_playback_diagnostics_distinguish_ack_completion_and_fragment_end(caplog):
+    caplog.set_level("DEBUG", logger=native.__name__)
+    value = connected()
+    value._playback_bounds = (100, 110)
+    def response(request, low, payload):
+        plain = struct.pack("<IIIHHI", 0x12345678, request, 1, 7, low, len(payload)) + payload
+        value._on_control_record(encrypt_record(ANSWER_KEY, plain), ANSWER_KEY)
+    response(0x00020008, 21, struct.pack("<ii", 0, 1))
+    response(0x00020008, 21, struct.pack("<ii", 0, 3))
+    response(0x00010008, 21, struct.pack("<ii", 0, 1))
+    response(0, 6, struct.pack("<4i", 0, 6, 100, 110))
+    assert value._playback_responses == ["7/21:1", "7/21:3"]
+    assert value._fragment_end == "matched_range"
+    assert "playback_responses=7/21:1,7/21:3" in value.transport_diagnostics
+    details = value.transport_diagnostics
+    assert "status=3,current_task=True" in details
+    assert "current_task=False" in details
+    assert "start=100,end=110,expected=(100, 110)" in details
+    response(0, 6, struct.pack("<4i", 0, 6, 200, 210))
+    assert value._fragment_end == "other_range"
+    response(0, 6, b"bad")
+    assert value._fragment_end == "truncated"
+    assert "bounds=truncated" in value.transport_diagnostics
+    response(0x00020008, 21, struct.pack("<ii", 0, -5))
+    assert "status=-5,current_task=True" in value.transport_diagnostics
+    for _ in range(20):
+        response(0x00020008, 21, struct.pack("<ii", 0, 1))
+    assert len(value._playback_responses) == 8
+    assert len(value._playback_response_details) == 8
+    response_logs = [record.getMessage() for record in caplog.records if "Native SD playback response:" in record.getMessage()]
+    assert len(response_logs) == 8
+    assert any("status=3,current_task=True" in message for message in response_logs)
+    assert any("start=100,end=110" in message for message in response_logs)
+    assert not any(ANSWER_KEY.hex() in message for message in response_logs)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "rejected", "cancelled"])
 async def test_incomplete_stop_is_not_resent_by_later_stop_or_close(monkeypatch, failure):
     value = connected()

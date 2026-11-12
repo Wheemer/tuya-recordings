@@ -367,8 +367,17 @@ class Peer:
     for media in (False, True)
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
-    + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)])
+    + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
+    + [("play_mode", True, False), ("checked_peer_udp", True, False)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
+    alternate_peer = mode == "checked_peer_udp"
+    play_mode = mode == "play_mode" or alternate_peer
+    if alternate_peer:
+        mode = "no_answer_udp"
+    elif play_mode:
+        mode = "answer"
+    fragments = '{"fragments":[{"start":100,"end":110}]}' if play_mode else ""
+    play_options = {"play_mode_supported": play_mode, "fragments_json": fragments}
     lan_after_wake = mode == "cooldown_lan_after_wake"
     cooldown = mode.startswith("cooldown_")
     if cooldown:
@@ -396,6 +405,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
         config = replace(config, token=json.dumps(source["p2pConfig"]), config_json=json.dumps(source), app_profile_id=profile)
+        if play_mode:
+            config = replace(config, skill='{"localStorage":128}')
         config = replace(config, sd_low_power_wake=True, wake_direct=True,
                          sd_status_mqtt_dp="110", sd_status_mqtt_capable=True,
                          sd_status_lan_dp="")
@@ -439,6 +450,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         receive_key = peer.key if mode.startswith("no_answer_udp") else ANSWER_KEY
         events = []
         udp_transport = None
+        udp_alternate = None
+        alternate_checked = asyncio.Event()
         udp_remote = None
         nomination_task = None
         def deliver(raw):
@@ -446,7 +459,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 session._on_direct_segment(raw)
             else:
                 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
-                udp_transport.sendto(raw + hmac_sha1(receive_key, raw), udp_remote)
+                sender = udp_alternate if alternate_peer and int.from_bytes(raw[:4], "little") in (1, 2) else udp_transport
+                sender.sendto(raw + hmac_sha1(receive_key, raw), udp_remote)
         lan_peer = KcpConversation(0, deliver)
         lan_media = {n: KcpConversation(n, deliver) for n in (1, 2)}
         media_sequence = 0
@@ -465,12 +479,18 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             if magic == 0x12345678 and high in (6, 7):
                 if high == 7:
                     playback_requests.append((request, low))
-                if not suppress_sd_media and (high, low) in {(7, 0), (7, 4)}:
-                    if low == 0:
+                if high == 7 and low == 21:
+                    # Literal CameraSDK native overload layout, transcribed
+                    # from 0031e0f8..0031e334, not the Python encoder.
+                    position = struct.unpack_from("<i", plain, 32)[0]
+                    assert plain == struct.pack("<IIIHHI7i", 0x12345678, request, 0, 7, 21, 28,
+                                                0, 21, 0, position, 1, 100, 110)
+                if not suppress_sd_media and (high, low) in {(7, 0), (7, 21), (7, 4)}:
+                    if low in (0, 21):
                         media_sequence += 1
                     # Native readers must already exist: video can precede
                     # StartPlayBack's callback, and audio-open has no callback.
-                    samples = ((1, 96, decodable_media[0]),) if low == 0 else ((2, 0, decodable_media[2]),)
+                    samples = ((1, 96, decodable_media[0]),) if low in (0, 21) else ((2, 0, decodable_media[2]),)
                     for channel, pt, payload in samples:
                         head = struct.pack("<I5I", request, 0, 0, 0, 0, 0)
                         rtp = struct.pack(">BBHII", 0x80, 0x80 | pt, media_sequence, 8000 * media_sequence, 1) + payload
@@ -587,6 +607,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                             async with asyncio.timeout(1):
                                 while not session._answer.done():
                                     await asyncio.sleep(0.001)
+                        if udp_alternate is not None:
+                            udp_alternate.sendto(request(nominate=False, password=session._local.ice_password,
+                                username=f"{session._local.ice_ufrag}:camera".encode()), udp_remote)
+                            await asyncio.wait_for(alternate_checked.wait(), 1)
                         udp_transport.sendto(request(password=session._local.ice_password,
                             username=f"{session._local.ice_ufrag}:camera".encode()), udp_remote)
                     nomination_task = asyncio.create_task(nominate())
@@ -597,8 +621,11 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import ice_responder
             from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import hmac_sha1
             class CameraUdp(asyncio.DatagramProtocol):
+                def __init__(self, alternate=False): self.alternate = alternate
                 def datagram_received(self, data, address):
                     if data[:2] == b"\x01\x01":
+                        if self.alternate:
+                            alternate_checked.set()
                         return
                     assert address == udp_remote
                     assert data[-20:] == hmac_sha1(peer.key, data[:-20])
@@ -609,6 +636,9 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                             lan_media[segment.conversation].input(segment)
             udp_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                 CameraUdp, local_addr=("127.0.0.1", 0))
+            if alternate_peer:
+                udp_alternate, _ = await loop.create_datagram_endpoint(
+                    lambda: CameraUdp(True), local_addr=("127.0.0.1", 0))
             monkeypatch.setattr(ice_responder, "local_address", lambda: "127.0.0.1")
             monkeypatch.setattr(playback, "IceResponder", ice_responder.IceResponder)
         monkeypatch.setattr(playback, "MotoClient", Mqtt)
@@ -665,7 +695,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         assert session._moto.low_power_connect is False
                     assert not any(high in (6, 9) for high, _ in bootstrap_commands), "SD connection must not start or stop a preview"
                     assert session._video.receive_sequence == session._audio.receive_sequence == 0
-                    await session.start(start=100, end=110)
+                    await session.start(start=100, end=110, **play_options)
                     async with asyncio.timeout(1):
                         video = await session.receive_frame()
                         audio = await session.receive_frame()
@@ -703,7 +733,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         assert len(list(source.decode(video=0))) == 1
                     await session.pause()
                     await session.resume()
-                    await session.seek(start=100, end=110, play_time=105)
+                    await session.seek(start=100, end=110, play_time=105, **play_options)
                     async with asyncio.timeout(1):
                         assert (await session.receive_frame()).payload == video.payload
                         assert (await session.receive_frame()).payload == audio.payload
@@ -711,8 +741,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     # Catalog consumes 8; no preview commands consume IDs.
                     # Only seek changes the task's high word.
                     assert playback_requests == [
-                        (0x00020009, 0), (0x00020009, 4), (10, 1),
-                        (0x0002000b, 2), (0x0003000c, 0), (0x0003000c, 4),
+                        (0x00020009, 21 if play_mode else 0), (0x00020009, 4), (10, 1),
+                        (0x0002000b, 2), (0x0003000c, 21 if play_mode else 0), (0x0003000c, 4),
                         (13, 3), (14, 5),
                     ]
                     # Run the real interactive orchestration on the same LAN
@@ -730,7 +760,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         runtime = NativeRelayRuntimeSession(config, app_session=APP_SESSION)
                         async with asyncio.timeout(2):
                             await runtime._interactive_connected(
-                                session, NativePlaybackRequest(start=100, end=110), emit, commands,
+                                session, NativePlaybackRequest(start=100, end=110, fragments_json=fragments), emit, commands,
                             )
                     assert [event["payload"]["type"] for event in interactive_events] == [
                         "started", "media-codec", "media-codec", "finished",
@@ -746,12 +776,12 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     )
                     with pytest.raises(NativeRelayRuntimeError, match="no media.*video_frames=0, audio_frames=0"):
                         await runtime._interactive_connected(
-                            session, NativePlaybackRequest(start=100, end=110),
+                            session, NativePlaybackRequest(start=100, end=110, fragments_json=fragments),
                             silent_events.append, queue.Queue(),
                         )
                     assert [event["payload"]["type"] for event in silent_events] == ["started"]
                     assert not session._playback_started
-                    assert [low for _, low in playback_requests[-4:]] == [0, 4, 3, 5]
+                    assert [low for _, low in playback_requests[-4:]] == [21 if play_mode else 0, 4, 3, 5]
                     assert peer.opened == 1
                     assert not any(high in (6, 9) for high, _ in bootstrap_commands)
                 if mode == "no_answer_udp":
@@ -789,12 +819,16 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             if nomination_task is not None:
                 nomination_task.cancel()
                 await asyncio.gather(nomination_task, return_exceptions=True)
+            if alternate_peer:
+                assert session._ice._alternate_peer_segments > 0
             await session.close()
             await lan_peer.async_close()
             for channel in lan_media.values():
                 await channel.async_close()
             if udp_transport is not None:
                 udp_transport.close()
+            if udp_alternate is not None:
+                udp_alternate.close()
         assert session._command is None and session._command_task is None
 
 
