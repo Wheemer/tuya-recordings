@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-21 (2026-11-12)
+
+### SD Playback
+
+- Follow the Smart Life native SDK's ICE check-list routing: accept authenticated video and audio from another checked LAN endpoint, rather than discarding everything outside the nominated endpoint.
+- Keep outgoing traffic on the nominated path. LAN-only filtering, packet authentication, and bounded peer tracking remain enforced; no additional camera commands or retries are introduced.
+
+### Diagnostics
+
+- Include playback response status codes, task matching, and fragment timestamps when diagnosing an acknowledged start without media.
+- Record bounded UDP-discard details, including packet size, peer relationship, authentication result, and authenticated channel identifiers, without exposing addresses, credentials, or media payloads.
+
 ## Tuya Recordings v0.4.13-20 (2026-11-12)
 
 ### Camera Connection
