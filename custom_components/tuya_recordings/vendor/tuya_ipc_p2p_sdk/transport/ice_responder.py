@@ -173,6 +173,8 @@ class IceResponder(asyncio.DatagramProtocol):
         self._ignored_short = 0
         self._ignored_no_handler = 0
         self._discard_details: list[str] = []
+        self._validated_peers: set[tuple[str | bytes, int]] = set()
+        self._alternate_peer_segments = 0
 
     def _record_discard(self, reason: str, data: bytes, addr: tuple[str | bytes, int]) -> None:
         """Keep bounded packet metadata, never payloads, addresses or credentials."""
@@ -330,6 +332,8 @@ class IceResponder(asyncio.DatagramProtocol):
                 self._authentication_failures += 1
                 self._record_discard("stun_authentication", data, addr)
                 return
+            if len(self._validated_peers) < 64:
+                self._validated_peers.add(addr)
             if nominated:
                 self._remote = addr
                 self._nominated.set()
@@ -352,7 +356,13 @@ class IceResponder(asyncio.DatagramProtocol):
             self._ignored_no_handler += 1
             self._record_discard("no_handler", data, addr)
             return
-        if addr != self._remote:
+        # IMM's UDP callback (00191934) also admits checklist endpoints.
+        # Never retarget outgoing traffic or bypass per-packet authentication.
+        alternate = addr != self._remote
+        if alternate and (
+            self._remote is None
+            or addr not in self._validated_peers and addr not in self._checked_candidates
+        ):
             self._ignored_endpoint += 1
             self._record_discard("endpoint", data, addr)
             return
@@ -365,6 +375,8 @@ class IceResponder(asyncio.DatagramProtocol):
             self._record_discard("authentication", data, addr)
             return
         self._received_segments += 1
+        if alternate:
+            self._alternate_peer_segments += 1
         self._on_segment(segment)
 
     def set_receive_key(self, key: bytes) -> None:
@@ -396,6 +408,7 @@ class IceResponder(asyncio.DatagramProtocol):
             f"datagrams={self._received_datagrams}, ignored_endpoint={self._ignored_endpoint}, "
             f"ignored_short={self._ignored_short}, ignored_no_handler={self._ignored_no_handler}, "
             f"discard_details={self._discard_details or 'none'}, "
+            f"validated_peers={len(self._validated_peers)}, alternate_peer_segments={self._alternate_peer_segments}, "
             f"blocked_non_lan={self._blocked_non_lan}, "
             f"auth_failures={self._authentication_failures}, "
             f"remote_candidates={len(self._remote_candidates)}, checks_sent={len(self._checked_candidates)}"
@@ -412,6 +425,7 @@ class IceResponder(asyncio.DatagramProtocol):
         self._transport = None
         self._remote_candidates.clear()
         self._checked_candidates.clear()
+        self._validated_peers.clear()
         self._remote_credentials = None
         if transport is not None:
             with contextlib.suppress(Exception):

@@ -118,3 +118,63 @@ def test_discard_diagnostics_are_bounded_redacted_and_do_not_accept_packets():
         responder.datagram_received(wire, responder._remote)
         assert delivered == [payload]
     asyncio.run(run())
+
+
+def test_authenticated_checked_peer_media_does_not_require_renomination():
+    async def run():
+        delivered, sent = [], []
+        key = b"a" * 16
+        responder = ice.IceResponder("secret", lambda _: None, local_ufrag="local", receive_key=key, send_key=key, on_segment=delivered.append)
+        responder._transport = SimpleNamespace(sendto=lambda *args: sent.append(args), close=lambda: None)
+        nominated = ("192.168.50.1", 1234)
+        alternate = ("192.168.50.1", 4321)
+        responder.datagram_received(request(), nominated)
+        responder.datagram_received(request(nominate=False), alternate)
+        packet = struct.pack("<IBBHIIII", 1, 81, 0, 512, 0, 0, 0, 5) + b"video"
+        wire = packet + ice.hmac_sha1(key, packet)
+        responder.datagram_received(wire, alternate)
+        assert delivered == [packet]
+        assert responder._remote == nominated
+        responder.send_segment(b"ack")
+        assert sent[-1][1] == nominated
+        responder.datagram_received(packet + bytes(20), alternate)
+        responder.datagram_received(wire, ("192.168.50.1", 9999))
+        assert delivered == [packet]
+        assert "alternate_peer_segments=1" in responder.diagnostics
+        responder.close()
+        assert not responder._validated_peers
+    asyncio.run(run())
+
+
+def test_checked_peer_admission_is_bounded_and_rejects_forged_checks():
+    async def run():
+        responder = ice.IceResponder("secret", lambda _: None, local_ufrag="local")
+        responder._transport = SimpleNamespace(sendto=lambda *args: None, close=lambda: None)
+        for port in range(1000, 1100):
+            responder.datagram_received(request(nominate=False), ("192.168.50.1", port))
+        assert len(responder._validated_peers) == 64
+        responder.datagram_received(request(password="wrong"), ("192.168.50.2", 5000))
+        assert ("192.168.50.2", 5000) not in responder._validated_peers
+        assert responder._remote is None
+        responder.close()
+        assert not responder._validated_peers
+    asyncio.run(run())
+
+
+def test_outbound_checked_candidate_requires_valid_media_tag():
+    async def run():
+        delivered = []
+        key = b"a" * 16
+        responder = ice.IceResponder("secret", lambda _: None, local_ufrag="local", receive_key=key, on_segment=delivered.append)
+        responder._transport = SimpleNamespace(sendto=lambda *args: None)
+        responder.add_remote_candidate("a=candidate:1 1 udp 1234 192.168.50.2 4321 typ host")
+        responder.set_remote_credentials("camera", "camera-secret")
+        responder.datagram_received(request(), ("192.168.50.1", 1234))
+        peer = ("192.168.50.2", 4321)
+        assert peer in responder._checked_candidates
+        payload = b"video"
+        responder.datagram_received(payload + bytes(20), peer)
+        assert delivered == []
+        responder.datagram_received(payload + ice.hmac_sha1(key, payload), peer)
+        assert delivered == [payload]
+    asyncio.run(run())
