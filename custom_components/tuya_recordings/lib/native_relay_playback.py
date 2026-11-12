@@ -232,6 +232,7 @@ class NativeRelayPlaybackSession:
         self._sd_lan_connect_failures = 0
         self._stop_incomplete = False
         self._playback_responses: list[str] = []
+        self._playback_response_details: list[str] = []
         self._playback_bounds: tuple[int, int] | None = None
         self._fragment_end = "not_received"
         self._sd_status_signaling_details = "not_used"
@@ -386,6 +387,7 @@ class NativeRelayPlaybackSession:
             f"sd_status_lan_connect_failures={self._sd_lan_connect_failures}, "
             f"playback_responses={','.join(self._playback_responses) or 'none'}, "
             f"fragment_end={self._fragment_end}, "
+            f"completion_details={self._playback_response_details or 'none'}, "
             f"sd_status_inventory_route={'mqtt' if config.sd_status_mqtt_dp else 'http' if config.sd_status_http_dp else 'none'}, "
             f"sd_status_online_report={getattr(self._moto, 'device_online', None)}, "
             f"sd_status_dispatch={getattr(self._moto, 'dp_query_dispatch', self._sd_status_dispatch) if self._sd_status_send_route == 'mqtt' else self._sd_status_dispatch}"
@@ -1425,6 +1427,7 @@ class NativeRelayPlaybackSession:
         self._stream_id = stream_id
         self._playback_bounds = (start, end)
         self._playback_responses.clear()
+        self._playback_response_details.clear()
         self._fragment_end = "not_received"
         self._playback_started = True
         self._playback_paused = False
@@ -1824,6 +1827,29 @@ class NativeRelayPlaybackSession:
         for command in commands:
             classified = f"{command.high_command}/{command.low_command}"
             if command.control == 1 and command.high_command == 7:
+                if command.low_command in (0, 6, 21):
+                    fields = (
+                        f"command={classified},request={command.request_id},"
+                        f"task={command.request_id >> 16},bytes={len(command.payload)}"
+                    )
+                    if command.low_command == 6:
+                        if len(command.payload) >= 16:
+                            start, end = struct.unpack_from("<ii", command.payload, 8)
+                            fields += f",start={start},end={end},expected={self._playback_bounds}"
+                        else:
+                            fields += ",bounds=truncated"
+                    else:
+                        status = (
+                            int.from_bytes(command.payload[4:8], "little", signed=True)
+                            if len(command.payload) >= 8 else "truncated"
+                        )
+                        matches = self._stream_id is not None and command.request_id >> 16 == self._stream_id >> 16
+                        fields += f",status={status},current_task={matches}"
+                    # Retain the latest values, but never flood the log on repeated replies.
+                    if len(self._playback_response_details) < 8:
+                        _LOGGER.debug("Native SD playback response: %s", fields)
+                    self._playback_response_details.append(fields)
+                    del self._playback_response_details[:-8]
                 if command.low_command in (0, 21) and self._stream_id is not None:
                     if command.request_id >> 16 == self._stream_id >> 16:
                         status = (

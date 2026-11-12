@@ -172,6 +172,27 @@ class IceResponder(asyncio.DatagramProtocol):
         self._ignored_endpoint = 0
         self._ignored_short = 0
         self._ignored_no_handler = 0
+        self._discard_details: list[str] = []
+
+    def _record_discard(self, reason: str, data: bytes, addr: tuple[str | bytes, int]) -> None:
+        """Keep bounded packet metadata, never payloads, addresses or credentials."""
+        peer = (
+            "not_nominated" if self._remote is None else
+            "nominated" if addr == self._remote else
+            "same_host_other_port" if addr[0] == self._remote[0] else "other_host"
+        )
+        detail = f"reason={reason},bytes={len(data)},peer={peer}"
+        if len(data) > 20 and reason in {"endpoint", "no_handler", "authentication"}:
+            segment, tag = data[:-20], data[-20:]
+            authenticated = any(
+                hmac.compare_digest(tag, hmac_sha1(key, segment))
+                for key in self._receive_keys
+            )
+            detail += f",authenticated={authenticated}"
+            if authenticated and len(segment) >= 24:
+                detail += f",conversation={int.from_bytes(segment[:4], 'little')},command={segment[4]}"
+        self._discard_details.append(detail)
+        del self._discard_details[:-8]
 
     @property
     def is_nominated(self) -> bool:
@@ -297,6 +318,7 @@ class IceResponder(asyncio.DatagramProtocol):
         self._received_datagrams += 1
         if not _lan_address(addr[0]):
             self._blocked_non_lan += 1
+            self._record_discard("non_lan", data, addr)
             return
         if (
             len(data) >= _STUN_HEADER_LENGTH
@@ -306,6 +328,7 @@ class IceResponder(asyncio.DatagramProtocol):
             nominated = self._binding_request(data)
             if nominated is None:
                 self._authentication_failures += 1
+                self._record_discard("stun_authentication", data, addr)
                 return
             if nominated:
                 self._remote = addr
@@ -323,12 +346,15 @@ class IceResponder(asyncio.DatagramProtocol):
             return
         if len(data) <= 20:
             self._ignored_short += 1
+            self._record_discard("short", data, addr)
             return
         if self._on_segment is None:
             self._ignored_no_handler += 1
+            self._record_discard("no_handler", data, addr)
             return
         if addr != self._remote:
             self._ignored_endpoint += 1
+            self._record_discard("endpoint", data, addr)
             return
         segment, tag = data[:-20], data[-20:]
         if not any(
@@ -336,6 +362,7 @@ class IceResponder(asyncio.DatagramProtocol):
             for key in self._receive_keys
         ):
             self._authentication_failures += 1
+            self._record_discard("authentication", data, addr)
             return
         self._received_segments += 1
         self._on_segment(segment)
@@ -368,6 +395,7 @@ class IceResponder(asyncio.DatagramProtocol):
             f"segments={self._received_segments}, "
             f"datagrams={self._received_datagrams}, ignored_endpoint={self._ignored_endpoint}, "
             f"ignored_short={self._ignored_short}, ignored_no_handler={self._ignored_no_handler}, "
+            f"discard_details={self._discard_details or 'none'}, "
             f"blocked_non_lan={self._blocked_non_lan}, "
             f"auth_failures={self._authentication_failures}, "
             f"remote_candidates={len(self._remote_candidates)}, checks_sent={len(self._checked_candidates)}"

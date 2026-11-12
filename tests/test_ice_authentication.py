@@ -1,4 +1,5 @@
 import asyncio
+import struct
 from types import SimpleNamespace
 
 from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import ice_responder as ice
@@ -83,4 +84,37 @@ def test_remote_candidate_checks_are_authenticated_controlled_and_bounded():
         responder.add_remote_candidate(candidate)
         responder.set_remote_credentials("camera", "camera-secret")
         assert len(sent) == 64 and responder._remote_candidates == set()
+    asyncio.run(run())
+
+
+def test_discard_diagnostics_are_bounded_redacted_and_do_not_accept_packets():
+    async def run():
+        delivered = []
+        key = b"private-key-1234"
+        responder = ice.IceResponder("private-password", lambda _: None, receive_key=key, on_segment=delivered.append)
+        responder._transport = SimpleNamespace(sendto=lambda *args: None)
+        responder._remote = ("192.168.50.1", 1234)
+        payload = struct.pack("<IBBHIIII", 1, 81, 0, 512, 0, 0, 0, 16) + b"secret-video-data"
+        wire = payload + ice.hmac_sha1(key, payload)
+        responder.datagram_received(wire, ("192.168.50.1", 4321))
+        assert "peer=same_host_other_port,authenticated=True,conversation=1,command=81" in responder.diagnostics
+        responder.datagram_received(payload + bytes(20), responder._remote)
+        assert "reason=authentication" in responder.diagnostics
+        assert "authenticated=False" in responder.diagnostics
+        responder.datagram_received(b"short", responder._remote)
+        assert "reason=short,bytes=5" in responder.diagnostics
+        responder._on_segment = None
+        responder.datagram_received(wire, responder._remote)
+        assert "reason=no_handler" in responder.diagnostics
+        responder.datagram_received(wire, ("8.8.8.8", 1234))
+        assert "reason=non_lan" in responder.diagnostics
+        for _ in range(30):
+            responder.datagram_received(wire, ("192.168.50.2", 4321))
+        assert len(responder._discard_details) == 8
+        assert delivered == []
+        for secret in ("192.168.50", "8.8.8.8", "secret-video-data", "private-key", "private-password", payload.hex()):
+            assert secret not in responder.diagnostics
+        responder._on_segment = delivered.append
+        responder.datagram_received(wire, responder._remote)
+        assert delivered == [payload]
     asyncio.run(run())
