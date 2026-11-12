@@ -49,6 +49,42 @@ def connected():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "rejected", "cancelled"])
+async def test_incomplete_stop_is_not_resent_by_later_stop_or_close(monkeypatch, failure):
+    value = connected()
+    monkeypatch.setattr(native, "_CONTROL_RESPONSE_TIMEOUT_SECONDS", 0.01)
+    sent = []
+    value._offer = SimpleNamespace(aes_key=ANSWER_KEY)
+    value._control = SimpleNamespace(send=sent.append)
+    if failure == "rejected":
+        value._control_messages.put_nowait(NativeSimpleCommand(9, 1, 7, 3, struct.pack("<ii", 0, 0)))
+    if failure == "cancelled":
+        stopping = asyncio.create_task(value.stop())
+        async with asyncio.timeout(1):
+            while len(sent) != 2:
+                await asyncio.sleep(0)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    else:
+        with pytest.raises(native.NativeRelayPlaybackError):
+            await value.stop()
+    assert len(sent) == 2
+    with pytest.raises(native.NativeRelayPlaybackError, match="Previous playback stop"):
+        await value.stop()
+    with pytest.raises(native.NativeRelayPlaybackError, match="Previous playback stop"):
+        await value.seek(start=100, end=110)
+    with pytest.raises(native.NativeRelayPlaybackError, match="Previous playback stop"):
+        await value.pause()
+    with pytest.raises(native.NativeRelayPlaybackError, match="Previous playback stop"):
+        await value.resume()
+    await value.close()
+    await value.close()
+    assert len(sent) == 2
+    assert value._closed and not value._connected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation,low,expected_id", [
     ("pause", 1, 9), ("resume", 2, 0x00020009), ("stop", 3, 9),
 ])

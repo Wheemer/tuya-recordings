@@ -165,6 +165,8 @@ async def test_manual_lan_then_sleeping_background_reselects_lan_after_wake(monk
     assert events == ["lan-connect", "wake", "lan-connect", "lan-query"]
     assert scheduled._sd_status_send_route == "lan"
     assert scheduled._sd_status_route_basis == "inventory_lan"
+    assert scheduled._sd_lan_attempts == 2
+    assert scheduled._sd_lan_connect_failures == 1
     assert scheduled._sd_status_deadline is None
     assert broker._dp_query is None
     assert all(client.closed for client in clients)
@@ -341,6 +343,17 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                 assert payload == crc32(key).to_bytes(4, "big")
                 events.append("wake")
                 background_sleeping = False
+                if background_followup:
+                    # Barry's log: online/lowPowerConnect and unrelated DP248
+                    # reports are not the requested SD-status completion.
+                    for protocol, report in (
+                        (1, {"online": True, "lowPowerConnect": True}),
+                        (4, {"dps": {"248": 1}}),
+                    ):
+                        self.inbound.put_nowait(SimpleNamespace(
+                            topic=f"smart/mb/in/{dev}",
+                            payload=encode_payload(key, 1, b"test", {"devId": dev, **report}, 0, protocol, "2.3"),
+                        ))
                 if outcome == "lan_answer_mqtt_status":
                     self.inbound.put_nowait(SimpleNamespace(
                         topic=f"smart/mb/in/{dev}",
@@ -486,6 +499,13 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                         ))
                 return
             if (high, low) != (3, 1):
+                if background_followup and (high, low) == (3, 0):
+                    assert struct.unpack_from("<4i", command, 20) == (0, 0, 0, 202609)
+                    events.append("month")
+                    payload = struct.pack("<4I", 0, 0, 0, 1 << 14)
+                    self.handler(encrypt_record(ANSWER_KEY, struct.pack(
+                        "<IIIHHI", 0x12345678, request, 1, 3, 0, len(payload),
+                    ) + payload))
                 return
             assert events[-1] == "nominated"
             assert struct.unpack_from("<4I", command, 20) == (0, day.year, day.month, day.day)
@@ -522,6 +542,15 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
 
         def open_device(self):
             device = tinytuya.Device(dev, "192.0.2.9", config.local_key, version=3.5)
+            closed = False
+
+            def close():
+                nonlocal closed
+                # TinyTuya's destructor calls close again during GC. Match
+                # real socket idempotence rather than logging phantom closes.
+                if not closed:
+                    closed = True
+                    events.append("lan-close")
 
             def get_socket(renew):
                 events.append("lan-connect")
@@ -552,7 +581,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             device._get_socket = get_socket
             device._send_receive = query
             device.receive = receive
-            device.close = lambda: events.append("lan-close")
+            device.close = close
             device.send = lambda _: pytest.fail("Receive-only LAN must not publish signaling")
             return device
 
@@ -655,23 +684,72 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             error = camera["bridgeStatus"]["error"]
             if background_followup:
                 import time
+                from datetime import timedelta
                 assert not error and clips
                 assert camera["catalogDays"].get(day.isoformat())
-                background_sleeping = True
-                relay_module.CAMERA_COMMANDS._wake_after[dev] = time.monotonic() + 0.01
-                events.clear()
-                # The actual automatic client entry must retain the refreshed
-                # provider and query the previous day after the manual button.
-                day = date(2026, 9, 14)
-                result = client.refresh_background_catalog(limit=1)
-                updated = result["cameras"][0]
-                assert not updated["bridgeStatus"]["error"]
-                assert "2026-09-14" in updated["catalogDays"]
-                assert events == [
-                    "lan-connect", "lan-close", "wake", "lan-connect", "lan-query",
-                    "offer", "answer", "nominated", "catalog", "direct-closed",
-                    "lan-close", "broker-closed",
-                ]
+                client.lookback_days = 7
+                for iteration in range(3):
+                    if iteration:
+                        day = date(2026, 9, 15)
+                        events.clear()
+                        client._manual_catalog_after.clear()
+                        asyncio.run(TuyaRecordingsRefreshButton(hass, entry).async_press())
+                        assert not client.cached_camera_index()["cameras"][0]["bridgeStatus"]["error"]
+                    background_sleeping = True
+                    relay_module.CAMERA_COMMANDS._wake_after[dev] = time.monotonic() + 0.2
+                    events.clear()
+                    # Same real client, provider and command queue: load the
+                    # next historical day after manual refresh and camera sleep.
+                    day = date(2026, 9, 14) - timedelta(days=iteration)
+                    result = client.refresh_background_catalog(limit=1)
+                    updated = result["cameras"][0]
+                    assert not updated["bridgeStatus"]["error"]
+                    assert day.isoformat() in updated["catalogDays"]
+                    assert events == [
+                        "lan-connect", "lan-close", "wake", "lan-connect", "lan-query",
+                        "offer", "answer", "nominated", "catalog", "direct-closed",
+                        "lan-close", "broker-closed",
+                    ], events
+
+                    async def playback_lifecycle():
+                        viewer = NativeRelayPlaybackSession(
+                            client._recordings_backend._provider.session_config(dev), APP_SESSION,
+                        )
+                        try:
+                            await viewer.connect(allow_wake=True)
+                            await viewer.start(start=clip_start, end=clip_end)
+                            for seek in (False, True, True):
+                                if seek:
+                                    await viewer.seek(start=clip_start, end=clip_end, play_time=clip_start + 1)
+                                async with asyncio.timeout(1):
+                                    video = await viewer.receive_frame()
+                                    audio = await viewer.receive_frame()
+                                assert not video.is_audio and audio.is_audio
+                                assert audio.payload == b"\x00\x00\xff\x7f"
+                                await viewer.pause()
+                                await viewer.resume()
+                            await viewer.stop()
+                        finally:
+                            await viewer.close()
+                        assert not viewer._candidate_tasks
+                        assert viewer._session is viewer._moto is viewer._answer_lan is None
+
+                    asyncio.run(playback_lifecycle())
+                    background_sleeping = True
+                    relay_module.CAMERA_COMMANDS._wake_after[dev] = time.monotonic() + 0.2
+                    events.clear()
+                    assert client._recordings_backend.recording_days_for_month(
+                        dev, date(2026, 9, 1),
+                    ) == [date(2026, 9, 14)]
+                    import gc
+                    gc.collect()
+                    expected_month_events = [
+                        "lan-connect", "lan-close", "wake", "lan-connect", "lan-query",
+                        "offer", "answer", "nominated", "month", "direct-closed",
+                        "lan-close", "broker-closed",
+                    ]
+                    if events != expected_month_events:
+                        pytest.fail("Unexpected month lifecycle: " + json.dumps(events))
         finally:
             client._recordings_backend.close()
         if background_followup:

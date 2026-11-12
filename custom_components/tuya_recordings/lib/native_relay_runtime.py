@@ -288,12 +288,6 @@ class NativeRelayStreamWorker:
                     raise NativeRelayRuntimeError("Native playback was cancelled")
                 if getattr(self, "_unfinished_transport", None) is not None:
                     raise NativeRelayRuntimeError("Previous native transport did not close")
-                if playback is None:
-                    playback = self._playback_factory(
-                        self._config,
-                        self._app_session,
-                    )
-                    await playback.connect(**_offer_retry_options(work.retry_offer))
                 runtime = NativeRelayRuntimeSession(
                     self._config,
                     app_session=self._app_session,
@@ -302,6 +296,12 @@ class NativeRelayStreamWorker:
                     media_secrets=self._media_secrets,
                     end_idle_timeout=self._end_idle_timeout,
                 )
+                if playback is None:
+                    playback = self._playback_factory(self._config, self._app_session)
+                    await runtime._wait_cancelable(
+                        playback.connect(allow_wake=True, **_offer_retry_options(work.retry_offer)),
+                        timeout=runtime.signaling_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS,
+                    )
                 await runtime._stream_connected(
                     playback,
                     work.request,
@@ -315,7 +315,7 @@ class NativeRelayStreamWorker:
                     playback, "_playback_started", False
                 ):
                     try:
-                        await playback.stop()
+                        await asyncio.wait_for(playback.stop(), timeout=_PLAYBACK_STOP_TIMEOUT_SECONDS)
                     except Exception:
                         with suppress(Exception):
                             await _close_worker_transport(self, playback)
@@ -407,7 +407,7 @@ class NativeRelayPlaybackWorker:
         work = _CatalogWork(
             days, cancel_event, events=events, months=months,
             # SD readiness is a connection prerequisite, not a manual retry.
-            allow_wake=not events and not months,
+            allow_wake=True,
         )
         self._submit(work)
         work.done.wait()
@@ -555,9 +555,9 @@ class NativeRelayPlaybackWorker:
                         self._config,
                         self._app_session,
                     )
-                    connect_options = {"allow_wake": True} if isinstance(work, _CatalogWork) and work.allow_wake else {}
-                    if isinstance(work, _InteractivePlaybackWork):
-                        connect_options["allow_wake"] = True
+                    # Every newly opened SD connection enters the same APK
+                    # readiness gate, regardless of the operation that needs it.
+                    connect_options = {"allow_wake": True}
                     if not isinstance(work, _ThumbnailWork):
                         connect_options.update(_offer_retry_options(work.retry_offer))
                     await self._wait_for_work(
@@ -1055,8 +1055,8 @@ class NativeRelayRuntimeSession:
         )
         try:
             await self._wait_cancelable(
-                playback.connect(media=True, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
-                timeout=self.signaling_timeout + 60,
+                playback.connect(media=True, allow_wake=True, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS,
             )
             await self._stream_connected(playback, request, event_handler)
         finally:
@@ -1069,7 +1069,8 @@ class NativeRelayRuntimeSession:
         )
         try:
             await self._wait_cancelable(
-                playback.connect(media=True), timeout=self.signaling_timeout + 60
+                playback.connect(media=True, allow_wake=True),
+                timeout=self.signaling_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS,
             )
             return await self._wait_cancelable(
                 playback.download_thumbnail(start=start, end=end),
@@ -1355,12 +1356,12 @@ class NativeRelayRuntimeSession:
     async def _event_recordings_for_day(self, day: date) -> list[dict[str, Any]]:
         playback = self.playback_factory(self.config, self.app_session)
         try:
-            await asyncio.wait_for(
-                playback.connect(media=False, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
-                timeout=self.signaling_timeout + 60,
+            await self._wait_cancelable(
+                playback.connect(media=False, allow_wake=True, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS,
             )
             try:
-                page = await asyncio.wait_for(
+                page = await self._wait_cancelable(
                     playback.query_event_recordings(day),
                     timeout=self.signaling_timeout,
                 )
@@ -1383,16 +1384,16 @@ class NativeRelayRuntimeSession:
             self.app_session,
         )
         try:
-            await asyncio.wait_for(
-                playback.connect(media=False, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
-                timeout=self.signaling_timeout + 60,
+            await self._wait_cancelable(
+                playback.connect(media=False, allow_wake=True, **_offer_retry_options(ON_DEMAND_OFFER_RETRIES.get())),
+                timeout=self.signaling_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS,
             )
             results: list[tuple[date, list[dict[str, Any]]]] = []
             for day in days:
                 if self._cancelled():
                     raise NativeRelayRuntimeError("Native catalog was cancelled")
                 try:
-                    page = await asyncio.wait_for(
+                    page = await self._wait_cancelable(
                         playback.query_recordings(day),
                         timeout=self.signaling_timeout,
                     )
