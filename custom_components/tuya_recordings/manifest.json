@@ -10,5 +10,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Wheemer/tuya-recordings/issues",
   "requirements": ["aiomqtt>=2.0.0", "av>=14.0.0", "tinytuya==1.20.0"],
-  "version": "0.4.13-21"
+  "version": "0.4.13-22"
 }
