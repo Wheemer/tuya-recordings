@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-22 (2026-11-12)
+
+### Camera Connection
+
+- Match the Smart Life native SDK's concurrent signaling-endpoint handshakes, so an endpoint that accepts TCP but never completes authentication does not block working alternatives.
+- Keep the handshake deadline bounded, close unused connections, and report endpoint outcomes without exposing server addresses or credentials. Video and audio remain LAN-only.
+
+### Local Caching
+
+- Separate catalog-refresh and recording-transfer time budgets, so slow catalog queries do not consume the time available for downloading a recording.
+- Let an active transfer finish within its recording-duration allowance instead of cancelling it at the background pass limit. The pass yields before starting more work; existing media liveness checks and pause/cancellation controls remain in place.
+
 ## Tuya Recordings v0.4.13-21 (2026-11-12)
 
 ### SD Playback
