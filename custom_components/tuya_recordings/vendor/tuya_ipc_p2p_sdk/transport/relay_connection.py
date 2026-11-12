@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..const import LOGGER
@@ -82,12 +83,82 @@ class RelayConnection:
         self._handshake_status: int | None = None
         self._socket_errno: int | None = None
         self._endpoint_attempts = 0
+        self._endpoint_results: dict[int, str] = {}
         self._received_attributes = 0
         self._multi_attribute_frames = 0
         self._last_data_attributes = 0
         self._empty_data_frames = 0
 
     async def async_connect(self) -> None:
+        """Race advertised signaling endpoints as IMM's 001bdc5c does."""
+        endpoints = self._token.endpoints
+        if len(endpoints) > 16:
+            raise TuyaIpcP2pProtocolError("Too many signaling endpoints")
+        if len(endpoints) == 1:
+            try:
+                async with asyncio.timeout(_HANDSHAKE_TIMEOUT_SECONDS):
+                    await self._async_connect_single()
+            except BaseException as error:
+                if isinstance(error, TimeoutError):
+                    self._failure = "dial_timeout" if self._phase == "dial" else "handshake_timeout"
+                await self.async_close()
+                raise
+        else:
+            candidates = [RelayConnection(
+                replace(self._token, urls=[f"{host}:{port}"]), self._signer,
+                self._device_id, self._uid, self._media_key,
+            ) for host, port in endpoints]
+            tasks = [asyncio.create_task(candidate._async_connect_single()) for candidate in candidates]
+            self._endpoint_attempts = len(tasks)
+            winner = None
+            last_error = None
+            try:
+                async with asyncio.timeout(_HANDSHAKE_TIMEOUT_SECONDS):
+                    pending = set(tasks)
+                    while pending and winner is None:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in tasks:
+                            if task not in done:
+                                continue
+                            try:
+                                task.result()
+                            except Exception as error:
+                                last_error = error
+                            else:
+                                winner = candidates[tasks.index(task)]
+                                break
+                    if winner is None:
+                        raise last_error or TuyaIpcP2pConnectionError("No signaling handshake completed")
+            except BaseException as error:
+                diagnostic = next((candidate for candidate in candidates if candidate._reader is not None), candidates[0])
+                self._copy_handshake_diagnostics(diagnostic)
+                if isinstance(error, TimeoutError):
+                    self._failure = "handshake_timeout"
+                raise
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._endpoint_results = {
+                    index: candidate._failure if candidate._failure != "none" else candidate._phase
+                    for index, candidate in enumerate(candidates)
+                }
+                if winner is not None:
+                    self._reader, self._writer = winner._reader, winner._writer
+                    winner._reader = winner._writer = None
+                    self._copy_handshake_diagnostics(winner)
+                await asyncio.gather(*(candidate.async_close() for candidate in candidates))
+        self._phase = "ready"
+        self._reader_task = asyncio.create_task(self._async_read_loop())
+        self._keepalive_task = asyncio.create_task(self._async_keepalive_loop())
+
+    def _copy_handshake_diagnostics(self, source: RelayConnection) -> None:
+        for name in ("_received_frames", "_decode_failures", "_phase", "_failure",
+                     "_read_stage", "_read_expected", "_read_partial", "_handshake_status", "_socket_errno"):
+            setattr(self, name, getattr(source, name))
+
+    async def _async_connect_single(self) -> None:
         """Dial the relay, run the handshake, and start carrying media."""
         if len(self._token.credential) < _CREDENTIAL_KEY_LENGTH:
             raise TuyaIpcP2pProtocolError("Failed to dial the relay: credential too short")
@@ -117,12 +188,13 @@ class RelayConnection:
                 await self._async_handshake()
         except BaseException as error:
             if self._failure == "none":
-                self._failure = "handshake_timeout" if isinstance(error, TimeoutError) else "handshake_rejected"
+                self._failure = (
+                    "cancelled" if isinstance(error, asyncio.CancelledError) else
+                    "handshake_timeout" if isinstance(error, TimeoutError) else "handshake_rejected"
+                )
             await self.async_close()
             raise
         self._phase = "ready"
-        self._reader_task = asyncio.create_task(self._async_read_loop())
-        self._keepalive_task = asyncio.create_task(self._async_keepalive_loop())
 
     async def _async_handshake(self) -> None:
         """Run the four-message challenge-response."""
@@ -305,6 +377,7 @@ class RelayConnection:
             f"read_expected={self._read_expected}, read_partial={self._read_partial}, "
             f"handshake_status={self._handshake_status}, socket_errno={self._socket_errno}"
             f", endpoint_attempts={self._endpoint_attempts}"
+            f", endpoint_results={self._endpoint_results or 'none'}"
         )
 
     def _notify_closed(self, error: Exception | None) -> None:
@@ -333,5 +406,6 @@ class RelayConnection:
         if writer is not None:
             writer.close()
             with contextlib.suppress(Exception):
-                await writer.wait_closed()
+                async with asyncio.timeout(2):
+                    await writer.wait_closed()
         self._notify_closed(None)

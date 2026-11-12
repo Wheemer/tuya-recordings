@@ -8,6 +8,7 @@ import re
 import io
 import queue
 from fractions import Fraction
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import date
 
@@ -68,7 +69,7 @@ def decodable_media():
 
 
 @pytest.mark.asyncio
-async def test_signaling_tries_secondary_endpoint_only_after_dial_failure():
+async def test_signaling_can_complete_when_another_endpoint_cannot_dial():
     async with Peer("answer") as peer:
         value = token(peer.port).raw.copy()
         value["urls"] = ["tcp4:127.0.0.1:0"]
@@ -87,6 +88,41 @@ async def test_signaling_tries_secondary_endpoint_only_after_dial_failure():
                     await asyncio.sleep(0.001)
             assert c._connection._endpoint_attempts == 2
             assert peer.opened == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await c.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_endpoint_race_silence_and_cancellation_close_every_socket(monkeypatch, cancel):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import relay_connection
+    monkeypatch.setattr(relay_connection, "_HANDSHAKE_TIMEOUT_SECONDS", 0.08)
+    async with Peer("stall_handshake") as first, Peer("stall_handshake") as second:
+        first.key = second.key = OFFER_KEY
+        value = token(first.port).raw.copy()
+        value["urlsEx"] = [f"tcp4:127.0.0.1:{second.port}"]
+        c = NativeCommandSignaling(
+            token=RelayToken.from_json(value), device_id="camera-device", uid="account-uid",
+            session_id="session", key=OFFER_KEY, transmit_direct=lambda _: None, on_signal=lambda _: None,
+        )
+        task = asyncio.create_task(c._connection.async_connect())
+        try:
+            if cancel:
+                async with asyncio.timeout(1):
+                    while first.opened != 1 or second.opened != 1:
+                        await asyncio.sleep(0.001)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(TimeoutError):
+                    await task
+            assert c._connection._endpoint_attempts == 2
+            assert c._connection._reader_task is None
+            assert c._connection._keepalive_task is None
+            assert not first.offers and not second.offers
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -368,8 +404,11 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
-    + [("play_mode", True, False), ("checked_peer_udp", True, False)])
+    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
+    endpoint_race = mode == "endpoint_race"
+    if endpoint_race:
+        mode = "answer"
     alternate_peer = mode == "checked_peer_udp"
     play_mode = mode == "play_mode" or alternate_peer
     if alternate_peer:
@@ -400,10 +439,14 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         work = submitted[0]
         assert work.allow_wake and not work.retry_offer
         connect_options = {"allow_wake": work.allow_wake, "retry_offer": work.retry_offer}
-    async with Peer("silent" if mode.startswith("no_answer_udp") else "batched_answer" if mode == "udp_answer" else "answer" if mode in {"offline_report_http", "qos1_wake"} else mode) as peer:
+    async with Peer("silent" if mode.startswith("no_answer_udp") else "batched_answer" if mode == "udp_answer" else "answer" if mode in {"offline_report_http", "qos1_wake"} else mode) as peer, AsyncExitStack() as endpoints:
         config = camera_config()
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
+        if endpoint_race:
+            silent = await endpoints.enter_async_context(Peer("stall_handshake"))
+            source["p2pConfig"]["tcpRelay"]["urls"] = [f"tcp4:127.0.0.1:{silent.port}"]
+            source["p2pConfig"]["tcpRelay"]["urlsEx"] = [f"tcp4:127.0.0.1:{peer.port}"]
         config = replace(config, token=json.dumps(source["p2pConfig"]), config_json=json.dumps(source), app_profile_id=profile)
         if play_mode:
             config = replace(config, skill='{"localStorage":128}')
@@ -447,6 +490,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
 
         session = playback.NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
         peer.key = session._local.aes_key
+        if endpoint_race:
+            silent.key = peer.key
         receive_key = peer.key if mode.startswith("no_answer_udp") else ANSWER_KEY
         events = []
         udp_transport = None

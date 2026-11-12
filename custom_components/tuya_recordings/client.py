@@ -1320,7 +1320,7 @@ class TuyaRecordingsClient:
             return {"enabled": self.media_sync_enabled, "running": True}
         deadline = Deadline(MEDIA_SYNC_CAMERA_PASS_TIMEOUT)
         try:
-            with camera_work_scope(Cancellation(cancellation, self.media_work_cancellation(), deadline)) as cancellation:
+            with camera_work_scope(Cancellation(cancellation, self.media_work_cancellation())) as cancellation:
                 return self._sync_recordings(cancellation, deadline)
         finally:
             self._media_sync_lock.release()
@@ -1343,11 +1343,16 @@ class TuyaRecordingsClient:
         current_device = None
         failures_changed = False
         state = "idle"
+        operation_deadline = deadline
         try:
             check_cancelled()
             result["recovered_partials"] = self._recover_interrupted_media_sync()
-            index = self.refresh_recent_recordings()
+            with camera_work_scope(deadline):
+                index = self.refresh_recent_recordings()
             check_cancelled()
+            # Catalog failures must not consume the transfer's time allowance.
+            deadline = Deadline(MEDIA_SYNC_CAMERA_PASS_TIMEOUT)
+            operation_deadline = deadline
             clips = sorted(
                 [(str(camera["devId"]), clip) for camera in index.get("cameras", []) if camera.get("devId")
                  for clip in camera.get("clips", [])
@@ -1365,6 +1370,9 @@ class TuyaRecordingsClient:
             attempts: dict[str, int] = {}
             for position, (dev_id, clip) in enumerate(clips, start=1):
                 check_cancelled()
+                if deadline.is_set():
+                    result["yielded"] = True
+                    break
                 current_device = dev_id
                 start, end = int(clip["start"]), int(clip["end"])
                 key = (dev_id, start, end)
@@ -1390,7 +1398,11 @@ class TuyaRecordingsClient:
                                            current={"dev_id": dev_id, "start": start, "end": end,
                                                     "position": position, "total": len(desired_clips)})
                 try:
-                    self.download_clip(dev_id, start, end, output_path, verify_clip=False, log_traceback=False)
+                    # Playback-backed caching may run in real time. The native
+                    # first-frame/idle guards still bound a silent camera.
+                    operation_deadline = Deadline(max(MEDIA_SYNC_CAMERA_PASS_TIMEOUT, end - start + MEDIA_SYNC_CAMERA_PASS_TIMEOUT))
+                    with camera_work_scope(operation_deadline):
+                        self.download_clip(dev_id, start, end, output_path, verify_clip=False, log_traceback=False)
                     check_cancelled()
                 except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
                     raise
@@ -1412,7 +1424,7 @@ class TuyaRecordingsClient:
                 result.update(self.cleanup_cached_media(desired_clips, cutoff))
         except CameraWorkCancelled:
             result["cancelled"] = True
-            if deadline.is_set():
+            if operation_deadline.is_set():
                 state = "stalled"
                 result["timed_out"] = True
                 result["stalled_cameras"] = [current_device] if current_device else []
