@@ -86,13 +86,11 @@ def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manu
                     worker.catalog([date(2026, 11, 3)], None, events=kind == "events", months=kind == "month")
         assert calls == [{
             "media": kind in {"clip", "timeline"},
-            **({"allow_wake": True} if kind in {"timeline", "day"} else {}),
+            "allow_wake": True,
             **({"retry_offer": True} if manual and kind != "thumbnail" else {}),
         }]
         from custom_components.tuya_recordings.lib.native_relay_playback import WAKE_SLOT_TIMEOUT_SECONDS
-        assert deadlines == [worker._command_timeout + 60 + (
-            WAKE_SLOT_TIMEOUT_SECONDS if kind in {"timeline", "day"} else 0
-        )]
+        assert deadlines == [worker._command_timeout + 60 + WAKE_SLOT_TIMEOUT_SECONDS]
     finally:
         worker.close()
         assert worker.wait_closed(2)
@@ -215,6 +213,109 @@ def test_month_inventory_uses_metadata_worker_without_starting_media():
     finally:
         worker.close()
         assert worker.wait_closed(2)
+
+
+def test_repeated_pool_lifecycle_recovers_after_failed_and_cancelled_connections():
+    instances = []
+    action = "catalog"
+    cancellation = None
+    pool = NativeRelayRuntimePool(APP_SESSION)
+
+    class LifecyclePlayback(ReusablePlayback):
+        async def connect(self, **kwargs):
+            assert kwargs.get("allow_wake") is True
+            assert all(item.closed for item in instances if item is not self)
+            if action == "cancel":
+                cancellation.set()
+                await asyncio.Event().wait()
+            if action == "fail":
+                raise NativeRelayRuntimeError("fixture peer refused connection")
+            await super().connect(**kwargs)
+
+        async def query_recording_days(self, month):
+            return [month.replace(day=2)]
+
+    def factory(*args):
+        value = LifecyclePlayback()
+        instances.append(value)
+        return value
+
+    pool._playback_factory = factory
+    config = camera_config()
+    workers = []
+    try:
+        for cycle in range(3):
+            config = replace(config, trace_id=f"lifecycle-{cycle}")
+            for action in ("catalog", "cancel", "catalog", "fail", "month", "events", "timeline", "catalog"):
+                cancellation = threading.Event()
+                session = pool.session(config, cancellation)
+                worker = session.command_worker
+                if worker not in workers:
+                    workers.append(worker)
+                    assert all(not old._thread.is_alive() for old in workers[:-1])
+                try:
+                    if action in {"cancel", "fail"}:
+                        with pytest.raises(NativeRelayRuntimeError, match="cancelled|refused"):
+                            session.recordings_for_day(date(2026, 11, 12))
+                    elif action == "month":
+                        assert session.recording_days_for_month(date(2026, 11, 1)) == [date(2026, 11, 2)]
+                    elif action == "events":
+                        assert session.event_recordings_for_day(date(2026, 11, 12))
+                    elif action == "timeline":
+                        commands = queue.Queue()
+                        commands.put(("stop", None))
+                        session.start_interactive_playback_stream(
+                            NativePlaybackRequest(start=100, end=110), commands, lambda event: None,
+                        )
+                    else:
+                        assert session.recordings_for_day(date(2026, 11, 12))
+                finally:
+                    session.close()
+                assert all(item.closed for item in instances)
+                assert not getattr(worker, "_unfinished_transport", None)
+    finally:
+        pool.close()
+    assert len(instances) == 24
+    assert all(not worker._thread.is_alive() for worker in workers)
+
+
+@pytest.mark.parametrize("worker_type", [NativeRelayStreamWorker, NativeRelayPlaybackWorker])
+def test_stream_connection_cancellation_closes_the_transport(worker_type):
+    cancelled = threading.Event()
+    class Connecting(ReusablePlayback):
+        async def connect(self, **kwargs):
+            assert kwargs.get("allow_wake") is True
+            cancelled.set()
+            await asyncio.Event().wait()
+    transport = Connecting()
+    worker = worker_type(camera_config(), APP_SESSION, playback_factory=lambda *args: transport)
+    try:
+        with pytest.raises(NativeRelayRuntimeError, match="cancelled"):
+            worker.stream(NativePlaybackRequest(start=100, end=110), lambda event: None, cancelled)
+        assert transport.closed
+    finally:
+        worker.close()
+        assert worker.wait_closed(2)
+
+
+@pytest.mark.parametrize("event_catalog", [False, True])
+def test_one_shot_catalog_cancels_connection_and_releases_transport(event_catalog):
+    cancellation = threading.Event()
+    class Connecting(ReusablePlayback):
+        async def connect(self, **kwargs):
+            assert kwargs.get("allow_wake") is True
+            cancellation.set()
+            await asyncio.Event().wait()
+    transport = Connecting()
+    session = NativeRelayRuntimeSession(
+        camera_config(), app_session=APP_SESSION, cancel_event=cancellation,
+        playback_factory=lambda *args: transport,
+    )
+    query = session.event_recordings_for_day if event_catalog else session.recordings_for_day
+    with pytest.raises(NativeRelayRuntimeError, match="cancelled"):
+        query(date(2026, 11, 12))
+    assert transport.closed
+    session.close()
 
 
 def camera_config():

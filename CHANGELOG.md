@@ -1,5 +1,23 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-20 (2026-11-12)
+
+### Camera Connection
+
+- Re-evaluate LAN SD-status access after waking a sleeping camera, instead of retaining an earlier failed connection attempt.
+- Apply the same SD-readiness preparation to recording catalogs, calendar and event queries, clip playback, and thumbnail connections.
+- Follow the Smart Life APK's wake-before-query sequence and current LAN-first route selection. Existing wake cooldowns and LAN-only video remain in place.
+
+### Playback and Recovery
+
+- Prevent teardown from resending playback-stop commands after a timeout, rejection, or cancellation.
+- Honor cancellation during camera connection and catalog queries, and bound clip-worker stop cleanup.
+- Clear the correct background-pause state when a browser playback handoff is cancelled or fails.
+
+### Diagnostics
+
+- Report LAN SD-status connection attempts and connection failures without exposing addresses, credentials, or DP values.
+
 ## Tuya Recordings v0.4.13-19 (2026-11-11)
 
 ### SD Status

@@ -227,6 +227,9 @@ class NativeRelayPlaybackSession:
         self._sd_status_prepared = False
         self._sd_wake_reserved = False
         self._sd_lan_prechecked = False
+        self._sd_lan_attempts = 0
+        self._sd_lan_connect_failures = 0
+        self._stop_incomplete = False
         self._sd_status_signaling_details = "not_used"
         self._sd_status_deadline: float | None = None
         self._session: DirectSession | None = None
@@ -375,6 +378,8 @@ class NativeRelayPlaybackSession:
             f"sd_status_report_route={self._sd_status_report_route}, "
             f"sd_status_send_route={self._sd_status_send_route}, "
             f"sd_status_route_basis={self._sd_status_route_basis}, "
+            f"sd_status_lan_attempts={self._sd_lan_attempts}, "
+            f"sd_status_lan_connect_failures={self._sd_lan_connect_failures}, "
             f"sd_status_inventory_route={'mqtt' if config.sd_status_mqtt_dp else 'http' if config.sd_status_http_dp else 'none'}, "
             f"sd_status_online_report={getattr(self._moto, 'device_online', None)}, "
             f"sd_status_dispatch={getattr(self._moto, 'dp_query_dispatch', self._sd_status_dispatch) if self._sd_status_send_route == 'mqtt' else self._sd_status_dispatch}"
@@ -884,6 +889,10 @@ class NativeRelayPlaybackSession:
             if send_wake:
                 self._connector_wake_sent = True
                 self._wake_status = "sent_unconfirmed"
+                # getDp selects the live route after justSendAwakeDevice.
+                # A failed cooldown probe describes the sleeping peer, not
+                # whether LAN can dispatch after this newly published wake.
+                self._sd_lan_prechecked = False
         # Wake publication is not the SD query's completion callback. The APK
         # still dispatches getDp; throttling a repeat wake must not bypass it.
         if report is not None and report.done():
@@ -961,6 +970,7 @@ class NativeRelayPlaybackSession:
     async def _try_lan_sd_status(self, dp: str, deadline: float, moto: MotoClient) -> bool:
         """Return false only when LAN could not dispatch the query."""
         config = self._native_config
+        self._sd_lan_attempts += 1
         self._lan_answer_attempted = True
         lan = Lan302Client(
             uid=self._uid, device_id=config.dev_id, session_id=self.local_cid,
@@ -981,6 +991,7 @@ class NativeRelayPlaybackSession:
                 try:
                     await lan.async_connect()
                 except (NativeLanUnavailableError, OSError):
+                    self._sd_lan_connect_failures += 1
                     self._sd_status_query = "lan_unavailable"
                     self._sd_status_dispatch = "not_sent"
                     return False
@@ -1377,6 +1388,8 @@ class NativeRelayPlaybackSession:
         play_mode_supported: bool,
     ) -> None:
         """Issue StartPlayBack without replacing the connected camera object."""
+        if self._stop_incomplete:
+            raise NativeRelayPlaybackError("Previous playback stop did not complete; close the transport")
         del speed
         stream_id = playback_stream_id(task_id=self._next_task_id, request_id=self._next_request_id)
         if self._video is None or self._audio is None:
@@ -1431,6 +1444,8 @@ class NativeRelayPlaybackSession:
 
     async def pause(self) -> None:
         """Pause playback on the active SDK stream."""
+        if self._stop_incomplete:
+            raise NativeRelayPlaybackError("Previous playback stop did not complete; close the transport")
         self._require_connected()
         if not self._playback_started or self._playback_paused:
             return
@@ -1442,6 +1457,8 @@ class NativeRelayPlaybackSession:
 
     async def resume(self) -> None:
         """Resume playback on the active SDK stream."""
+        if self._stop_incomplete:
+            raise NativeRelayPlaybackError("Previous playback stop did not complete; close the transport")
         self._require_connected()
         if not self._playback_started or not self._playback_paused:
             return
@@ -1462,12 +1479,15 @@ class NativeRelayPlaybackSession:
         """Stop active SD playback using the native SDK's ordered commands."""
         if not self._playback_started:
             return
+        if self._stop_incomplete:
+            raise NativeRelayPlaybackError("Previous playback stop did not complete; close the transport")
         self._require_connected()
         stream_id = self._stream_id
         if stream_id is None:
             raise NativeRelayPlaybackError("Active playback has no stream ID")
         request_id = self._allocate_request_id()
         media_stop, _ = encode_playback_stop(stream_id=request_id, channel=0)
+        self._stop_incomplete = True
         self._send_control(media_stop)
         # AsyncSendCommand queues both operations; its immediate return is
         # not the camera's completion callback.
@@ -1476,6 +1496,7 @@ class NativeRelayPlaybackSession:
         )
         self._send_control(playback_stop)
         await self._wait_for_control_response(request_id, (7, 3))
+        self._stop_incomplete = False
         self._playback_started = False
         self._playback_paused = False
         self._stream_id = None
@@ -1506,7 +1527,7 @@ class NativeRelayPlaybackSession:
                 and self._answer_mqtt is None and self._ice is None and not self._candidate_tasks
                 and self._command is None and self._command_task is None):
             return
-        if self._connected and self._playback_started:
+        if self._connected and self._playback_started and not self._stop_incomplete:
             with suppress(Exception):
                 await _bounded_cleanup(self.stop())
         self._closed = True

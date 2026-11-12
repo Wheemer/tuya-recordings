@@ -1,5 +1,7 @@
 import threading
 import time
+import asyncio
+import pytest
 from types import SimpleNamespace
 
 from custom_components.tuya_recordings import http as recordings_http
@@ -26,6 +28,59 @@ def test_background_cancellation_uses_generations():
     assert client.background_work_paused is False
     assert running.is_set() is True
     assert client.background_work_cancellation().is_set() is False
+
+
+@pytest.mark.parametrize("failure", ["cancelled", "timeout", "socket_close"])
+def test_cancelled_handoff_releases_pause_without_unlocking_previous_owner(monkeypatch, failure):
+    async def exercise():
+        client = TuyaRecordingsClient({})
+        entry = {"client": client}
+        domain = {"entry": entry}
+        hass = SimpleNamespace(data={DOMAIN: domain}, loop=asyncio.get_running_loop())
+        lock = asyncio.Lock()
+        await lock.acquire()
+        if failure == "timeout":
+            monkeypatch.setattr(recordings_http, "_PLAYBACK_HANDOFF_TIMEOUT", 0.01)
+        if failure == "socket_close":
+            class BrokenSocket:
+                closed = False
+                async def close(self, **kwargs):
+                    raise ConnectionResetError("fixture old browser disconnected")
+            monkeypatch.setattr(recordings_http.web, "WebSocketResponse", BrokenSocket)
+            domain[recordings_http._DATA_PLAYBACK_WS] = BrokenSocket()
+        for _ in range(3):
+            generation, stop = recordings_http._claim_playback_handoff(domain)
+            recordings_http._pause_background_camera_work(hass, client, generation)
+            waiting = asyncio.create_task(recordings_http._acquire_playback_lock(
+                hass, client, domain, lock, generation, stop,
+            ))
+            await asyncio.sleep(0)
+            if failure != "socket_close":
+                assert client.background_work_paused
+            if failure == "cancelled":
+                waiting.cancel()
+            try:
+                await waiting
+            except (asyncio.CancelledError, TimeoutError, ConnectionResetError):
+                pass
+            else:
+                raise AssertionError("Expected cancelled handoff")
+            assert lock.locked(), "A waiter must not unlock the previous owner"
+            assert stop.is_set()
+            assert not client.background_work_paused
+            assert DATA_INTERACTIVE_PLAYBACK_ACTIVE not in entry
+            assert recordings_http._DATA_PLAYBACK_STOP not in domain
+        lock.release()
+        domain.pop(recordings_http._DATA_PLAYBACK_WS, None)
+        generation, stop = recordings_http._claim_playback_handoff(domain)
+        recordings_http._pause_background_camera_work(hass, client, generation)
+        await recordings_http._acquire_playback_lock(hass, client, domain, lock, generation, stop)
+        assert lock.locked()
+        lock.release()
+        recordings_http._resume_background_camera_work(hass, client, generation)
+        assert not client.background_work_paused
+
+    asyncio.run(exercise())
 
 
 def test_playback_pause_clears_queued_work_without_using_master_pause():

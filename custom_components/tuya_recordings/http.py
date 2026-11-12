@@ -515,6 +515,25 @@ def _resume_background_camera_work(
         client.resume_background_work()
 
 
+async def _acquire_playback_lock(hass, client, domain_data, lock, generation, stop_event):
+    """A cancelled handoff must not strand its background-pause generation."""
+    try:
+        async with asyncio.timeout(_PLAYBACK_HANDOFF_TIMEOUT):
+            active_ws = domain_data.get(_DATA_PLAYBACK_WS)
+            if isinstance(active_ws, web.WebSocketResponse) and not active_ws.closed:
+                await active_ws.close(
+                    code=WSCloseCode.GOING_AWAY,
+                    message=b"Playback moved to a newer request",
+                )
+            await lock.acquire()
+    except BaseException:
+        stop_event.set()
+        if domain_data.get(_DATA_PLAYBACK_STOP) is stop_event:
+            domain_data.pop(_DATA_PLAYBACK_STOP, None)
+        _resume_background_camera_work(hass, client, generation)
+        raise
+
+
 def _clip_title(start: int, end: int) -> str:
     return f"{datetime.fromtimestamp(start):%H:%M:%S} - {datetime.fromtimestamp(end):%H:%M:%S}"
 
@@ -751,9 +770,8 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         generation, stop_event = _claim_playback_handoff(domain_data)
         _pause_background_camera_work(self.hass, client, generation)
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=_PLAYBACK_HANDOFF_TIMEOUT)
+            await _acquire_playback_lock(self.hass, client, domain_data, lock, generation, stop_event)
         except TimeoutError as err:
-            _resume_background_camera_work(self.hass, client, generation)
             raise web.HTTPServiceUnavailable(
                 reason="Previous Tuya recording playback did not close cleanly"
             ) from err
@@ -960,23 +978,15 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
         lock = domain_data.setdefault(_DATA_PLAYBACK_LOCK, asyncio.Lock())
         generation, stop_event = _claim_playback_handoff(domain_data)
         _pause_background_camera_work(self.hass, client, generation)
-        active_ws = domain_data.get(_DATA_PLAYBACK_WS)
-        if isinstance(active_ws, web.WebSocketResponse) and not active_ws.closed:
-            # Waking only the camera producer is insufficient: the superseded
-            # request can remain blocked in its WebSocket receive loop and keep
-            # the playback lock forever. Closing its socket lets that handler
-            # run cleanup and release the lock before this session starts.
-            await active_ws.close(
-                code=WSCloseCode.GOING_AWAY,
-                message=b"Playback moved to a newer request",
-            )
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=_PLAYBACK_HANDOFF_TIMEOUT)
+            await _acquire_playback_lock(self.hass, client, domain_data, lock, generation, stop_event)
         except TimeoutError:
-            _resume_background_camera_work(self.hass, client, generation)
             await ws.send_json({"type": "error", "message": "Previous playback did not close"})
             await ws.close()
             return ws
+        except BaseException:
+            await ws.close()
+            raise
 
         # A newer browser request may have superseded this one while it was
         # waiting for the older session to release the serialized camera.
