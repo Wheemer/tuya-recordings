@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-24 (2026-11-13)
+
+### SD Playback
+
+- Follow the Smart Life native SDK's audio-led timing when a recording fragment changes its clock. Keep video and audio synchronized across forward gaps, backwards resets, and timestamp-scale changes without transcoding.
+- Preserve each completed H.264 frame's own timestamp scale and reject oversized MP4 packet durations before they reach the muxer.
+- Keep the timeline on the recording's camera time while the player uses a continuous media clock. Clear fragment clock mappings when seeking to a new stream.
+
+### Local Caching
+
+- Apply the same shared video and audio clock handling when remuxing recordings into local copies. Encoded video and audio remain unchanged.
+
 ## Tuya Recordings v0.4.13-23 (2026-11-13)
 
 ### SD Playback
