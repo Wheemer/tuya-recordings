@@ -26,6 +26,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   let audioTimestampScaleHint = null;
   let firstVideoTimestamp = null;
   let videoTimestampScaleHint = null;
+  let cameraClockMappings = [];
   let aacElement = null;
   let aacObjectUrl = '';
   let aacNode = null;
@@ -68,9 +69,14 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   const setLoading = loading => {
     player?.elements?.container?.classList.toggle('plyr--loading', Boolean(loading));
   };
-  const position = () => continuous
-    ? offset + (Number(video.currentTime) || 0)
-    : Math.min(clip.duration, offset + (Number(video.currentTime) || 0));
+  const position = () => {
+    const time = Number(video.currentTime) || 0;
+    if (continuous) {
+      const anchor = cameraClockMappings.findLast(item => item.mediaTime <= time);
+      return offset + (anchor ? anchor.cameraTime + time - anchor.mediaTime : time);
+    }
+    return Math.min(clip.duration, offset + time);
+  };
   const clearScheduledAudio = () => {
     for (const source of audioSources) {
       try { source.stop(); } catch (_error) {}
@@ -113,6 +119,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   };
   const release = () => {
     releasing = true;
+    cameraClockMappings = [];
     setLoading(false);
     if (waitingTimer !== null) clearTimeout(waitingTimer);
     waitingTimer = null;
@@ -521,6 +528,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           continue;
         }
         activeSegmentGeneration = generation;
+        cameraClockMappings = [];
         segmentPosition = position;
         expectedTimelinePosition = null;
         if (magicRead) {
@@ -638,6 +646,21 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           if (payload.length !== 4) throw new Error('Camera video format is invalid');
           videoTimestampScaleHint = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(0);
           if (!videoTimestampScaleHint || videoTimestampScaleHint > 1000000) throw new Error('Camera video clock is invalid');
+        } else if (kind === 9) {
+          if (payload.length !== 16) throw new Error('Camera recording clock is invalid');
+          const clock = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+          const mediaTime = clock.getFloat64(0), cameraTime = clock.getFloat64(8);
+          const previous = cameraClockMappings.at(-1);
+          if (!Number.isFinite(mediaTime) || !Number.isFinite(cameraTime) || mediaTime < 0
+              || cameraTime < 0 || (previous && mediaTime <= previous.mediaTime)) {
+            throw new Error('Camera recording clock is invalid');
+          }
+          cameraClockMappings.push({ mediaTime, cameraTime });
+          // Retain the current anchor and bounded future fragment mappings.
+          while (cameraClockMappings.length > 1 && cameraClockMappings[1].mediaTime <= video.currentTime) {
+            cameraClockMappings.shift();
+          }
+          if (cameraClockMappings.length > 256) throw new Error('Camera recording clock exceeded its buffer limit');
         } else if (kind === 3) {
           streamComplete = true;
           debug('stream-complete', {

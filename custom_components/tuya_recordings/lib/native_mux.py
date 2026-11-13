@@ -21,7 +21,10 @@ from .native_frames import (
     NativePlaybackFrameType,
     validate_playback_frame_event,
 )
-from .native_packet_cache import PACKET_HEADER, TimestampedVideoMuxer, TimestampedAacMuxer, mux_camera_packets
+from .native_packet_cache import (
+    PACKET_HEADER, NativePresentationClock, TimestampedVideoMuxer,
+    TimestampedAacMuxer, mux_camera_packets,
+)
 
 
 class NativeMuxError(RuntimeError):
@@ -83,6 +86,7 @@ BROWSER_STREAM_AUDIO_FORMAT = 5
 BROWSER_STREAM_AUDIO_G711A = 6
 BROWSER_STREAM_AUDIO_AAC_MP4 = 7
 BROWSER_STREAM_VIDEO_FORMAT = 8
+BROWSER_STREAM_CAMERA_CLOCK = 9
 _BROWSER_STREAM_HEADER = struct.Struct(">BQI")
 _BROWSER_STREAM_SEGMENT = struct.Struct(">IQ")
 _BROWSER_STREAM_AUDIO_FORMAT = struct.Struct(">IB")
@@ -113,6 +117,7 @@ class NativePlaybackMuxer:
     output_path: Path
     require_audio: bool = True
     protocol: int = NATIVE_PLAYBACK_EVENT_VERSION
+    _clock: NativePresentationClock = field(default_factory=NativePresentationClock, init=False, repr=False)
     _video_path: Path = field(init=False, repr=False)
     _audio_path: Path = field(init=False, repr=False)
     _temp_path: Path = field(init=False, repr=False)
@@ -239,6 +244,7 @@ class NativePlaybackMuxer:
         raise NativeMuxError(f"Unsupported native raw packet codec: {codec or 'unknown'}")
 
     def _record_packet(self, kind: int, data: bytes, info: dict[str, Any]) -> None:
+        info = _presentation_info(self._clock, kind, data, info)
         timestamp, scale = info.get("timestamp"), info.get("timestampScale", 1000)
         if type(timestamp) is not int or not 0 <= timestamp < 1 << 64 or type(scale) is not int or not 0 < scale <= 1_000_000:
             raise NativeMuxError("Native cached packet has invalid camera timing")
@@ -584,6 +590,7 @@ class NativePlaybackBrowserStreamMuxer:
     process_module: Any = subprocess
     pipe_factory: Any = os.pipe
     protocol: int = NATIVE_PLAYBACK_EVENT_VERSION
+    _clock: NativePresentationClock = field(default_factory=NativePresentationClock, init=False, repr=False)
     stream_header: bytes = BROWSER_STREAM_MAGIC + _BROWSER_STREAM_SEGMENT.pack(0, 0)
     _video_handle: Any = field(default=None, init=False, repr=False)
     _proc: Any = field(default=None, init=False, repr=False)
@@ -602,6 +609,10 @@ class NativePlaybackBrowserStreamMuxer:
     _packet_audio: Any = field(default=None, init=False, repr=False)
     _audio_codec: str = field(default="", init=False, repr=False)
     _first_audio_timestamp: int = field(default=0, init=False, repr=False)
+    _first_video_source: Fraction | None = field(default=None, init=False, repr=False)
+    _video_source_scale: int | None = field(default=None, init=False, repr=False)
+    _video_clock_offset: Fraction | None = field(default=None, init=False, repr=False)
+    _camera_clock_anchor: tuple[Fraction, Fraction] = field(default=(Fraction(0), Fraction(0)), init=False, repr=False)
 
     def __enter__(self) -> Self:
         self.open()
@@ -725,9 +736,32 @@ class NativePlaybackBrowserStreamMuxer:
                 # that can play audio while Chromium never renders video.
                 if not _has_h264_decoder_config(self._h264_parameter_sets) or not _has_h264_idr(data):
                     return False
-                self._first_video_timestamp = int(info.get("timestamp") or 0)
                 if not parameter_sets:
                     data = self._h264_parameter_sets + data
+            if "timestampScale" in info:
+                source_info = info
+                info = _presentation_info(self._clock, 1, data, info)
+                source = Fraction(source_info["timestamp"], source_info["timestampScale"])
+                source_scale = source_info["timestampScale"]
+                if self._first_video_source is None:
+                    self._first_video_source = source
+                    self._video_source_scale = source_scale
+                else:
+                    presented = Fraction(info["timestamp"], info["timestampScale"])
+                    clock_offset = source - presented
+                    if clock_offset != self._video_clock_offset and source_scale == self._video_source_scale:
+                        media_time = presented - Fraction(self._first_video_timestamp, info["timestampScale"])
+                        camera_time = source - self._first_video_source
+                        old_media, old_camera = self._camera_clock_anchor
+                        if camera_time >= old_camera + media_time - old_media:
+                            self._emit_record(BROWSER_STREAM_CAMERA_CLOCK, 0,
+                                              struct.pack(">dd", float(media_time), float(camera_time)))
+                            self._camera_clock_anchor = media_time, camera_time
+                    self._video_clock_offset = clock_offset
+                if self._video_clock_offset is None:
+                    self._video_clock_offset = source - Fraction(info["timestamp"], info["timestampScale"])
+            if not self._video_bytes:
+                self._first_video_timestamp = int(info.get("timestamp") or 0)
             self._video_info = info
             if not self._video_bytes and type(info.get("timestampScale")) is int:
                 self._emit_record(BROWSER_STREAM_VIDEO_FORMAT, 0, struct.pack(">I", info["timestampScale"]))
@@ -736,6 +770,8 @@ class NativePlaybackBrowserStreamMuxer:
         if self._audio_codec and self._audio_codec != codec:
             raise NativeMuxError("Camera changed audio codec during playback")
         self._audio_codec = codec
+        if "timestampScale" in info:
+            info = _presentation_info(self._clock, 2, data, info)
         if codec in {"aac", "mpeg4-generic"}:
             self._emit_audio_format(info)
             data = _aac_with_adts(data, info)
@@ -986,6 +1022,27 @@ class NativePlaybackInteractiveBrowserMuxer:
             muxer.stream_header = browser_stream_header(generation, position)
         muxer.open()
         self._muxer = muxer
+
+
+def _presentation_info(clock, kind, data, info):
+    duration = None
+    codec = _codec_name(info)
+    if kind == 2:
+        rate, channels = info.get("sampleRate"), info.get("channels")
+        if type(rate) is not int or rate <= 0 or type(channels) is not int or channels <= 0:
+            raise NativeMuxError("Native audio presentation clock requires a valid sample format")
+        if codec in {"aac", "mpeg4-generic"}:
+            duration = Fraction(1024, rate)
+        else:
+            width = 2 if codec == "pcm_s16le" else 1
+            duration = Fraction(len(data), width * channels * rate)
+    try:
+        timestamp, scale = clock.map(
+            kind, info.get("timestamp"), info.get("timestampScale", 1000), duration=duration,
+        )
+    except ValueError as err:
+        raise NativeMuxError(str(err)) from err
+    return {**info, "timestamp": timestamp, "timestampScale": scale}
 
 
 def _h264_nals(payload: bytes) -> tuple[bytes, ...]:

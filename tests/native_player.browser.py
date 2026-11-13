@@ -130,7 +130,7 @@ def main(audio_codec: str = "pcm_s16le") -> None:
             video_records += kind == 1
         record_bytes = stream[len(browser_stream_header()) : -len(record(BROWSER_STREAM_END, 0))]
         timeline_streams = {
-            "initial": browser_stream_header(1, 400) + record_bytes,
+            "initial": browser_stream_header(1, 400) + record(9, 0, struct.pack(">dd", 0.5, 60)) + record_bytes,
             # This arrives after the final seek was accepted. It must be
             # ignored wholesale, including its audio records.
             "stale": (
@@ -521,7 +521,7 @@ def main(audio_codec: str = "pcm_s16le") -> None:
                 )
                 try:
                     page.wait_for_function(
-                        "window.timelinePosition > 400.8",
+                        "window.timelinePosition > 460.1",
                         timeout=15_000,
                     )
                 except Exception:
@@ -576,6 +576,7 @@ def main(audio_codec: str = "pcm_s16le") -> None:
                     "window.timelinePosition > 502.2 && document.querySelector('video').currentTime > 0.2",
                     timeout=15_000,
                 )
+                assert page.evaluate("window.timelinePosition < 504"), "Seek retained the previous fragment's clock mapping"
                 page.wait_for_function(
                     "document.querySelector('video').buffered.length && document.querySelector('video').buffered.start(0) < 0.1",
                     timeout=5_000,
@@ -786,7 +787,7 @@ def main(audio_codec: str = "pcm_s16le") -> None:
     assert not report["paused"]
     assert report["status"] == ""
     assert ended == {"status": "Finished", "hasSource": False}
-    assert timeline["position"] > 400.8
+    assert timeline["position"] > 460.1
     assert timeline["status"] != "Finished"
     assert timeline["hasSource"] is True
     assert timeline["progress"] is False

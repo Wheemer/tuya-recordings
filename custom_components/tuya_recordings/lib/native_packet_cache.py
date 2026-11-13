@@ -1,8 +1,10 @@
 """Remux native callback packets with their camera clock; never encode frames."""
 
 from contextlib import ExitStack
+from dataclasses import dataclass
 from fractions import Fraction
 import io
+import logging
 from pathlib import Path
 import struct
 
@@ -11,6 +13,80 @@ import av
 PACKET_HEADER = struct.Struct(">BBQQI")
 MAX_PACKET_BYTES = 8 * 1024 * 1024
 RAW_AUDIO_FORMATS = {"pcm_s16le": "s16le", "g711u": "mulaw", "g711a": "alaw"}
+_LOGGER = logging.getLogger(__name__)
+_SD_CLOCK_GAP = Fraction(1050, 1000)
+
+
+@dataclass
+class _ClockTrack:
+    source: Fraction
+    presented: Fraction
+    interval: Fraction
+    offset: Fraction
+    epoch: int
+    scale: int
+
+
+class NativePresentationClock:
+    """Re-anchor discontinuous SD clocks without changing encoded media.
+
+    CameraSDK's SD no-drop dispatcher re-anchors a delay over 1049 ms using
+    its audio clock and frame cadence; its synchronizer also resets backwards
+    clocks. Share the new epoch between tracks, allowing queued old-fragment
+    packets on the other track to finish first.
+    """
+
+    def __init__(self):
+        self._tracks = {}
+        self._epoch = 0
+        self._offset = Fraction(0)
+        self._latest_source = None
+
+    def map(self, kind, timestamp, scale, *, duration=None):
+        if (type(timestamp) is not int or not 0 <= timestamp < 1 << 64
+                or type(scale) is not int or not 0 < scale <= 1_000_000):
+            raise ValueError("Native packet has invalid camera timing")
+        stamp = Fraction(timestamp, scale)
+        previous = self._tracks.get(kind)
+        interval = duration or (previous.interval if previous else Fraction(1, 25))
+        offset = previous.offset if previous else Fraction(0)
+        epoch = previous.epoch if previous else 0
+        delta = stamp - previous.source if previous else None
+        if previous and delta is not None and 0 < delta < _SD_CLOCK_GAP:
+            interval = duration or delta
+        elif previous:
+            if epoch != self._epoch and self._latest_source is not None and abs(stamp - self._latest_source) < _SD_CLOCK_GAP:
+                offset, epoch = self._offset, self._epoch
+            else:
+                audio = self._tracks.get(2)
+                end = audio.presented + audio.interval if audio else None
+                # Use the audio sample clock as master, rather than stretching
+                # a final video frame and introducing a hole in copied audio.
+                if end is None or end <= max(track.presented for track in self._tracks.values()):
+                    end = max(track.presented + track.interval for track in self._tracks.values())
+                self._epoch += 1
+                offset = self._offset = end - stamp
+                epoch = self._epoch
+                self._latest_source = stamp
+                if epoch <= 8:
+                    _LOGGER.debug(
+                        "Native presentation clock reset: track=%s epoch=%s previous=%s/%s source=%s/%s delta_seconds=%s",
+                        kind, epoch, previous.source.numerator, previous.source.denominator,
+                        timestamp, scale, float(delta),
+                    )
+        elif self._epoch and self._latest_source is not None and abs(stamp - self._latest_source) < _SD_CLOCK_GAP:
+            offset, epoch = self._offset, self._epoch
+        presented = stamp + offset
+        if previous and presented <= previous.presented:
+            raise ValueError("Native presentation clock could not reconcile overlapping fragments")
+        output_scale = previous.scale if previous else scale
+        value = round(presented * output_scale)
+        if not 0 <= value < 1 << 64:
+            raise ValueError("Native presentation timestamp is outside its wire range")
+        self._tracks[kind] = _ClockTrack(stamp, presented, interval, offset, epoch, output_scale)
+        if epoch == self._epoch:
+            self._latest_source = stamp
+        return value, output_scale
 
 
 class _ChunkWriter(io.RawIOBase):
@@ -33,6 +109,7 @@ class TimestampedVideoMuxer:
     def __init__(self, first_packet, callback):
         self.origin = None
         self.pending = None
+        self.pending_pts = None
         self.interval = 40000
         self.source = av.open(io.BytesIO(first_packet), format="h264")
         self.writer = _ChunkWriter(callback)
@@ -60,14 +137,18 @@ class TimestampedVideoMuxer:
         packet.stream = self.stream
         packet.is_keyframe = bool(keyframe)
         packet.time_base = Fraction(1, 1_000_000)
-        packet.pts = packet.dts = round((stamp - self.origin) * 1_000_000)
+        pts = round((stamp - self.origin) * 1_000_000)
+        packet.pts = packet.dts = pts
         if self.pending is not None:
-            interval = packet.pts - self.pending.pts
+            interval = pts - self.pending_pts
             if interval <= 0:
                 raise ValueError("Native video timestamps are not increasing")
+            if interval > 0x7fffffff:
+                raise ValueError(f"Native packet duration exceeds the MP4 limit: duration_us={interval}")
             self.pending.duration = self.interval = interval
             self.target.mux(self.pending)
         self.pending = packet
+        self.pending_pts = pts
 
     def close(self, *, flush=True):
         target, self.target = self.target, None
@@ -93,6 +174,7 @@ class TimestampedAacMuxer(TimestampedVideoMuxer):
         self.config, _ = _aac_packet_config(first_adts_packet)
         self.origin = None
         self.pending = None
+        self.pending_pts = None
         self.source = av.open(io.BytesIO(first_adts_packet), format="aac")
         self.writer = _ChunkWriter(callback)
         self.target = None

@@ -2021,11 +2021,16 @@ class NativeRelayPlaybackSession:
                 self._count_media_drop(f"unsupported_ch{conversation}_pt{rtp.payload_type}")
                 continue
             try:
-                access_units = self._h264.push(rtp, presentation_timestamp=packet.camera_timestamp or rtp.timestamp)
+                access_units = self._h264.push(
+                    rtp, presentation_timestamp=packet.camera_timestamp or rtp.timestamp,
+                    timestamp_scale=1000 if packet.camera_timestamp else 90000,
+                )
             except NativeSimpleRtpError:
                 self._count_media_drop("h264_depacketize")
                 continue
-            for access_unit, timestamp in zip(access_units, self._h264.completed_timestamps, strict=True):
+            for access_unit, timestamp, scale in zip(
+                access_units, self._h264.completed_timestamps, self._h264.completed_timestamp_scales, strict=True,
+            ):
                 self._video_frame_number += 1
                 self._put_nowait(
                     self._media_frames,
@@ -2041,7 +2046,7 @@ class NativeRelayPlaybackSession:
                         field_28=self._video_frame_number,
                         codec_info=None,
                         payload=access_unit,
-                        timestamp_scale=1000 if packet.camera_timestamp else 90000,
+                        timestamp_scale=scale,
                     ),
                     "media",
                 )

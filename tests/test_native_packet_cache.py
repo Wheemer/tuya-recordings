@@ -15,9 +15,72 @@ from playwright.sync_api import sync_playwright
 from custom_components.tuya_recordings.lib.native_frames import (
     NativePlaybackFrame, NativePlaybackFrameType, playback_frame_event,
 )
-from custom_components.tuya_recordings.lib.native_mux import NativePlaybackMuxer, NativePlaybackBrowserStreamMuxer, NativeMuxError
+from custom_components.tuya_recordings.lib.native_mux import NativePlaybackMuxer, NativePlaybackBrowserStreamMuxer, NativeMuxError, browser_stream_header
 from custom_components.tuya_recordings.lib.ffmpeg import finalize_mp4_for_browser
-from custom_components.tuya_recordings.lib.native_packet_cache import TimestampedVideoMuxer, TimestampedAacMuxer
+from custom_components.tuya_recordings.lib.native_packet_cache import TimestampedVideoMuxer, TimestampedAacMuxer, NativePresentationClock
+
+
+def native_stream_server(stream):
+    frontend = Path(__file__).resolve().parents[1] / "custom_components/tuya_recordings/frontend"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/":
+                data = b"<div><video playsinline></video><div role='status'></div></div>"
+                mime = "text/html"
+            elif path == "/stream":
+                data, mime = stream, "application/octet-stream"
+            else:
+                file = (frontend / path.removeprefix("/frontend/")).resolve()
+                if not file.is_relative_to(frontend) or not file.is_file():
+                    self.send_error(404)
+                    return
+                data = file.read_bytes()
+                mime = "text/javascript" if file.suffix == ".js" else "image/svg+xml"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
+def test_presentation_clock_keeps_scale_and_valid_sparse_cadence():
+    clock = NativePresentationClock()
+    assert clock.map(1, 1000, 1000) == (1000, 1000)
+    assert clock.map(1, 1200000, 1_000_000) == (1200, 1000)
+    assert clock.map(1, 2249, 1000) == (2249, 1000)
+    assert clock._epoch == 0
+    clock.map(1, 3299, 1000)
+    assert clock._epoch == 1
+
+
+def test_presentation_clock_allows_queued_old_track_to_finish_before_joining_new_epoch():
+    from fractions import Fraction
+    clock = NativePresentationClock()
+    clock.map(1, 1000, 1000)
+    clock.map(2, 1000, 1000, duration=Fraction(1, 50))
+    clock.map(1, 1040, 1000)
+    clock.map(2, 1020, 1000, duration=Fraction(1, 50))
+    new_audio = clock.map(2, 70000, 1000, duration=Fraction(1, 50))
+    assert clock.map(1, 1060, 1000) == (1060, 1000)
+    assert clock.map(1, 70000, 1000) == new_audio
+    assert clock._epoch == 1 and len(clock._tracks) == 2
+
+
+def test_packet_mux_rejects_oversized_duration_before_ffmpeg(encoded_video):
+    muxer = TimestampedVideoMuxer(encoded_video[0], lambda data: None)
+    try:
+        muxer.push(encoded_video[0], 0, 1_000_000, True)
+        with pytest.raises(ValueError, match="duration_us=3377270400"):
+            muxer.push(encoded_video[1], 3377270400, 1_000_000, False)
+    finally:
+        muxer.close(flush=False)
 
 
 def test_live_mux_preserves_initialization_error_if_cleanup_fails(monkeypatch):
@@ -111,12 +174,14 @@ def test_cache_preserves_raw_audio_and_uneven_video_clock(tmp_path, encoded_vide
     assert not list(tmp_path.glob("*.packets.tmp"))
 
 
-def test_cache_rejects_reversed_camera_clock_and_cleans_up(tmp_path, encoded_video):
+def test_cache_rejects_invalid_camera_clock_and_cleans_up(tmp_path, encoded_video):
     output = tmp_path / "invalid.mp4"
-    with pytest.raises(NativeMuxError, match="timestamps are not increasing"):
+    with pytest.raises(NativeMuxError, match="invalid camera timing"):
         with NativePlaybackMuxer(output, require_audio=False) as muxer:
             muxer.handle_event(media(encoded_video[0], "h264", 200))
-            muxer.handle_event(media(encoded_video[1], "h264", 100))
+            event = media(encoded_video[1], "h264", 100)
+            event["payload"]["info"]["timestampScale"] = 0
+            muxer.handle_event(event)
     assert not output.exists()
     assert not list(tmp_path.glob("*.tmp*"))
 
@@ -170,8 +235,166 @@ def test_live_packet_mux_preserves_uneven_camera_clock(encoded_video):
             [0, 0.18, 0.41, 0.6, 0.84], abs=0.001)
 
 
+@pytest.mark.parametrize("jump", [69_000, 3_377_270.4, -50_000, -(2**32) + 2000])
+@pytest.mark.parametrize("audio_first", [False, True])
+def test_live_fragment_transitions_keep_video_and_audio_on_one_clock(encoded_video, jump, audio_first):
+    chunks = []
+    epoch = (2**32 - 1000) if jump < -1_000_000 else 1_790_000_000_000
+    with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
+        muxer.handle_event(playback_frame_event(NativePlaybackFrame(NativePlaybackFrameType.STARTED, b"", {}), protocol=1))
+        for fragment in range(2):
+            events = [(stamp, False, packet) for stamp, packet in zip([100, 280, 510, 700, 940], encoded_video, strict=True)]
+            events.extend((100 + index * 20, True, b"\x80" * 160) for index in range(50))
+            for stamp, audio, packet in sorted(events, key=lambda row: (row[0], row[1] != audio_first)):
+                event = media(packet, "g711u" if audio else "h264", 0, audio=audio)
+                event["payload"]["info"].update({
+                    "timestamp": round((epoch + fragment * jump + stamp) * 1000),
+                    "timestampScale": 1_000_000,
+                })
+                muxer.handle_event(event)
+    video_bytes = b"".join(chunk[13:] for chunk in chunks if chunk[0] == 1)
+    with av.open(io.BytesIO(video_bytes), format="mp4") as output:
+        packets = [packet for packet in output.demux(video=0) if packet.size]
+        times = [float(packet.pts * packet.time_base) for packet in packets]
+        durations = [float(packet.duration * packet.time_base) for packet in packets]
+        assert len(packets) == 10
+        assert all(0 < right - left < 1 for left, right in zip(times, times[1:]))
+        assert all(0 < duration < 1 for duration in durations)
+        assert len(list(av.open(io.BytesIO(video_bytes), format="mp4").decode(video=0))) == 10
+    audio = [(struct.unpack_from(">Q", chunk, 1)[0], chunk[13:]) for chunk in chunks if chunk[0] == 4]
+    assert b"".join(payload for _, payload in audio) == b"\x80" * 16000
+    audio_times = [stamp / 1_000_000 for stamp, _ in audio]
+    assert all(0 < right - left < 1 for left, right in zip(audio_times, audio_times[1:]))
+    first_video = next(struct.unpack_from(">Q", chunk, 1)[0] / 1_000_000 for chunk in chunks if chunk[0] == 1)
+    # Shared epoch offsets preserve A/V alignment at the new recording.
+    assert abs((audio_times[50] - first_video) - times[5]) < 0.025
+
+
+@pytest.mark.parametrize("jump", [69000, -50000, 3_377_270.4])
+def test_cached_fragments_keep_packets_and_audio_video_alignment(tmp_path, encoded_video, jump):
+    output = tmp_path / "fragments.mp4"
+    with NativePlaybackMuxer(output) as muxer:
+        for fragment in range(2):
+            events = [(stamp, False, packet) for stamp, packet in zip([100, 280, 510, 700, 940], encoded_video, strict=True)]
+            events.extend((100 + index * 20, True, b"\x80" * 160) for index in range(50))
+            for stamp, audio, packet in sorted(events, key=lambda row: row[0]):
+                event = media(packet, "g711u" if audio else "h264", 0, audio=audio)
+                event["payload"]["info"].update(
+                    timestamp=round((1_790_000_000_000 + fragment * jump + stamp) * 1000), timestampScale=1_000_000,
+                )
+                muxer.handle_event(event)
+    with av.open(str(output)) as result:
+        packets = [packet for packet in result.demux() if packet.size]
+        video = [packet for packet in packets if packet.stream.type == "video"]
+        audio = [packet for packet in packets if packet.stream.type == "audio"]
+        assert len(video) == 10
+        assert b"".join(bytes(packet) for packet in audio) == b"\x80" * 16000
+        assert all(0 < float(packet.duration * packet.time_base) < 1 for packet in video)
+        consumed = 0
+        for packet in audio:
+            if consumed <= 8000 < consumed + packet.size:
+                boundary = float(packet.pts * packet.time_base) + (8000 - consumed) / 8000
+                break
+            consumed += packet.size
+        assert abs(boundary - float(video[5].pts * video[5].time_base)) < 0.025
+
+
+@pytest.mark.parametrize("jump", [69000, -50000, 3_377_270.4])
+def test_g711_browser_keeps_playing_across_fragment_clock_reset(tmp_path, encoded_video, jump):
+    audio_path = tmp_path / "source.mulaw"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=500:sample_rate=8000:duration=4", "-c:a", "pcm_mulaw",
+                    "-f", "mulaw", "-y", str(audio_path)], check=True, timeout=15)
+    audio = audio_path.read_bytes()
+    events = [(index * 200, False, packet) for index, packet in enumerate(encoded_video * 4)]
+    events.extend((index // 160 * 20, True, audio[index:index + 160]) for index in range(0, len(audio), 160))
+    chunks = []
+    with NativePlaybackBrowserStreamMuxer(chunks.append, stream_header=browser_stream_header(1, 100)) as muxer:
+        muxer.handle_event(playback_frame_event(NativePlaybackFrame(NativePlaybackFrameType.STARTED, b"", {}), protocol=1))
+        for stamp, is_audio, data in sorted(events, key=lambda row: row[0]):
+            event = media(data, "g711u" if is_audio else "h264", 0, audio=is_audio)
+            event["payload"]["info"].update(
+                timestamp=round((1_790_000_000_000 + stamp + (jump if stamp >= 2000 else 0)) * 1000),
+                timestampScale=1_000_000,
+            )
+            muxer.handle_event(event)
+    server = native_stream_server(b"".join(chunks))
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True, args=["--autoplay-policy=no-user-gesture-required"])
+            try:
+                page = browser.new_page()
+                errors = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto(f"http://127.0.0.1:{server.server_port}/")
+                page.evaluate("""async () => {
+                    window.framesRendered = 0; window.latePeak = 0; window.sources = new Set();
+                    window.cameraPositions = [];
+                    window.WebSocket = class extends EventTarget {
+                        static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+                        constructor() {
+                            super(); this.readyState = 0;
+                            setTimeout(async () => {
+                                this.readyState = 1; this.dispatchEvent(new Event('open'));
+                                const data = await (await fetch('/stream')).arrayBuffer();
+                                if (this.readyState === 1) this.dispatchEvent(new MessageEvent('message', {data}));
+                            }, 0);
+                        }
+                        send() {}
+                        close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+                    };
+                    const video = document.querySelector('video');
+                    const count = () => { framesRendered++; video.requestVideoFrameCallback(count); };
+                    video.requestVideoFrameCallback(count);
+                    const gain = AudioContext.prototype.createGain;
+                    AudioContext.prototype.createGain = function() {
+                        const node = gain.call(this);
+                        window.analyser = this.createAnalyser(); node.connect(analyser);
+                        return node;
+                    };
+                    const create = AudioContext.prototype.createBufferSource;
+                    AudioContext.prototype.createBufferSource = function() {
+                        const node = create.call(this), start = node.start.bind(node), stop = node.stop.bind(node);
+                        node.start = (...args) => { sources.add(node); start(...args); };
+                        node.stop = (...args) => { sources.delete(node); stop(...args); };
+                        node.addEventListener('ended', () => sources.delete(node), {once:true});
+                        return node;
+                    };
+                    const monitor = () => {
+                        if (window.stopMonitor) return;
+                        if (window.analyser && video.currentTime > 2.5) {
+                            const samples = new Float32Array(analyser.fftSize);
+                            analyser.getFloatTimeDomainData(samples);
+                            latePeak = Math.max(latePeak, ...samples.map(Math.abs));
+                        }
+                        requestAnimationFrame(monitor);
+                    }; monitor();
+                    const {attachCameraPlayer} = await import('/frontend/camera-player.js');
+                    window.disposePlayer = attachCameraPlayer(video,
+                        {cached:false, duration:4, start:100, end:104, playback_url:'/timeline/stream', stream_transport:'native'},
+                        async path => path, {autoplay:true, mode:'timeline', onPosition: value => cameraPositions.push({position:value, time:video.currentTime})});
+                }""")
+                page.wait_for_function("framesRendered >= 12 && latePeak > 0.01 && document.querySelector('video').currentTime > 2.6", timeout=10000)
+                assert not page.locator("video").evaluate("video => Boolean(video.error)")
+                last = page.evaluate("cameraPositions.at(-1)")
+                assert last["time"] > 2.2
+                assert last["position"] - last["time"] == pytest.approx(100 + max(0, jump / 1000), abs=0.025)
+                assert not errors
+                page.evaluate("disposePlayer(); window.stopMonitor = true")
+                assert page.evaluate("sources.size") == 0
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+@pytest.mark.parametrize("jump", [0, 69000, -50000, 3_377_270.4])
 @pytest.mark.parametrize("rate,channels,audio_offset", [(8000, 1, 0), (16000, 2, 240)])
-def test_aac_live_player_decodes_audio_seeks_and_releases(tmp_path, encoded_video, rate, channels, audio_offset):
+def test_aac_live_player_decodes_audio_seeks_and_releases(tmp_path, encoded_video, rate, channels, audio_offset, jump):
     audio_path = tmp_path / "live.aac"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
                     f"sine=frequency=500:sample_rate={rate}:duration=4",
@@ -185,8 +408,11 @@ def test_aac_live_player_decodes_audio_seeks_and_releases(tmp_path, encoded_vide
         muxer.handle_event(playback_frame_event(NativePlaybackFrame(
             NativePlaybackFrameType.STARTED, b"", {}), protocol=1))
         for stamp, packet, is_audio in sorted(events, key=lambda item: item[0]):
-            event = media(packet, "aac" if is_audio else "h264",
-                          1_790_000_000_000 + stamp, audio=is_audio)
+            event = media(packet, "aac" if is_audio else "h264", 0, audio=is_audio)
+            event["payload"]["info"].update(
+                timestamp=round((1_790_000_000_000 + stamp + (jump if stamp >= 2000 else 0)) * 1000),
+                timestampScale=1_000_000,
+            )
             if is_audio:
                 event["payload"]["info"].update(sampleRate=rate, channels=channels)
             muxer.handle_event(event)
@@ -197,33 +423,7 @@ def test_aac_live_player_decodes_audio_seeks_and_releases(tmp_path, encoded_vide
     (tmp_path / "live-audio.mp4").write_bytes(aac_bytes)
     with av.open(io.BytesIO(aac_bytes), format="mp4") as source:
         assert [bytes(packet) for packet in source.demux(audio=0) if packet.size] == [packet[7:] for packet in audio]
-    frontend = Path(__file__).resolve().parents[1] / "custom_components/tuya_recordings/frontend"
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            path = self.path.split("?", 1)[0]
-            if path == "/":
-                data = b"<div><video playsinline></video><div role='status'></div></div>"
-                mime = "text/html"
-            elif path == "/stream":
-                data, mime = stream, "application/octet-stream"
-            else:
-                file = (frontend / path.removeprefix("/frontend/")).resolve()
-                if not file.is_relative_to(frontend) or not file.is_file():
-                    self.send_error(404)
-                    return
-                data = file.read_bytes()
-                mime = "text/javascript" if file.suffix == ".js" else "image/svg+xml"
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, *args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = native_stream_server(stream)
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -273,7 +473,7 @@ def test_aac_live_player_decodes_audio_seeks_and_releases(tmp_path, encoded_vide
                         clip, async path => path, {autoplay:true, debug: detail => playerDebug.push(detail)});
                 }""")
                 try:
-                    page.wait_for_function("window.peak > 0.02 && Math.abs(audioFrequency - 500) < 60 && document.querySelector('video').currentTime > 0.25", timeout=10000)
+                    page.wait_for_function("window.peak > 0.02 && Math.abs(audioFrequency - 500) < 60 && document.querySelector('video').currentTime > 2.5", timeout=10000)
                 except Exception:
                     print(page.evaluate("""() => ({peak, audioFrequency, playerDebug,
                         status: document.querySelector('[role=status]').textContent,
