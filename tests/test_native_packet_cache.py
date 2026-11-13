@@ -73,6 +73,44 @@ def test_presentation_clock_allows_queued_old_track_to_finish_before_joining_new
     assert clock._epoch == 1 and len(clock._tracks) == 2
 
 
+def test_presentation_clock_reanchors_late_track_after_old_tail_overtakes_epoch():
+    from fractions import Fraction
+    clock = NativePresentationClock()
+    clock.map(1, 1000, 1000)
+    clock.map(2, 1000, 1000, duration=Fraction(1, 50))
+    clock.map(1, 1040, 1000)
+    clock.map(2, 1020, 1000, duration=Fraction(1, 50))
+    clock.map(2, 70000, 1000, duration=Fraction(1, 50))
+    for timestamp in (1080, 1120, 1160):
+        clock.map(1, timestamp, 1000)
+    video, scale = clock.map(1, 70000, 1000)
+    audio, _ = clock.map(2, 70020, 1000, duration=Fraction(1, 50))
+    assert scale == 1000 and video > 1160
+    assert audio - video == 20
+    assert len(clock._tracks) == 2
+
+
+@pytest.mark.parametrize("first", [1, 2])
+def test_presentation_clock_repeated_staggered_transitions_are_monotonic(first):
+    from fractions import Fraction
+    clock = NativePresentationClock()
+    previous = {1: -1, 2: -1}
+    base = 10000
+    for fragment in range(100):
+        next_base = base + (69000 if fragment % 2 == 0 else -50000)
+        order = (first, 3 - first)
+        for step in range(5):
+            for kind in order:
+                timestamp = next_base + step * 40
+                value, _ = clock.map(kind, timestamp, 1000,
+                                     duration=Fraction(1, 25) if kind == 2 else None)
+                assert value > previous[kind]
+                previous[kind] = value
+        assert abs(previous[1] - previous[2]) <= 80
+        base = next_base
+    assert len(clock._tracks) == 2
+
+
 def test_packet_mux_rejects_oversized_duration_before_ffmpeg(encoded_video):
     muxer = TimestampedVideoMuxer(encoded_video[0], lambda data: None)
     try:
@@ -297,6 +335,37 @@ def test_cached_fragments_keep_packets_and_audio_video_alignment(tmp_path, encod
                 break
             consumed += packet.size
         assert abs(boundary - float(video[5].pts * video[5].time_base)) < 0.025
+
+
+def test_repeated_interleaved_fragment_tails_decode_video_and_preserve_audio(encoded_video):
+    chunks = []
+    fragments = 20
+    epoch = 1_790_000_000_000
+    with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
+        muxer.handle_event(playback_frame_event(NativePlaybackFrame(NativePlaybackFrameType.STARTED, b"", {}), protocol=1))
+        previous_base = None
+        for fragment in range(fragments):
+            base = epoch + fragment * 69000
+            muxer.handle_event(media(b"\x80" * 160, "g711u", base, audio=True))
+            if previous_base is not None:
+                muxer.handle_event(media(encoded_video[-1], "h264", previous_base + 100))
+            for index, packet in enumerate(encoded_video[:-1]):
+                muxer.handle_event(media(packet, "h264", base + index * 20))
+                muxer.handle_event(media(b"\x80" * 160, "g711u", base + (index + 1) * 20, audio=True))
+            previous_base = base
+        muxer.handle_event(media(encoded_video[-1], "h264", previous_base + 100))
+    video = b"".join(chunk[13:] for chunk in chunks if chunk[0] == 1)
+    with av.open(io.BytesIO(video), format="mp4") as output:
+        assert len(list(output.decode(video=0))) == fragments * 5
+    with av.open(io.BytesIO(video), format="mp4") as output:
+        packets = [packet for packet in output.demux(video=0) if packet.size]
+        times = [float(packet.pts * packet.time_base) for packet in packets]
+        assert all(0 < right - left < 0.2 for left, right in zip(times, times[1:]))
+    audio = [(struct.unpack_from(">Q", chunk, 1)[0] / 1000, chunk[13:]) for chunk in chunks if chunk[0] == 4]
+    assert b"".join(data for _, data in audio) == b"\x80" * 160 * 5 * fragments
+    first_video = next(struct.unpack_from(">Q", chunk, 1)[0] / 1000 for chunk in chunks if chunk[0] == 1)
+    for fragment in range(fragments):
+        assert abs(audio[fragment * 5][0] - first_video - times[fragment * 5]) < 0.1
 
 
 @pytest.mark.parametrize("jump", [69000, -50000, 3_377_270.4])

@@ -22,8 +22,9 @@ _MAX_CONVERSATIONS = 16
 class DirectSession:
     """Route Tuya KCP conversations over one authenticated LAN datagram path."""
 
-    def __init__(self, transmit: Callable[[bytes], None]) -> None:
+    def __init__(self, transmit: Callable[[bytes], None], *, on_failure: Callable[[str], None] | None = None) -> None:
         self._transmit = transmit
+        self._on_failure = on_failure
         self._conversations: dict[int, KcpConversation] = {}
         self._segment_counts: dict[tuple[int, int], int] = {}
         self._malformed_datagrams = 0
@@ -40,7 +41,11 @@ class DirectSession:
             return existing
         if len(self._conversations) >= _MAX_CONVERSATIONS:
             raise TuyaIpcP2pSessionError("Camera exceeded the conversation limit")
-        created = KcpConversation(conversation_id, self._transmit)
+        # Native ikcp_create uses dead_link=20 and an initial 200ms RTO.
+        # Keep this direct policy separate from bounded TCP bootstrap backoff.
+        created = KcpConversation(conversation_id, self._transmit,
+                                  max_transmits=20, retransmit_interval=0.2,
+                                  on_failure=self._on_failure)
         self._conversations[conversation_id] = created
         return created
 

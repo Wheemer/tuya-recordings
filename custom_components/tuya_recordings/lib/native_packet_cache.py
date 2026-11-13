@@ -76,9 +76,19 @@ class NativePresentationClock:
                     )
         elif self._epoch and self._latest_source is not None and abs(stamp - self._latest_source) < _SD_CLOCK_GAP:
             offset, epoch = self._offset, self._epoch
+        if epoch == self._epoch and previous and previous.epoch == epoch:
+            # A late joining track may have moved the shared synchronizer
+            # forward since this track's last packet. Adopt that same reset.
+            offset = self._offset
         presented = stamp + offset
         if previous and presented <= previous.presented:
-            raise ValueError("Native presentation clock could not reconcile overlapping fragments")
+            # Old-fragment frames can finish after the other track has already
+            # started a new epoch. Re-anchor both tracks at the completed tail;
+            # do not emit backwards MP4 time or fail a valid SDK transition.
+            presented = previous.presented + previous.interval
+            offset = presented - stamp
+            self._offset = offset
+            epoch = self._epoch
         output_scale = previous.scale if previous else scale
         value = round(presented * output_scale)
         if not 0 <= value < 1 << 64:

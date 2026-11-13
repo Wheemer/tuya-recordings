@@ -61,6 +61,9 @@ class KcpConversation:
     def __init__(
         self, conversation: int, transmit: Callable[[bytes], None],
         *, max_message_bytes: int = _MAX_MESSAGE_BYTES, backoff: bool = False,
+        max_transmits: int = _MAX_RETRANSMITS,
+        retransmit_interval: float = _RETRANSMIT_INTERVAL_SECONDS,
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         """Bind the conversation to the connection that carries its segments."""
         self.conversation = conversation
@@ -68,6 +71,11 @@ class KcpConversation:
             raise ValueError("Invalid KCP message limit")
         self._max_message_bytes = max_message_bytes
         self._backoff = backoff
+        if not 1 <= max_transmits <= 20 or not 0.1 <= retransmit_interval <= 1:
+            raise ValueError("Invalid KCP retransmission policy")
+        self._max_transmits = max_transmits
+        self._retransmit_interval = retransmit_interval
+        self._on_failure = on_failure
         self._transmit = transmit
         self._next_send_sequence = 0
         self._next_receive_sequence = 0
@@ -251,7 +259,8 @@ class KcpConversation:
 
     def _arm_retransmit(self) -> None:
         """Start the retransmit loop, if it is not already running."""
-        if self._retransmit_task is not None or self._closed:
+        if (self._closed or not self._pending
+                or self._retransmit_task is not None and not self._retransmit_task.done()):
             return
         self._retransmit_task = asyncio.create_task(self._async_retransmit_loop())
 
@@ -266,12 +275,16 @@ class KcpConversation:
         """Resend unacknowledged segments until the peer catches up or gives up."""
         try:
             while not self._closed and self._pending:
-                await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+                await asyncio.sleep(self._retransmit_interval)
                 self._retransmit_once()
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            LOGGER.debug("KCP retransmit loop stopped: %s", exception)
+            LOGGER.debug("KCP retransmit loop stopped: %s", type(exception).__name__)
+            self._fail("transmit_failed")
+        finally:
+            if self._retransmit_task is asyncio.current_task():
+                self._retransmit_task = None
 
     def _retransmit_once(self) -> None:
         """Resend whatever has been waiting longer than the retransmit interval."""
@@ -284,22 +297,32 @@ class KcpConversation:
         for entry in list(self._pending):
             if not entry.transmits:
                 continue
-            interval = _RETRANSMIT_INTERVAL_SECONDS * (
+            interval = self._retransmit_interval * (
                 2 ** max(0, entry.transmits - 1) if self._backoff else 1
             )
             if _difference(now, entry.sent_at) < interval * 1000:
                 continue
-            if entry.transmits >= _MAX_RETRANSMITS:
+            if entry.transmits >= self._max_transmits:
                 LOGGER.warning(
                     "Failed to deliver KCP segment %s after %s transmits",
                     entry.sequence,
                     entry.transmits,
                 )
-                self.close()
+                self._fail("delivery_exhausted")
                 return
             entry.sent_at = now
             entry.transmits += 1
+            # ikcp_flush refreshes ts and una on every retransmission while
+            # preserving the original sequence and encoded message bytes.
+            entry.raw = entry.raw[:8] + now.to_bytes(4, "little") + entry.raw[12:16] + self._next_receive_sequence.to_bytes(4, "little") + entry.raw[20:]
             self._transmit(entry.raw)
+
+    def _fail(self, reason: str) -> None:
+        if self._closed:
+            return
+        self.close()
+        if self._on_failure is not None:
+            self._on_failure(reason)
 
     def close(self) -> None:
         """Stop the conversation and release everything it was holding."""
