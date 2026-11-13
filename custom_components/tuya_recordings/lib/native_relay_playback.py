@@ -472,7 +472,11 @@ class NativeRelayPlaybackSession:
                 on_segment=self._on_direct_segment,
                 local_ufrag=p2p.ice_ufrag,
             )
-            self._session = DirectSession(self._ice.send_segment)
+            self._session = DirectSession(
+                self._ice.send_segment,
+                on_failure=lambda reason: self._fail_transport(NativeRelayPlaybackError(
+                    f"Native LAN delivery failed ({reason})")),
+            )
             self._start_command_signaling(
                 tcp=media or self._on_demand_catalog or self._retry_mqtt_offer,
             )
@@ -2169,6 +2173,8 @@ class NativeRelayPlaybackSession:
         return request_id
 
     def _require_connected(self) -> None:
+        if self._ended is not None and self._ended.done():
+            raise self._ended.result()
         if self._closed or not self._connected or self._control is None:
             raise NativeRelayPlaybackError("Playback session is not connected")
 

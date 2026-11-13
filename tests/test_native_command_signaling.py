@@ -410,9 +410,12 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
-    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False)]
+    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False), ("lossy_seek", True, False)]
     + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device")])
-async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
+async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media, shared_commands=None, lan_key_reconnect=False):
+    lossy_seek = mode == "lossy_seek"
+    if lossy_seek:
+        mode = "answer"
     account_sd_report = mode.startswith("account_")
     account_wrong_device = mode == "account_wrong_device"
     account_silence = mode == "account_sd_silence" or account_wrong_device
@@ -486,7 +489,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 async def async_close(self): pass
             monkeypatch.setattr(playback, "Lan302Client", FailedLan)
         from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
-        commands = CameraCommandQueue()
+        commands = shared_commands or CameraCommandQueue()
         monkeypatch.setattr(playback, "CAMERA_COMMANDS", commands)
         if cooldown:
             assert commands.reserve_wake(config.dev_id)
@@ -529,12 +532,60 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 1, b"test", {"devId": config.dev_id, "dps": {"110": 1}}, 0, 4, "2.3"))
             return True
 
+        if lan_key_reconnect:
+            config = replace(config, sd_status_lan_dp="110", sd_status_lan_error_route="mqtt")
         session = playback.NativeRelayPlaybackSession(config, APP_SESSION, call_api=gateway)
         peer.key = session._local.aes_key
         if endpoint_race:
             silent.key = peer.key
         receive_key = peer.key if mode.startswith("no_answer_udp") else ANSWER_KEY
         events = []
+        if lan_key_reconnect:
+            import hashlib
+            import hmac
+            from types import SimpleNamespace
+            from custom_components.tuya_recordings.lib import native_lan_signaling as lan
+            from importlib import import_module
+            tiny = lan.tinytuya
+            xenon = import_module("tinytuya.core.XenonDevice")
+            real_socket = xenon.socket
+            writes = []
+            opened = []
+            closed = []
+
+            class Socket:
+                def setsockopt(self, *args): pass
+                def settimeout(self, value): pass
+                def connect(self, address): opened.append(address)
+                def close(self): closed.append(1)
+                def sendall(self, raw): writes.append(tiny.parse_header(raw).cmd)
+
+            monkeypatch.setattr(xenon, "socket", SimpleNamespace(
+                **{name: getattr(real_socket, name) for name in (
+                    "AF_INET", "AF_INET6", "SOCK_STREAM", "IPPROTO_TCP", "TCP_NODELAY", "timeout"
+                )}, socket=lambda *a: Socket(),
+            ))
+            monkeypatch.setattr(tiny, "find_device", lambda **k: {"ip": "192.0.2.9", "version": "3.5"})
+            class InterleavedLan(lan.Lan302Client):
+                def _open_device(self):
+                    device = super()._open_device()
+                    replies = 0
+                    def receive():
+                        nonlocal replies
+                        replies += 1
+                        if replies == 2:
+                            payload = b"remote-nonce-123" + hmac.new(
+                                device.real_local_key, device.local_nonce, hashlib.sha256
+                            ).digest()
+                            return tiny.TuyaMessage(2, 4, 0, payload, 0, True, 0, None)
+                        if replies == 3:
+                            assert writes == [3, 5, 7]
+                            events.append("SD status")
+                            return tiny.TuyaMessage(3, 7, 0, b'{"dps":{"110":1}}', 0, True, 0, None)
+                        return tiny.TuyaMessage(1, 8, 0, b'{"dps":{"248":1}}', 0, True, 0, None)
+                    device._receive = receive
+                    return device
+            monkeypatch.setattr(playback, "Lan302Client", InterleavedLan)
         udp_transport = None
         udp_alternate = None
         alternate_checked = asyncio.Event()
@@ -812,7 +863,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 else:
                     assert session._command._channel.pending_count == 0
                 if media:
-                    if mode == "answer":
+                    if mode == "answer" and not lan_key_reconnect:
                         assert session._moto.low_power_wake_confirmed
                         assert session._moto.low_power_connect is False
                     assert not any(high in (6, 9) for high, _ in bootstrap_commands), "SD connection must not start or stop a preview"
@@ -855,7 +906,25 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         assert len(list(source.decode(video=0))) == 1
                     await session.pause()
                     await session.resume()
-                    await session.seek(start=100, end=110, play_time=105, **play_options)
+                    if lossy_seek:
+                        from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.kcp_segment import parse_segment
+                        transmit = session._control._transmit
+                        lost_sequence = session._control._next_send_sequence
+                        lost = 0
+                        def lose_start(raw):
+                            nonlocal lost
+                            segment = parse_segment(raw)
+                            if segment.command == 0x51 and segment.sequence == lost_sequence and lost < 8:
+                                lost += 1
+                                return
+                            transmit(raw)
+                        session._control._transmit = lose_start
+                    try:
+                        await session.seek(start=100, end=110, play_time=105, **play_options)
+                    except Exception as error:
+                        if lossy_seek:
+                            error.add_note(f"lost={lost}, closed={session._control.closed}, pending={[(p.sequence, p.transmits) for p in session._control._pending]}, loop={session._control._retransmit_task}")
+                        raise
                     async with asyncio.timeout(1):
                         assert (await session.receive_frame()).payload == video.payload
                         assert (await session.receive_frame()).payload == audio.payload
@@ -867,6 +936,21 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         (0x0002000b, 2), (0x0003000c, 21 if play_mode else 0), (0x0003000c, 4),
                         (13, 3), (14, 5),
                     ]
+                    if lossy_seek:
+                        assert lost == 8 and not session._control.closed
+                        for position in (101, 107, 102, 108):
+                            await session.start(start=100, end=110, play_time=position, **play_options)
+                            async with asyncio.timeout(1):
+                                assert (await session.receive_frame()).payload == video.payload
+                                assert (await session.receive_frame()).payload == audio.payload
+                            await session.pause()
+                            await session.resume()
+                            await session.seek(start=100, end=110, play_time=position + 1, **play_options)
+                            async with asyncio.timeout(1):
+                                assert (await session.receive_frame()).payload == video.payload
+                                assert (await session.receive_frame()).payload == audio.payload
+                            await session.stop()
+                        assert peer.opened == 1 and not session._control.closed
                     # Run the real interactive orchestration on the same LAN
                     # object, including its threaded event sink and stop path.
                     commands = queue.Queue()
@@ -972,6 +1056,47 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             if udp_alternate is not None:
                 udp_alternate.close()
         assert session._command is None and session._command_task is None
+        if lan_key_reconnect:
+            assert len(opened) == len(closed) == 1
+            assert writes == [3, 5, 7]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+async def test_sd_timeout_cleanup_then_fresh_wake_playback_and_repeated_seek(monkeypatch, profile, decodable_media):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+    commands = CameraCommandQueue()
+    dev = camera_config().dev_id
+    with monkeypatch.context() as patch:
+        await test_tcp_command_answer_then_catalog_uses_only_lan(
+            patch, profile, "account_sd_silence", True, False, decodable_media,
+            shared_commands=commands,
+        )
+    assert commands.wake_report_on_cooldown(dev)
+    # Advance the fixture's shared reservation, not the production timeout.
+    commands._wake_after[dev] = time.monotonic() - 1
+    assert not commands.wake_report_on_cooldown(dev)
+    with monkeypatch.context() as patch:
+        await test_tcp_command_answer_then_catalog_uses_only_lan(
+            patch, profile, "lossy_seek", True, False, decodable_media,
+            shared_commands=commands,
+        )
+    assert dev not in commands._wake_report_missing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
+async def test_lan_interleaved_key_exchange_playback_seek_and_reconnect(monkeypatch, profile, decodable_media):
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+    commands = CameraCommandQueue()
+    dev = camera_config().dev_id
+    for _ in range(2):
+        commands._wake_after[dev] = time.monotonic() - 1
+        with monkeypatch.context() as patch:
+            await test_tcp_command_answer_then_catalog_uses_only_lan(
+                patch, profile, "lossy_seek", True, False, decodable_media,
+                shared_commands=commands, lan_key_reconnect=True,
+            )
 
 
 @pytest.mark.asyncio

@@ -277,6 +277,34 @@ def session():
     return NativeRelayPlaybackSession(camera_config(), APP_SESSION)
 
 
+@pytest.mark.asyncio
+async def test_dead_control_channel_fails_pending_seek_without_waiting_for_callback_timeout(monkeypatch):
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport.direct_session import DirectSession
+    from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.transport import kcp_conversation as module
+    playback = session()
+    playback._ended = asyncio.get_running_loop().create_future()
+    playback._connected = True
+    now = 1000
+    monkeypatch.setattr(module, "_now_milliseconds", lambda: now)
+    direct = DirectSession(lambda _: None, on_failure=lambda reason: playback._fail_transport(
+        NativeRelayPlaybackError(f"Native LAN delivery failed ({reason})")))
+    playback._control = direct.control
+    waiting = asyncio.create_task(playback._wait_for_playback_responses(0x20008))
+    try:
+        direct.control.send(b"seek")
+        for _ in range(20):
+            now += 201
+            direct.control._retransmit_once()
+        with pytest.raises(NativeRelayPlaybackError, match="delivery_exhausted"):
+            await asyncio.wait_for(waiting, 0.1)
+        with pytest.raises(NativeRelayPlaybackError, match="delivery_exhausted"):
+            playback._require_connected()
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await direct.async_close()
+
+
 @pytest.mark.parametrize("outcome", ["home", "resend", "candidate_resend", "silent", "wake", "http_wake", "lan_delivery_fail", "no_card", "missing", "hub", "lan_answer", "mqtt_and_lan_answer", "lan_answer_no_wake", "lan_answer_mqtt_status"])
 @pytest.mark.parametrize("via_button", [False, True])
 @pytest.mark.parametrize("profile", ["smart_life", "tuya_smart"])
@@ -525,7 +553,8 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
     class Direct:
         diagnostics = "fixture direct transport"
 
-        def __init__(self, _transmit):
+        def __init__(self, _transmit, *, on_failure=None):
+            self.on_failure = on_failure
             self.control = self
             self.channels = {}
 
@@ -2322,7 +2351,8 @@ def test_connect_uses_mqtt_signaling_and_requires_direct_ice(monkeypatch, bootst
     class FakeDirectSession:
         diagnostics = "routed=0:0x81=1, malformed_datagrams=0"
 
-        def __init__(self, transmit):
+        def __init__(self, transmit, *, on_failure=None):
+            self.on_failure = on_failure
             events.append("direct-open")
             captured["transmit"] = transmit
             self.control = Conversation()
