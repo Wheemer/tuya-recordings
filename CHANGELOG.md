@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-23 (2026-11-13)
+
+### SD Playback
+
+- Refresh the selected recording day on the playback connection before starting video. Preserve the selected position while using the camera's current recording bounds and encryption metadata.
+- Reuse the day catalog when seeking, and stop playback before querying another day or a newly available recording range. Do not silently jump to a different recording when the selected position is absent.
+- Follow the Smart Life native SDK's completion handling: drain queued media before finishing, and report an empty completion promptly instead of waiting for a playback timeout.
+
+### Camera Connection
+
+- Keep native command signaling available when the LAN connection becomes ready before the signaling handshake finishes, rather than cancelling the handshake and discarding its pending offer.
+- Keep signaling attempts bounded and clean up pending work when the connection closes. Video and audio remain LAN-only, with no added background retries or live-preview commands.
+
 ## Tuya Recordings v0.4.13-22 (2026-11-12)
 
 ### Camera Connection
