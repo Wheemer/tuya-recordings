@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from contextlib import suppress
+from types import MethodType
 from typing import Any, Callable
 
 import tinytuya
@@ -15,7 +16,43 @@ from ..vendor.tuya_ipc_p2p_sdk.json_types import dp_integer
 _LAN_IPC_302 = 32
 _LAN_CONTROL = 7
 _LAN_TIMEOUT_SECONDS = 5.0
+_LAN_KEY_TIMEOUT_SECONDS = 10.0
 _DISCOVERY_CACHE_SECONDS = 900.0
+_KEY_RESPONSE = 4
+_KEY_RESPONSE_LIMIT = 64
+
+
+def _negotiate_lan_session(device: Any) -> bool:
+    """Keep unrelated LAN reports out of the APK's ReceiveSHello handler."""
+    deadline = time.monotonic() + _LAN_KEY_TIMEOUT_SECONDS
+    device._native_lan_early_reports = []
+    try:
+        if not device._send_receive_quick(
+            device._negotiate_session_key_generate_step_1(), None
+        ):
+            return False
+        for _ in range(_KEY_RESPONSE_LIMIT):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            device.socket.settimeout(remaining)
+            message = device._receive()
+            if not message.crc_good:
+                return False
+            if message.cmd != _KEY_RESPONSE:
+                if message.payload and message.cmd in (7, 8, 10, 16):
+                    report = device._decode_payload(message.payload)
+                    if isinstance(report, dict):
+                        device._native_lan_early_reports.append(report)
+                continue
+            finish = device._negotiate_session_key_generate_step_3(message)
+            if not finish or not device._send_receive_quick(finish, None):
+                return False
+            return bool(device._negotiate_session_key_generate_finalize())
+        return False
+    finally:
+        if device.socket is not None:
+            device.socket.settimeout(_LAN_TIMEOUT_SECONDS)
 
 
 class NativeLanSignalError(RuntimeError):
@@ -28,6 +65,18 @@ class NativeLanUnavailableError(NativeLanSignalError):
 
 class NativeLanDpReportError(NativeLanSignalError):
     """A dispatched LAN query lost its report channel."""
+
+
+def _matching_dp_report(message: Any, device_id: str, dp: str) -> int | None:
+    if (not isinstance(message, dict) or message.get("cid")
+            or message.get("devId") not in (None, "", device_id)):
+        return None
+    data = message.get("data", message)
+    dps = data.get("dps") if (
+        isinstance(data, dict) and not data.get("cid")
+        and data.get("devId") in (None, "", device_id)
+    ) else None
+    return dp_integer(dps.get(dp)) if isinstance(dps, dict) else None
 
 
 class Lan302Client:
@@ -161,6 +210,13 @@ class Lan302Client:
             device = self._device
             if device is None or self._reader is not None:
                 raise NativeLanUnavailableError("DP query needs an idle local socket")
+            reports = getattr(device, "_native_lan_early_reports", ())
+            device._native_lan_early_reports = []
+            for report in reports:
+                value = _matching_dp_report(report, self._device_id, dp)
+                if value is not None:
+                    self._query_state = "report_received"
+                    return value
             message = await _join_device_io(self._send_query, device, {
                 "devId": self._device_id, "uid": self._uid,
                 "t": int(time.time()), "dps": {dp: None},
@@ -168,16 +224,10 @@ class Lan302Client:
             while not self._closed:
                 if _is_device_error(message):
                     raise NativeLanDpReportError("Local DP report channel failed")
-                if isinstance(message, dict) and message.get("devId") in (None, "", self._device_id):
-                    data = message.get("data", message)
-                    dps = data.get("dps") if (
-                        isinstance(data, dict) and not data.get("cid")
-                        and data.get("devId") in (None, "", self._device_id)
-                    ) else None
-                    value = dp_integer(dps.get(dp)) if isinstance(dps, dict) else None
-                    if value is not None:
-                        self._query_state = "report_received"
-                        return value
+                value = _matching_dp_report(message, self._device_id, dp)
+                if value is not None:
+                    self._query_state = "report_received"
+                    return value
                 device.set_socketTimeout(0.25)
                 try:
                     message = await _join_device_io(device.receive)
@@ -293,6 +343,8 @@ class Lan302Client:
         device.set_socketPersistent(True)
         device.set_socketTimeout(_LAN_TIMEOUT_SECONDS)
         device.set_retry(False)
+        if protocol_version >= 3.4:
+            device._negotiate_session_key = MethodType(_negotiate_lan_session, device)
         return device
 
     def _connect_device(self, device: Any) -> None:
@@ -303,7 +355,7 @@ class Lan302Client:
             result = device._get_socket(False)
             if result is not True:
                 self._connect_state = "socket_failed"
-                code = result.get("Err") if isinstance(result, dict) else None
+                code = result.get("Err") if isinstance(result, dict) else result
                 self._connect_error = (f"tinytuya_{code}" if str(code).isascii()
                                        and str(code).isdecimal() and len(str(code)) <= 4 else "socket_unavailable")
                 self._discovery_cache.pop(self._device_id, None)

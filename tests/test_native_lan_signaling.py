@@ -1,6 +1,8 @@
 import asyncio
 import json
 import threading
+import hashlib
+import hmac
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -66,8 +68,149 @@ class FakeTinyTuya:
         return {"ip": "192.0.2.9", "version": "3.5"}
 
 
+@pytest.mark.parametrize("version", [3.4, 3.5])
+@pytest.mark.parametrize("preceding", [[], [8], [9, 8, 0, 8]])
+def test_lan_key_exchange_waits_for_shello_not_unsolicited_reports(monkeypatch, version, preceding):
+    """APK ReceiveSHello checks command 4, not the first nonempty payload."""
+    tiny = lan_module.tinytuya
+    device = tiny.Device("camera", "192.0.2.9", "0123456789abcdef", version=version)
+    sent = []
+    timeouts = []
+    device.socket = SimpleNamespace(settimeout=timeouts.append)
+    remote_nonce = b"remote-nonce-123"
+
+    def reply():
+        payload = remote_nonce + hmac.new(device.real_local_key, device.local_nonce, hashlib.sha256).digest()
+        if version == 3.4:
+            payload = tiny.AESCipher(device.real_local_key).encrypt(payload, False)
+        return tiny.TuyaMessage(2, 4, 0, payload, 0, True, 0, None)
+
+    incoming = iter([*(lambda command=command: tiny.TuyaMessage(
+        1, command, 0, b'{"dps":{"248":true}}', 0, True, 0, None
+    ) for command in preceding), reply])
+
+    def send(payload, retries):
+        assert retries is None
+        sent.append(payload)
+        return True
+
+    monkeypatch.setattr(device, "_send_receive_quick", send)
+    monkeypatch.setattr(device, "_receive", lambda: next(incoming)())
+    assert lan_module._negotiate_lan_session(device)
+    assert [payload.cmd for payload in sent] == [3, 5]
+    assert device.remote_nonce == remote_nonce
+    assert device.local_key != device.real_local_key
+    assert len(timeouts) == len(preceding) + 2
+    assert all(0 < value <= 10 for value in timeouts)
+    device.socket = None
+
+
+@pytest.mark.parametrize("failure", ["bad_hmac", "bad_crc", "short", "flood", "deadline", "finish_send"])
+def test_lan_key_exchange_failure_is_bounded_and_never_finalizes(monkeypatch, failure):
+    tiny = lan_module.tinytuya
+    device = tiny.Device("camera", "192.0.2.9", "0123456789abcdef", version=3.5)
+    device.socket = SimpleNamespace(settimeout=lambda _: None)
+    sent = []
+    received = []
+    finalized = []
+
+    def receive():
+        received.append(1)
+        payload = b"remote-nonce-123" + hmac.new(device.real_local_key, device.local_nonce, hashlib.sha256).digest()
+        if failure == "bad_hmac":
+            payload = b"x" * 48
+        elif failure == "short":
+            payload = b"x"
+        return tiny.TuyaMessage(2, 8 if failure == "flood" else 4, 0,
+                               payload, 0, failure != "bad_crc", 0, None)
+
+    def send(payload, retries):
+        sent.append(payload.cmd)
+        return not (failure == "finish_send" and payload.cmd == 5)
+
+    if failure == "deadline":
+        ticks = iter([0, 11])
+        monkeypatch.setattr(lan_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(device, "_receive", receive)
+    monkeypatch.setattr(device, "_send_receive_quick", send)
+    monkeypatch.setattr(device, "_negotiate_session_key_generate_finalize", lambda: finalized.append(1))
+    assert not lan_module._negotiate_lan_session(device)
+    assert not finalized
+    assert len(received) <= 64
+    assert sent == ([3, 5] if failure == "finish_send" else [3])
+    device.socket = None
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+def test_pinned_key_exchange_before_after_unsolicited_status(monkeypatch, fixed):
+    tiny = lan_module.tinytuya
+    device = tiny.Device("camera", "192.0.2.9", "0123456789abcdef", version=3.5)
+    writes = []
+    device.socket = SimpleNamespace(settimeout=lambda _: None, sendall=writes.append)
+    monkeypatch.setattr(device, "_get_socket", lambda _: True)
+    replies = 0
+    def receive():
+        nonlocal replies
+        replies += 1
+        if replies == 1:
+            return tiny.TuyaMessage(1, 8, 0, b'{"dps":{"248":1}}', 0, True, 0, None)
+        payload = b"remote-nonce-123" + hmac.new(device.real_local_key, device.local_nonce, hashlib.sha256).digest()
+        return tiny.TuyaMessage(2, 4, 0, payload, 0, True, 0, None)
+    monkeypatch.setattr(device, "_receive", receive)
+    negotiate = (lambda: lan_module._negotiate_lan_session(device)) if fixed else device._negotiate_session_key
+    assert negotiate() is fixed
+    assert [tiny.parse_header(raw).cmd for raw in writes] == ([3, 5] if fixed else [3])
+    assert replies == (2 if fixed else 1)
+    device.socket = None
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [{"Err": "901"}, {"Err": "secret-address"}, OSError("private")])
+@pytest.mark.parametrize("version", [3.4, 3.5])
+@pytest.mark.parametrize("report", [
+    {"devId": "camera", "dps": {"110": 1}},
+    {"devId": "other", "dps": {"110": 2}},
+    {"cid": "child", "dps": {"110": 2}},
+    {"cid": "child", "data": {"dps": {"110": 2}}},
+    {"dps": {"110": True}},
+])
+async def test_sd_report_during_key_exchange_is_preserved_and_identity_checked(monkeypatch, version, report):
+    tiny = lan_module.tinytuya
+    device = tiny.Device("camera", "192.0.2.9", "0123456789abcdef", version=version)
+    device.socket = SimpleNamespace(settimeout=lambda _: None)
+    replies = 0
+    def receive():
+        nonlocal replies
+        replies += 1
+        if replies == 1:
+            payload = json.dumps(report).encode()
+            command = 8
+        else:
+            payload = b"remote-nonce-123" + hmac.new(device.real_local_key, device.local_nonce, hashlib.sha256).digest()
+            command = 4
+        if version == 3.4:
+            payload = tiny.AESCipher(device.real_local_key).encrypt(payload, False)
+        return tiny.TuyaMessage(replies, command, 0, payload, 0, True, 0, None)
+    monkeypatch.setattr(device, "_receive", receive)
+    monkeypatch.setattr(device, "_send_receive_quick", lambda *a: True)
+    assert lan_module._negotiate_lan_session(device)
+    client = Lan302Client(uid="account", device_id="camera", session_id="session",
+                          local_key="0123456789abcdef", on_answer=lambda _: None,
+                          on_candidate=lambda _: None, on_disconnect=lambda _: None,
+                          preconnect=False, security_level=3)
+    client._device = device
+    queries = []
+    def query(*args):
+        queries.append(1)
+        return {"dps": {"110": 1}}
+    monkeypatch.setattr(client, "_send_query", query)
+    assert await client.async_query_direct_dp("110") == 1
+    assert bool(queries) is (report.get("devId") != "camera")
+    assert device._native_lan_early_reports == []
+    device.socket = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [901, 902, 914, {"Err": "901"}, {"Err": "secret-address"}, OSError("private")])
 async def test_lan_connection_failure_diagnostics_are_bounded_and_clear_discovery(monkeypatch, error):
     class Device(FakeDevice):
         def _get_socket(self, renew):
@@ -85,6 +228,8 @@ async def test_lan_connection_failure_diagnostics_are_bounded_and_clear_discover
     with pytest.raises((lan_module.NativeLanUnavailableError, OSError)):
         await client.async_connect()
     assert "connect_state=socket_failed" in client.diagnostics
+    if isinstance(error, int):
+        assert f"connect_error=tinytuya_{error}" in client.diagnostics
     assert "camera" not in Lan302Client._discovery_cache
     assert client._device.retry_limit == 0
     assert not any(secret in client.diagnostics for secret in ("secret-address", "private", "192.0.2.9", "0123456789abcdef"))
