@@ -129,22 +129,27 @@ def encode_catalog_request(
 
 
 def encode_recording_month_request(*, request_id: int, channel: int, month: date) -> bytes:
-    """GetRecordDaysByMonth: channel, zero, zero, integer YYYYMM (3/0)."""
+    """GetRecordDaysByMonth: channel, year, month, reserved zero (3/0)."""
     _uint32("request_id", request_id)
     _non_negative("channel", channel)
     if not isinstance(month, date):
         raise NativeSimpleError("Recording month must be a date")
     return _command(request_id, 0, 3, 0,
-                    struct.pack("<4i", channel, 0, 0, month.year * 100 + month.month))
+                    struct.pack("<4i", channel, month.year, month.month, 0))
 
 
 def decode_recording_month_reply(command: NativeSimpleCommand, *, request_id: int, month: date) -> list[date]:
     """Read SDK callback mask at 0x0c, or 0x4c in its extended envelope."""
     if command.request_id != request_id or command.control != 1:
         raise NativeSimpleError("Recording month response has another request ID")
+    if (command.high_command, command.low_command) != (3, 0):
+        raise NativeSimpleError("Recording month response has another command")
     offsets = {16: 12, 80: 76}
     if len(command.payload) not in offsets:
-        raise NativeSimpleError("Recording month response has an invalid size")
+        raise NativeSimpleError(
+            f"Recording month response has an invalid size: {len(command.payload)} bytes "
+            "(expected 16 or 80)"
+        )
     mask = struct.unpack_from("<I", command.payload, offsets[len(command.payload)])[0]
     maximum = calendar.monthrange(month.year, month.month)[1]
     return [date(month.year, month.month, day) for day in range(1, maximum + 1) if mask & (1 << day)]

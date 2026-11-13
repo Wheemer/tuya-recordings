@@ -1,5 +1,16 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-27 (2026-11-13)
+
+### Media Sync
+
+- Correct the monthly recording query to send channel, year, month, and reserved zero in the order used by the Smart Life APK. This repairs a malformed request encountered when Sync queries the recording calendar.
+- Preserve the existing working playback and seeking paths. No additional wake attempts, retries, or background queries are introduced.
+
+### Diagnostics
+
+- Include the actual response length, command, and connection diagnostics if a monthly recording reply is invalid, rather than reporting only an invalid size.
+
 ## Tuya Recordings v0.4.13-26 (2026-11-13)
 
 ### SD Playback

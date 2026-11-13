@@ -30,6 +30,23 @@ ANSWER_KEY = bytes(range(16, 32))
 
 
 @pytest.mark.asyncio
+async def test_month_query_reports_actual_invalid_reply_size_and_transport(monkeypatch):
+    playback = session()
+    monkeypatch.setattr(playback, "_require_connected", lambda: None)
+    monkeypatch.setattr(playback, "_allocate_request_id", lambda: 42)
+    requests = []
+    monkeypatch.setattr(playback, "_send_control", requests.append)
+    async def receive(_queue):
+        return NativeSimpleCommand(42, 1, 3, 0, bytes(8))
+    monkeypatch.setattr(playback, "_receive_or_transport_failure", receive)
+    with pytest.raises(NativeRelayPlaybackError, match="invalid size: 8 bytes") as error:
+        await playback.query_recording_days(date(2026, 11, 1))
+    assert struct.unpack_from("<4i", requests[0], 20) == (0, 2026, 11, 0)
+    assert "command=3/0, control=1" in str(error.value)
+    assert "transport=direct-ice" in str(error.value)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", [(7, 0), (7, 21), (100, 20)])
 async def test_completion_drains_media_and_ignores_other_tasks(command):
     playback = session()
@@ -590,7 +607,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                 return
             if (high, low) != (3, 1):
                 if background_followup and (high, low) == (3, 0):
-                    assert struct.unpack_from("<4i", command, 20) == (0, 0, 0, 202609)
+                    assert struct.unpack_from("<4i", command, 20) == (0, 2026, 9, 0)
                     events.append("month")
                     payload = struct.pack("<4I", 0, 0, 0, 1 << 14)
                     self.handler(encrypt_record(ANSWER_KEY, struct.pack(

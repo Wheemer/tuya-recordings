@@ -39,10 +39,12 @@ def test_encodes_apk_catalog_command():
     assert struct.unpack_from("<4i", packet, 20) == (0, 2026, 9, 18)
 
 
-def test_month_request_matches_native_channel_and_integer_month():
-    packet = encode_recording_month_request(request_id=42, channel=0, month=date(2026, 11, 1))
+@pytest.mark.parametrize("month", [date(2026, 11, 1), date(2027, 1, 31), date(2028, 2, 29)])
+@pytest.mark.parametrize("channel", [0, 2])
+def test_month_request_matches_apk_channel_year_month_reserved(month, channel):
+    packet = encode_recording_month_request(request_id=42, channel=channel, month=month)
     assert header(packet) == (0x12345678, 42, 0, 3, 0, 16)
-    assert struct.unpack_from("<4i", packet, 20) == (0, 0, 0, 202611)
+    assert struct.unpack_from("<4i", packet, 20) == (channel, month.year, month.month, 0)
 
 
 @pytest.mark.parametrize("size,offset", [(16, 12), (80, 76)])
@@ -57,7 +59,13 @@ def test_month_reply_decodes_both_native_callback_layouts(size, offset):
 
 def test_month_reply_rejects_truncated_payload():
     command = NativeSimpleCommand(42, 1, 3, 0, bytes(15))
-    with pytest.raises(NativeSimpleError, match="invalid size"):
+    with pytest.raises(NativeSimpleError, match="invalid size: 15 bytes"):
+        decode_recording_month_reply(command, request_id=42, month=date(2026, 11, 1))
+
+
+def test_month_reply_rejects_another_command():
+    command = NativeSimpleCommand(42, 1, 3, 1, bytes(16))
+    with pytest.raises(NativeSimpleError, match="another command"):
         decode_recording_month_reply(command, request_id=42, month=date(2026, 11, 1))
 
 
