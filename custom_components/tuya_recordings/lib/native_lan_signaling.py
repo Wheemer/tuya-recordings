@@ -77,6 +77,8 @@ class Lan302Client:
         self._received_messages = 0
         self._invalid_messages = 0
         self._signals: dict[str, int] = {}
+        self._connect_state = "not_started"
+        self._connect_error = "none"
 
     @property
     def diagnostics(self) -> str:
@@ -85,7 +87,8 @@ class Lan302Client:
         return (f"version={version}, query_protocol={self._query_protocol}, query_state={self._query_state}, "
                 f"reader={self._reader_state}, received={self._received_messages}, "
                 f"invalid_shape={self._invalid_messages}, session_mismatches={self._session_mismatches}, "
-                f"signals={self._signals or 'none'}")
+                f"signals={self._signals or 'none'}, connect_state={self._connect_state}, "
+                f"connect_error={self._connect_error}")
 
     def configure_offer_metadata(self, *, moto_id: str, security_level: int, preconnect: bool) -> None:
         """Reuse the established device socket for a native LAN offer."""
@@ -106,6 +109,7 @@ class Lan302Client:
         """Discover the single configured device and open one local socket."""
         async with self._lock:
             if self._device is None:
+                self._connect_state = "discovering"
                 opening = asyncio.create_task(asyncio.to_thread(self._open_device))
                 try:
                     self._device = await asyncio.shield(opening)
@@ -113,7 +117,13 @@ class Lan302Client:
                     with suppress(Exception):
                         self._device = await _finish_device_io(opening)
                     raise
+                except (NativeLanSignalError, OSError) as error:
+                    self._connect_state = "discovery_failed"
+                    self._connect_error = type(error).__name__
+                    raise
+                self._connect_state = "connecting"
                 await _join_device_io(self._connect_device, self._device)
+                self._connect_state = "connected"
 
     async def async_send_offer(
         self,
@@ -290,9 +300,19 @@ class Lan302Client:
         # Open once before sending an offer, then forbid implicit reconnects.
         device.set_socketRetryLimit(1)
         try:
-            if device._get_socket(False) is not True:
+            result = device._get_socket(False)
+            if result is not True:
+                self._connect_state = "socket_failed"
+                code = result.get("Err") if isinstance(result, dict) else None
+                self._connect_error = (f"tinytuya_{code}" if str(code).isascii()
+                                       and str(code).isdecimal() and len(str(code)) <= 4 else "socket_unavailable")
                 self._discovery_cache.pop(self._device_id, None)
                 raise NativeLanUnavailableError("Camera LAN socket is unavailable")
+        except OSError as error:
+            self._connect_state = "socket_failed"
+            self._connect_error = type(error).__name__
+            self._discovery_cache.pop(self._device_id, None)
+            raise
         finally:
             device.set_socketRetryLimit(0)
 

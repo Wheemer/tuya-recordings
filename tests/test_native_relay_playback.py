@@ -390,8 +390,12 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             events.append("broker-closed")
 
         async def subscribe(self, topic, *, qos, timeout):
-            assert (topic, qos) == (f"smart/mb/in/{dev}", 1)
-            return (1,)
+            assert qos == 1
+            if isinstance(topic, str):
+                assert topic == f"smart/mb/in/{dev}"
+                return (1,)
+            assert topic == [("smart/mb/account-uid", 1), ("p1000018/mb/account-uid", 1)]
+            return (1, 1)
 
         async def publish(self, topic, payload, *, qos, **kwargs):
             nonlocal background_sleeping
@@ -1394,8 +1398,9 @@ async def test_mixed_sd_status_falls_back_only_after_lan_send_failure(monkeypatc
         return
     await playback._maybe_send_wake(Broker())
     if outcome == "unavailable":
-        assert calls == ["wake", "lan-connect", "lan-close"]
-        assert playback._sd_status_query == "route_or_schema_unconfirmed"
+        assert calls == ["wake", "lan-connect", "lan-close", "mqtt-query"]
+        assert playback._sd_status_query == "report_received"
+        assert playback._sd_status_route_basis == "lan_connect_error"
     else:
         assert calls == ["wake", "lan-connect", "lan-query", "lan-close"] + (
             ["mqtt-query"] if outcome == "send_failed" else []

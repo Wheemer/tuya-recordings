@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-25 (2026-11-13)
+
+### Camera Connection
+
+- Receive SD-card status updates on the account MQTT topics used by the Smart Life SDK, alongside the existing camera-topic replies. Match each report to the requested camera and DP before allowing playback to connect.
+- Follow the APK's fallback routing after a LAN connection failure, as well as a failed LAN query send.
+- Keep account subscriptions on the existing MQTT connection. Denied account subscriptions do not disable working camera-topic replies; no additional wakes, SD queries, or playback retries are introduced. Video and audio remain LAN-only.
+
+### Diagnostics
+
+- Report account-subscription outcomes and retain the LAN connection stage and bounded error codes when SD readiness fails, without exposing account topics, addresses, credentials, or report contents.
+
 ## Tuya Recordings v0.4.13-24 (2026-11-13)
 
 ### SD Playback

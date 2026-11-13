@@ -67,6 +67,32 @@ class FakeTinyTuya:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error", [{"Err": "901"}, {"Err": "secret-address"}, OSError("private")])
+async def test_lan_connection_failure_diagnostics_are_bounded_and_clear_discovery(monkeypatch, error):
+    class Device(FakeDevice):
+        def _get_socket(self, renew):
+            if isinstance(error, Exception):
+                raise error
+            return error
+
+    monkeypatch.setattr(lan_module, "tinytuya", FakeTinyTuya)
+    monkeypatch.setattr(FakeTinyTuya, "Device", Device)
+    Lan302Client._discovery_cache.clear()
+    client = Lan302Client(uid="account", device_id="camera", session_id="session",
+                          local_key="0123456789abcdef", on_answer=lambda _: None,
+                          on_candidate=lambda _: None, on_disconnect=lambda _: None,
+                          preconnect=False, security_level=3)
+    with pytest.raises((lan_module.NativeLanUnavailableError, OSError)):
+        await client.async_connect()
+    assert "connect_state=socket_failed" in client.diagnostics
+    assert "camera" not in Lan302Client._discovery_cache
+    assert client._device.retry_limit == 0
+    assert not any(secret in client.diagnostics for secret in ("secret-address", "private", "192.0.2.9", "0123456789abcdef"))
+    await client.async_close()
+    assert client._device is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [0, "0"])
 async def test_lan_dp_query_uses_control_frame_and_ignores_ack(monkeypatch, status):
     replies = iter([
