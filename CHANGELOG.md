@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-26 (2026-11-13)
+
+### SD Playback
+
+- Keep video and audio playing across overlapping recording-fragment transitions, including late packets from the preceding fragment.
+- Restore delivery of later seek commands after an earlier retransmission finishes. Recover bounded packet loss on the existing connection and report an exhausted transport promptly.
+
+### Camera Connection
+
+- Follow the Smart Life APK's LAN key-exchange dispatcher: wait for the authenticated handshake response instead of mistaking an unrelated status update for it, using the native ten-second negotiation timeout.
+- Preserve SD-status reports received during key exchange so a valid report can complete readiness without a redundant query. Reject unrelated cameras, child-device reports, and invalid status values.
+- Retain actual LAN connection error codes in sanitized diagnostics. No additional wake attempts or background retries are introduced; video and audio remain LAN-only.
+
 ## Tuya Recordings v0.4.13-25 (2026-11-13)
 
 ### Camera Connection
