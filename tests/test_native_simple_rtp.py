@@ -26,6 +26,16 @@ def test_unmarked_access_unit_keeps_its_own_camera_timestamp():
     assert unpacker.completed_timestamps == (1790000000000, 1790000000200)
 
 
+def test_unmarked_access_unit_keeps_its_clock_scale_when_next_packet_switches_clock():
+    unpacker = NativeH264RtpDepacketizer()
+    assert unpacker.push(NativeRtpPacket(96, False, 1, 90000, 1, b"\x61first"),
+        presentation_timestamp=90000, timestamp_scale=90000) == ()
+    assert len(unpacker.push(NativeRtpPacket(96, True, 2, 108000, 1, b"\x61second"),
+        presentation_timestamp=1790000000200, timestamp_scale=1000)) == 2
+    assert unpacker.completed_timestamps == (90000, 1790000000200)
+    assert unpacker.completed_timestamp_scales == (90000, 1000)
+
+
 def test_audio_extension_supplies_format_indices():
     header = bytes(16) + struct.pack("<I", 1) + bytes(4)
     extension = struct.pack("<BB3H", 0, 0, 3, 1, 1)

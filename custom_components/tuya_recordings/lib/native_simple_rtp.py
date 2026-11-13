@@ -132,27 +132,35 @@ class NativeH264RtpDepacketizer:
         self._fragment: bytearray | None = None
         self._frame_bytes = 0
         self._presentation_timestamp: int | None = None
+        self._presentation_scale: int | None = None
         self.completed_timestamps: tuple[int, ...] = ()
+        self.completed_timestamp_scales: tuple[int, ...] = ()
 
-    def push(self, packet: NativeRtpPacket, *, presentation_timestamp: int | None = None) -> tuple[bytes, ...]:
+    def push(self, packet: NativeRtpPacket, *, presentation_timestamp: int | None = None, timestamp_scale: int = 90000) -> tuple[bytes, ...]:
         if not packet.payload:
             raise NativeSimpleRtpError("H.264 RTP payload is empty")
         completed: list[bytes] = []
         times: list[int] = []
+        scales: list[int] = []
         self.completed_timestamps = ()
+        self.completed_timestamp_scales = ()
         if self._timestamp is not None and packet.timestamp != self._timestamp:
             previous_time = self._presentation_timestamp
+            previous_scale = self._presentation_scale
             previous = self._finish()
             if previous is not None:
                 completed.append(previous)
                 assert previous_time is not None
                 times.append(previous_time)
+                assert previous_scale is not None
+                scales.append(previous_scale)
         if self._last_sequence is not None and packet.sequence != (
             self._last_sequence + 1
         ) & 0xFFFF:
             self._reset()
         if self._timestamp is None:
             self._presentation_timestamp = packet.timestamp if presentation_timestamp is None else presentation_timestamp
+            self._presentation_scale = timestamp_scale
         self._timestamp = packet.timestamp
         self._last_sequence = packet.sequence
         self._frame_bytes += len(packet.payload)
@@ -172,15 +180,20 @@ class NativeH264RtpDepacketizer:
             )
         if not packet.marker:
             self.completed_timestamps = tuple(times)
+            self.completed_timestamp_scales = tuple(scales)
             return tuple(completed)
         current_time = self._presentation_timestamp
+        current_scale = self._presentation_scale
         current = self._finish()
         if current is None:
             raise NativeSimpleRtpError("H.264 marker ended an incomplete access unit")
         completed.append(current)
         assert current_time is not None
         times.append(current_time)
+        assert current_scale is not None
+        scales.append(current_scale)
         self.completed_timestamps = tuple(times)
+        self.completed_timestamp_scales = tuple(scales)
         return tuple(completed)
 
     def _push_stap_a(self, payload: bytes) -> None:
@@ -221,6 +234,7 @@ class NativeH264RtpDepacketizer:
         self._fragment = None
         self._frame_bytes = 0
         self._presentation_timestamp = None
+        self._presentation_scale = None
 
     def _finish(self) -> bytes | None:
         if self._fragment is not None or not self._units:
