@@ -1244,7 +1244,14 @@ class NativeRelayPlaybackSession:
         while True:
             command = await self._receive_or_transport_failure(self._control_messages)
             if command.request_id == request_id:
-                return decode_recording_month_reply(command, request_id=request_id, month=month)
+                try:
+                    return decode_recording_month_reply(command, request_id=request_id, month=month)
+                except NativeSimpleError as err:
+                    raise NativeRelayPlaybackError(
+                        f"Camera returned an invalid recording month reply: {err}; "
+                        f"command={command.high_command}/{command.low_command}, "
+                        f"control={command.control} ({self.transport_diagnostics})"
+                    ) from err
 
     async def query_event_recordings(self, day: date) -> NativeV4CatalogPage:
         """Collect the event day, serializing bounded legacy page requests."""
