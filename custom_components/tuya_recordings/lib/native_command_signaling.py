@@ -124,6 +124,8 @@ class NativeCommandSignaling:
                 raise
             except Exception as error:
                 self._failure = type(error).__name__
+                self._queued.clear()
+                self._channel.discard_pending()
                 await self._connection.async_close()
 
         self._state = "connecting"
@@ -249,13 +251,15 @@ class NativeCommandSignaling:
 
     def _on_tcp_closed(self, error: Exception | None) -> None:
         self._tcp_ready = False
+        self._queued.clear()
+        self._channel.discard_pending()
         if not self._closed and not self._bootstrap_finished:
             self._state = "tcp_closed_direct_ready" if self._direct_ready else "tcp_closed"
         if error is not None and not self._closed:
             self._failure = type(error).__name__
 
     async def finish_bootstrap(self) -> None:
-        """Close TCP after the answer; leave only direct command signaling."""
+        """Close signaling TCP at teardown; preserve direct receive state."""
         self._bootstrap_finished = True
         self._tcp_ready = False
         self._queued.clear()

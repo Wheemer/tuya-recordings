@@ -48,6 +48,135 @@ TOKEN = {
 }
 
 
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("interactive", [False, True])
+def test_fresh_catalog_start_and_camera_completion(empty, interactive):
+    from custom_components.tuya_recordings.lib.native_relay_playback import NativePlaybackCompleted
+
+    class CompletingPlayback(Playback):
+        transport_diagnostics = "fixture-direct-LAN"
+
+        async def start(self, **kwargs):
+            assert self.queries == [date(2026, 11, 12)]
+            await super().start(**kwargs)
+            if empty:
+                while not self.frames.empty():
+                    self.frames.get_nowait()
+
+        async def receive_frame(self):
+            if self.frames.empty():
+                raise NativePlaybackCompleted
+            return await super().receive_frame()
+
+    playback = CompletingPlayback()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    request = NativePlaybackRequest(start=100, end=110, catalog_day=date(2026, 11, 12))
+    events = []
+    operation = (runtime._interactive_connected(playback, request, events.append, queue.Queue())
+                 if interactive else runtime._stream_connected(playback, request, events.append))
+    if empty:
+        with pytest.raises(NativeRelayRuntimeError, match="completed SD playback before delivering both"):
+            asyncio.run(asyncio.wait_for(operation, 1))
+        assert not any(event["payload"]["type"] == "finished" for event in events)
+    else:
+        asyncio.run(asyncio.wait_for(operation, 1))
+        assert events[-1]["payload"]["type"] == "finished"
+    assert playback.stop_count == 1
+
+
+def test_fresh_catalog_rejects_missing_position_without_starting_playback():
+    playback = Playback()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    request = NativePlaybackRequest(start=200, end=210, catalog_day=date(2026, 11, 12))
+    with pytest.raises(NativeRelayRuntimeError, match="fresh SD catalog does not contain"):
+        asyncio.run(runtime._stream_connected(playback, request, lambda event: None))
+    assert playback.start_calls == []
+    assert playback.queries == [request.catalog_day]
+
+
+def test_fresh_catalog_preserves_position_and_updates_bounds_and_encryption():
+    from custom_components.tuya_recordings.lib.native_v4 import NativeV4CatalogPage, NativeV4Recording
+
+    class Catalog(Playback):
+        async def query_recordings(self, day):
+            self.queries.append(day)
+            return NativeV4CatalogPage(1, 0, "", 1, 1, 1, (
+                NativeV4Recording(102, 108, encrypt=1, uuid="fresh-secret-id"),
+            ))
+
+    playback = Catalog()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    request = NativePlaybackRequest(start=100, end=110, play_time=105, catalog_day=date(2026, 11, 12))
+    prepared = asyncio.run(runtime._prepare_playback_request(playback, request, {}))
+    assert (prepared.start, prepared.end, prepared.position) == (102, 108, 105)
+    assert prepared.encrypted and prepared.encryption_uuid == "fresh-secret-id"
+    assert json.loads(prepared.fragments_json) == {"fragments": [{"start": 102, "end": 108}]}
+    assert playback.queries == [request.catalog_day]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_playback_catalog_timeout_or_cancel_does_not_send_start(cancel):
+    class Catalog(Playback):
+        transport_diagnostics = "fixture-LAN-catalog"
+
+        async def query_recordings(self, day):
+            await asyncio.Event().wait()
+
+    playback = Catalog()
+    cancelled = threading.Event()
+    if cancel:
+        cancelled.set()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION,
+                                        signaling_timeout=0.01, cancel_event=cancelled)
+    request = NativePlaybackRequest(start=100, end=110, catalog_day=date(2026, 11, 12))
+    with pytest.raises(NativeRelayRuntimeError, match="cancelled" if cancel else "catalog timed out"):
+        asyncio.run(runtime._stream_connected(playback, request, lambda event: None))
+    assert playback.start_calls == []
+
+
+@pytest.mark.parametrize("next_day", [12, 13])
+def test_catalog_is_reused_for_seeks_and_new_ranges_are_queried_only_after_stop(next_day):
+    from custom_components.tuya_recordings.lib.native_v4 import NativeV4CatalogPage, NativeV4Recording
+
+    class Timeline(Playback):
+        def __init__(self):
+            super().__init__()
+            self.operations = []
+
+        async def query_recordings(self, day):
+            assert not self._playback_started
+            self.operations.append(("query", day.day))
+            start = 100 if sum(op[0] == "query" for op in self.operations) == 1 else 200
+            return NativeV4CatalogPage(1, 0, "", 1, 1, 1, (NativeV4Recording(start, start + 10),))
+
+        async def start(self, **kwargs):
+            self.operations.append(("start", kwargs["play_time"]))
+            await super().start(**kwargs)
+
+        async def seek(self, **kwargs):
+            self.operations.append(("seek", kwargs["play_time"]))
+
+        async def stop(self):
+            self.operations.append(("stop", None))
+            await super().stop()
+
+    playback = Timeline()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    request = NativePlaybackRequest(start=100, end=110, catalog_day=date(2026, 11, 12))
+    commands = queue.Queue()
+    commands.put(("seek", replace(request, play_time=105)))
+    # Pause breaks seek coalescing, allowing both seeks to be exercised.
+    commands.put(("pause", None))
+    commands.put(("seek", replace(request, start=200, end=210, play_time=205, catalog_day=date(2026, 11, next_day))))
+    commands.put(("stop", None))
+    playback.pause = lambda: asyncio.sleep(0)
+    asyncio.run(runtime._interactive_connected(playback, request, lambda event: None, commands))
+    assert playback.operations == [
+        ("query", 12), ("start", 100), ("seek", 105), ("stop", None),
+        ("query", next_day), ("start", 205), ("stop", None),
+    ]
+
+
 @pytest.mark.parametrize("kind", ["clip", "timeline", "day", "month", "events", "thumbnail"])
 @pytest.mark.parametrize("manual", [False, True])
 def test_worker_only_enables_offer_resends_for_manual_camera_requests(kind, manual):
