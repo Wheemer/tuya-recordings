@@ -205,6 +205,7 @@ class NativeRelayPlaybackSession:
         self._moto: MotoClient | Lan302Client | None = None
         self._status_lan: Lan302Client | None = None
         self._answer_lan: Lan302Client | None = None
+        self._failed_lan_answer_details = "not_open"
         self._answer_mqtt: MotoClient | None = None
         self._lan_answers_alive = False
         self._mqtt_answers_alive = False
@@ -369,7 +370,7 @@ class NativeRelayPlaybackSession:
             f"answer_channels=(mqtt={self._mqtt_answers_alive}, lan={self._lan_answers_alive}, "
             f"source={self._answer_source}, duplicates={self._duplicate_answers}, "
             f"failures={self._answer_channel_failures}), "
-            f"lan_answer_details=({getattr(lan_answers, 'diagnostics', 'not_open')}), "
+            f"lan_answer_details=({getattr(lan_answers, 'diagnostics', self._failed_lan_answer_details)}), "
             f"lan={self._lan_status}, offer={self._offer_status}, "
             "offer_delivery=unconfirmed, "
             f"answer={self._answer_status}, "
@@ -782,6 +783,7 @@ class NativeRelayPlaybackSession:
             await lan.async_listen()
         except (NativeLanSignalError, OSError) as error:
             self._answer_channel_failures["LAN"] = type(error).__name__
+            self._failed_lan_answer_details = lan.diagnostics
             if not await _bounded_cleanup(lan.async_close()):
                 raise NativeRelayPlaybackError("LAN answer listener cleanup timed out") from error
             self._answer_lan = None

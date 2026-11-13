@@ -1,5 +1,12 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-28 (2026-11-13)
+
+### Connection Diagnostics
+
+- Retain the LAN answer listener's sanitized discovery, socket, and key-negotiation failure details after cleanup, instead of reporting only that the listener is not open.
+- This diagnostic update helps distinguish the connection failure reported in #62; it does not claim to fix that connection. Playback, seeking, routing, wake behavior, and retries are unchanged.
+
 ## Tuya Recordings v0.4.13-27 (2026-11-13)
 
 ### Media Sync
