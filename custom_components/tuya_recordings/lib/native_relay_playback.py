@@ -927,13 +927,14 @@ class NativeRelayPlaybackSession:
         if dp and config.sd_status_mqtt_capable and type(online) is bool:
             use_mqtt = online
             self._sd_status_route_basis = "mqtt_online_report"
-        if self._sd_status_query == "lan_send_failed":
+        if self._sd_status_query in {"lan_unavailable", "lan_send_failed"}:
+            lan_connect_failed = self._sd_status_query == "lan_unavailable"
             route = config.sd_status_lan_error_route
             if route not in {"mqtt", "http"}:
                 return
             dp = config.sd_status_lan_dp
             use_mqtt = route == "mqtt"
-            self._sd_status_route_basis = "lan_send_error"
+            self._sd_status_route_basis = "lan_connect_error" if lan_connect_failed else "lan_send_error"
         if not dp.isascii() or not dp.isdecimal():
             if self._sd_status_query != "lan_send_failed":
                 self._sd_status_query = "route_or_schema_unconfirmed"

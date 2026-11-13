@@ -1394,8 +1394,9 @@ async def test_mixed_sd_status_falls_back_only_after_lan_send_failure(monkeypatc
         return
     await playback._maybe_send_wake(Broker())
     if outcome == "unavailable":
-        assert calls == ["wake", "lan-connect", "lan-close"]
-        assert playback._sd_status_query == "route_or_schema_unconfirmed"
+        assert calls == ["wake", "lan-connect", "lan-close", "mqtt-query"]
+        assert playback._sd_status_query == "report_received"
+        assert playback._sd_status_route_basis == "lan_connect_error"
     else:
         assert calls == ["wake", "lan-connect", "lan-query", "lan-close"] + (
             ["mqtt-query"] if outcome == "send_failed" else []

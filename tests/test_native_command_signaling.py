@@ -410,8 +410,11 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
-    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False)])
+    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
+    lan_connect_fallback = mode == "lan_connect_fallback"
+    if lan_connect_fallback:
+        mode = "answer"
     late_tcp_answer = mode == "late_tcp_answer"
     if late_tcp_answer:
         mode = "no_answer_udp"
@@ -466,6 +469,18 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         config = replace(config, sd_low_power_wake=True, wake_direct=True,
                          sd_status_mqtt_dp="110", sd_status_mqtt_capable=True,
                          sd_status_lan_dp="")
+        if lan_connect_fallback:
+            # The LAN error callback uses sendCommand, not the stale initial
+            # HTTP route. Preserve the subscribed report listener throughout.
+            config = replace(config, sd_status_lan_dp="110", sd_status_mqtt_dp="",
+                             sd_status_http_dp="110", sd_status_lan_error_route="mqtt")
+            class FailedLan:
+                diagnostics = "fixture socket unavailable"
+                def __init__(self, **kwargs): pass
+                async def async_connect(self):
+                    raise playback.NativeLanUnavailableError("fixture socket unavailable")
+                async def async_close(self): pass
+            monkeypatch.setattr(playback, "Lan302Client", FailedLan)
         from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
         commands = CameraCommandQueue()
         monkeypatch.setattr(playback, "CAMERA_COMMANDS", commands)
@@ -473,7 +488,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             assert commands.reserve_wake(config.dev_id)
             until = time.monotonic() + 0.05
             commands._wake_after[config.dev_id] = until
-            config = replace(config, sd_status_lan_dp="110")
+            config = replace(config, sd_status_lan_dp="110", sd_status_lan_error_route="mqtt")
             class UnavailableLan:
                 diagnostics = "fixture unavailable before query"
                 def __init__(self, **kwargs): pass
@@ -483,6 +498,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 async def async_query_direct_dp(self, dp):
                     assert lan_after_wake and dp == "110"
                     events.append("SD status")
+                    if lan_connect_fallback:
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "dps": {"248": 1}}, 0, 4, "2.3"))
+                        assert self._dp_query is not None and not self._dp_query[1].done()
                     return 1
                 async def async_listen(self): pass
                 async def async_close(self): pass
@@ -631,6 +650,15 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert topic == f"smart/mb/out/{config.dev_id}"
                 protocol, body = decode_payload(config.local_key.encode(), payload)
                 if protocol == 5:
+                    if lan_connect_fallback:
+                        # Independently inspect the APK PV2.3 GCM envelope,
+                        # rather than accepting our own decoder's roundtrip.
+                        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                        assert payload[:3] == b"2.3" and payload[11] == 0
+                        decoded = json.loads(AESGCM(config.local_key.encode()).decrypt(
+                            payload[12:24], payload[24:], payload[:12]))
+                        assert decoded["protocol"] == 5
+                        assert decoded["data"] == {"dps": {"110": None}}
                     assert not lan_after_wake, "Wake must reselect the available LAN route"
                     assert qos == 1 and body == {"dps": {"110": None}}
                     assert events == ["wake"]
@@ -904,7 +932,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert events == ["wake", "SD status"]
                 assert peer.opened == 0 and not peer.offers
                 assert "sd_status_send_route=mqtt" in str(error.value)
-                assert "sd_status_route_basis=inventory" in str(error.value)
+                assert f"sd_status_route_basis={'lan_connect_error' if cooldown else 'inventory'}" in str(error.value)
                 assert "sd_status_dispatch=sent" in str(error.value)
                 assert "sd_status_inventory_route=mqtt" in str(error.value)
                 assert "sd_status_online_report=None" in str(error.value)
