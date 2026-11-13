@@ -188,6 +188,12 @@ class NativeRelayPlaybackSession:
         self._mqtt_identity = _mqtt_identity(
             app_session, config.app_region, config.app_profile_id
         )
+        # bddqqbb/qqddbpb select the consumer and SDK account update topics.
+        # Both are exact authenticated-account subscriptions, never wildcards.
+        self._account_topics = (
+            f"smart/mb/{app_session['uid']}",
+            f"{app_session['partner_identity']}/mb/{app_session['uid']}",
+        )
         self._control_messages: asyncio.Queue[NativeSimpleCommand] = asyncio.Queue(
             maxsize=_CONTROL_QUEUE_LIMIT
         )
@@ -735,6 +741,7 @@ class NativeRelayPlaybackSession:
             security_level=self._native_config.p2p_security_level,
             moto_id=self._stream_config.moto_id if self._stream_config else "",
             on_failure=self._on_signaling_failure,
+            account_topics=self._account_topics,
         )
     async def _connect_auxiliary_mqtt(self, session_id: str) -> None:
         """Subscribe for answers without making broker availability a LAN gate."""

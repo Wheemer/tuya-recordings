@@ -28,6 +28,82 @@ from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.signaling.envelop
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic", ["smart/mb/account", "partner/mb/account"])
+@pytest.mark.parametrize("string_map", [False, True])
+async def test_account_sd_status_report_completes_the_pending_device_query(topic, string_map):
+    client = MotoClient(
+        identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+        uid="account", device_id="camera", session_id="session", local_key="0123456789abcdef",
+        on_answer=lambda _: pytest.fail("Account reports cannot carry native answers"),
+        on_candidate=lambda _: None, on_disconnect=lambda _: None,
+        account_topics=("smart/mb/account", "partner/mb/account"),
+    )
+    with client.dp_report_listener("110") as reply:
+        def receive(data, *, route=topic, protocol=4):
+            client._consume_message(route, json.dumps({"protocol": protocol, "data": data}).encode())
+        receive({"gwId": "other", "dps": '{"110":1}'})
+        receive({"dps": '{"110":1}'})
+        receive({"gwId": "camera", "devId": "other", "dps": '{"110":1}'})
+        receive({"gwId": "camera", "cid": "child", "dps": '{"110":1}'})
+        receive({"gwId": "camera", "dps": '{"110":1}'}, route="smart/mb/other-account")
+        receive({"gwId": "camera", "dps": '{"110":1}'}, protocol=302)
+        receive({"gwId": "camera", "dps": '{"248":1}'})
+        receive({"gwId": "camera", "dps": '{"110":true}'})
+        client._consume_message(topic, b'{"protocol":4,"data":')
+        client._consume_message(topic, b"x" * 65537)
+        assert not reply.done()
+        data = {"devId": "camera", "dps": {"110": "1"}}
+        if string_map:
+            data = {"gwId": "camera", "dps": '{"110":"1"}'}
+        receive(data)
+        assert await reply == 1
+        assert "account_received=" in client.diagnostics and "dp_report_accepted=1" in client.diagnostics
+        assert not any(value in client.diagnostics for value in (topic, "0123456789abcdef", "other-account"))
+    assert client._dp_query is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grants", [(1, 1), (128, 1), (128, 128)])
+async def test_account_subscriptions_share_one_connection_and_keep_device_replies(monkeypatch, grants):
+    calls = []
+    messages = asyncio.Queue()
+    class Broker:
+        def __init__(self, **kwargs):
+            calls.append("connection")
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): calls.append("closed")
+        async def subscribe(self, topic, **kwargs):
+            calls.append(topic)
+            return (1,) if isinstance(topic, str) else grants
+        @property
+        def messages(self):
+            async def stream():
+                while True:
+                    yield await messages.get()
+            return stream()
+    monkeypatch.setattr(moto_client.aiomqtt, "Client", Broker)
+    client = MotoClient(identity=MqttIdentity("mqtt.example.test", 8883, "client", "user", "pass"),
+                        uid="account", device_id="camera", session_id="session", local_key="0123456789abcdef",
+                        on_answer=lambda _: None, on_candidate=lambda _: None, on_disconnect=lambda _: None,
+                        account_topics=("smart/mb/account", "partner/mb/account"))
+    try:
+        await client.async_connect()
+        with client.dp_report_listener("110") as reply:
+            if grants == (1, 1):
+                topic = "smart/mb/account"
+                payload = b'{"protocol":4,"data":{"gwId":"camera","dps":"{\\"110\\":1}"}}'
+            else:
+                topic = "smart/mb/in/camera"
+                payload = encode_payload(b"0123456789abcdef", 1, b"test", {"dps": {"110": 1}}, 0, 4, "2.3")
+            await messages.put(SimpleNamespace(topic=topic, payload=payload))
+            assert await asyncio.wait_for(asyncio.shield(reply), 1) == 1
+    finally:
+        await client.async_close()
+    assert calls == ["connection", "smart/mb/in/camera", [("smart/mb/account", 1), ("partner/mb/account", 1)], "closed"]
+    assert client._reader is None and client._client is None
+
+
 @pytest.mark.parametrize(("version", "frame"), [
     ("1.1", bytes.fromhex(
         "312e3160f1c19600000003616263647b2264617461223a7b22647073223a7b7d7d"

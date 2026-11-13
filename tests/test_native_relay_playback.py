@@ -390,8 +390,12 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
             events.append("broker-closed")
 
         async def subscribe(self, topic, *, qos, timeout):
-            assert (topic, qos) == (f"smart/mb/in/{dev}", 1)
-            return (1,)
+            assert qos == 1
+            if isinstance(topic, str):
+                assert topic == f"smart/mb/in/{dev}"
+                return (1,)
+            assert topic == [("smart/mb/account-uid", 1), ("p1000018/mb/account-uid", 1)]
+            return (1, 1)
 
         async def publish(self, topic, payload, *, qos, **kwargs):
             nonlocal background_sleeping

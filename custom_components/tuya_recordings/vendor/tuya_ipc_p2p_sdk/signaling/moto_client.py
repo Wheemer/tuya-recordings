@@ -16,7 +16,7 @@ import aiomqtt
 
 from ..const import LOGGER
 from ..exceptions import TuyaIpcP2pConnectionError, TuyaIpcP2pError
-from ..json_types import JsonObject, JsonValue, dp_integer, optional_int, optional_str
+from ..json_types import JsonObject, JsonValue, dp_integer, optional_int, optional_str, parse_json_object
 from .envelope import (
     SESSION_PROTOCOL,
     SIG_QUERY_PROTOCOL,
@@ -73,6 +73,7 @@ class MotoClient:
         security_level: int = 3,
         moto_id: str = "",
         on_failure: Callable[[str], None] | None = None,
+        account_topics: tuple[str, ...] = (),
     ) -> None:
         """Bind the client to one device, one session and the callbacks that consume it."""
         if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
@@ -97,6 +98,13 @@ class MotoClient:
         self._security_level = security_level
         self._publish_topic = f"smart/mb/out/{device_id}"
         self._subscribe_topic = f"smart/mb/in/{device_id}"
+        if len(account_topics) > 2 or any(
+            not isinstance(topic, str) or not 0 < len(topic) <= 512
+            or "+" in topic or "#" in topic or "\x00" in topic for topic in account_topics
+        ):
+            raise ValueError("Invalid MQTT account report topics")
+        self._account_topics = tuple(dict.fromkeys(account_topics))
+        self._account_subscription = "not_requested"
         # Match Smart Life's per-device SandO state: a positive origin in
         # [1000, 1000999] and a counter initialized to 2, then incremented
         # before every publish. The camera therefore sees 3 on the first frame.
@@ -139,7 +147,8 @@ class MotoClient:
                 f"device_online={self.device_online}, low_power_connect={self.low_power_connect}, "
                 f"low_power_wake_confirmed={self.low_power_wake_confirmed}, "
                 f"dp_query={self._last_dp_query}, dp_report_keys={self._last_dp_report_keys}, "
-                f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}")
+                f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}, "
+                f"account_subscription={self._account_subscription}")
 
     async def async_connect(self) -> None:
         """Connect the broker, subscribe, and start consuming inbound payloads."""
@@ -181,6 +190,22 @@ class MotoClient:
                 "Broker rejected the native MQTT camera reply subscription"
             )
         self._subscription = f"granted_qos_{codes[0]}"
+        if self._account_topics:
+            # SDK/consumer account updates share this TLS connection. A denied
+            # account subscription must not disable working device/LAN replies.
+            try:
+                granted = await client.subscribe(
+                    [(topic, 1) for topic in self._account_topics], qos=1, timeout=_CONNECT_TIMEOUT_SECONDS,
+                )
+            except aiomqtt.MqttError:
+                self._account_subscription = "failed"
+            else:
+                codes = tuple(getattr(item, "value", item) for item in granted)
+                accepted = sum(code in (0, 1) for code in codes)
+                self._account_subscription = (
+                    "granted" if len(codes) == len(self._account_topics) and accepted == len(codes)
+                    else "partial" if accepted else "rejected"
+                )
         self._reader = asyncio.create_task(self._async_read())
 
     async def _async_read(self) -> None:
@@ -190,16 +215,7 @@ class MotoClient:
             return
         try:
             async for message in client.messages:
-                if str(message.topic) != self._subscribe_topic:
-                    self._received += 1
-                    self._inbound["topic_mismatch"] += 1
-                    continue
-                payload = message.payload
-                if isinstance(payload, bytes):
-                    self._consume(payload)
-                else:
-                    self._received += 1
-                    self._inbound["non_binary"] += 1
+                self._consume_message(str(message.topic), message.payload)
         except asyncio.CancelledError:
             raise
         except Exception as exception:
@@ -213,6 +229,46 @@ class MotoClient:
                 reply.set_exception(TuyaIpcP2pConnectionError("Device DP report channel stopped"))
         if self._on_failure is not None:
             self._on_failure(self._reader_failure)
+
+    def _consume_message(self, topic: str, payload: object) -> None:
+        """Route camera envelopes and APK account updates without cross-device delivery."""
+        if topic != self._subscribe_topic and topic not in self._account_topics:
+            self._received += 1
+            self._inbound["topic_mismatch"] += 1
+        elif not isinstance(payload, bytes):
+            self._received += 1
+            self._inbound["non_binary"] += 1
+        elif topic == self._subscribe_topic:
+            self._consume(payload)
+        else:
+            self._received += 1
+            self._inbound["account_received"] += 1
+            if len(payload) > 65536:
+                self._inbound["account_invalid_shape"] += 1
+                return
+            try:
+                envelope = parse_json_object(payload)
+                data = envelope.get("data")
+                if type(envelope.get("protocol")) is not int or envelope["protocol"] != 4 or not isinstance(data, dict):
+                    self._inbound["account_other_protocol_or_shape"] += 1
+                    return
+                # Unlike a dedicated device topic, the account topic supplies
+                # no implicit device identity. Never infer it from this query.
+                target = data.get("gwId", data.get("devId"))
+                if (target != self._device_id or data.get("devId") not in (None, "", self._device_id)
+                        or data.get("cid") not in (None, "")):
+                    self._inbound["account_other_device"] += 1
+                    return
+                dps = data.get("dps")
+                if isinstance(dps, str):
+                    dps = parse_json_object(dps)
+                if not isinstance(dps, dict):
+                    self._inbound["account_invalid_shape"] += 1
+                    return
+            except (TuyaIpcP2pError, RecursionError):
+                self._inbound["account_invalid_shape"] += 1
+                return
+            self._consume_dp_report({"devId": self._device_id, "dps": dps})
 
     def _consume(self, payload: bytes) -> None:
         """Decode one payload and dispatch it to the session."""

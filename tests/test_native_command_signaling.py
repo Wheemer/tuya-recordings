@@ -410,11 +410,15 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
-    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False)])
+    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False)]
+    + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device")])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
-    lan_connect_fallback = mode == "lan_connect_fallback"
+    account_sd_report = mode.startswith("account_")
+    account_wrong_device = mode == "account_wrong_device"
+    account_silence = mode == "account_sd_silence" or account_wrong_device
+    lan_connect_fallback = mode == "lan_connect_fallback" or account_sd_report
     if lan_connect_fallback:
-        mode = "answer"
+        mode = "sd_silence" if account_silence else "answer"
     late_tcp_answer = mode == "late_tcp_answer"
     if late_tcp_answer:
         mode = "no_answer_udp"
@@ -502,6 +506,11 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         self._consume(encode_payload(config.local_key.encode(), 1, b"test",
                             {"devId": config.dev_id, "dps": {"248": 1}}, 0, 4, "2.3"))
                         assert self._dp_query is not None and not self._dp_query[1].done()
+                    if account_wrong_device:
+                        self._consume_message(self._account_topics[0], json.dumps({
+                            "protocol": 4, "data": {"gwId": "other-camera", "dps": '{"110":"1"}'},
+                        }).encode())
+                        assert not self._dp_query[1].done()
                     return 1
                 async def async_listen(self): pass
                 async def async_close(self): pass
@@ -668,8 +677,14 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                             {"devId": config.dev_id, "online": True, "lowPowerConnect": False,
                              "lastConnectChangeTime": 101}, 0, 1, "2.3"))
                     if mode != "sd_silence" and (mode != "qos1_wake" or self.awake):
-                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
-                            {"devId": config.dev_id, "dps": {"110": 1.0 if profile == "smart_life" else "1.0"}}, 0, 4, "2.3"))
+                        if account_sd_report:
+                            assert self._account_topics == ("smart/mb/account-uid", "p1000018/mb/account-uid")
+                            self._consume_message(self._account_topics[0], json.dumps({
+                                "protocol": 4, "data": {"gwId": config.dev_id, "dps": '{"110":"1"}'},
+                            }).encode())
+                        else:
+                            self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                                {"devId": config.dev_id, "dps": {"110": 1.0 if profile == "smart_life" else "1.0"}}, 0, 4, "2.3"))
                     return
                 assert protocol == 302 and qos == 0
                 # Native JSON is passed unchanged to publishDevice by rsv.
@@ -932,9 +947,9 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert events == ["wake", "SD status"]
                 assert peer.opened == 0 and not peer.offers
                 assert "sd_status_send_route=mqtt" in str(error.value)
-                assert f"sd_status_route_basis={'lan_connect_error' if cooldown else 'inventory'}" in str(error.value)
+                assert f"sd_status_route_basis={'lan_connect_error' if cooldown or lan_connect_fallback else 'inventory'}" in str(error.value)
                 assert "sd_status_dispatch=sent" in str(error.value)
-                assert "sd_status_inventory_route=mqtt" in str(error.value)
+                assert f"sd_status_inventory_route={'http' if lan_connect_fallback else 'mqtt'}" in str(error.value)
                 assert "sd_status_online_report=None" in str(error.value)
                 assert "offer=not_sent" in str(error.value)
             else:
