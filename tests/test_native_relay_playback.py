@@ -30,6 +30,34 @@ ANSWER_KEY = bytes(range(16, 32))
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("details", [
+    "connect_state=discovery_failed, connect_error=NativeLanUnavailableError",
+    "version=3.5, connect_state=socket_failed, connect_error=tinytuya_914",
+])
+async def test_failed_lan_listener_retains_sanitized_details_after_cleanup(monkeypatch, details):
+    playback = session()
+    playback._native_config = replace(playback._native_config, wake_direct=True, lan_signaling_capable=True)
+    playback._answer = asyncio.get_running_loop().create_future()
+    closed = []
+    class FailedLan:
+        diagnostics = details
+        def __init__(self, **kwargs): pass
+        async def async_connect(self):
+            raise relay_module.NativeLanUnavailableError("private-address-and-key")
+        async def async_close(self):
+            self.diagnostics = "closed"
+            closed.append(1)
+    monkeypatch.setattr(relay_module, "Lan302Client", FailedLan)
+    await playback._ensure_lan_answer_listener()
+    assert playback._answer_lan is None
+    assert closed == [1]
+    assert f"lan_answer_details=({details})" in playback.transport_diagnostics
+    assert "private-address-and-key" not in playback.transport_diagnostics
+    await playback._ensure_lan_answer_listener()
+    assert closed == [1]
+
+
+@pytest.mark.asyncio
 async def test_month_query_reports_actual_invalid_reply_size_and_transport(monkeypatch):
     playback = session()
     monkeypatch.setattr(playback, "_require_connected", lambda: None)
