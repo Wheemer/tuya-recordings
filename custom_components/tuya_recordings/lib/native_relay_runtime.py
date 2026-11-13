@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -22,7 +23,9 @@ from .native_media_crypto import (
     decrypt_playback_frame,
 )
 from .native_relay_media import playback_stream_frame
-from .native_relay_playback import NativeRelayPlaybackSession, WAKE_SLOT_TIMEOUT_SECONDS
+from .native_relay_playback import (
+    NativePlaybackCompleted, NativeRelayPlaybackSession, WAKE_SLOT_TIMEOUT_SECONDS,
+)
 from .native_session import NativeCameraSessionConfig, NativePlaybackRequest
 from .native_thumbnail import NativeThumbnailReady
 
@@ -1086,11 +1089,8 @@ class NativeRelayRuntimeSession:
         event_handler: Callable[[dict[str, Any]], None],
     ) -> None:
         """Play one clip over an already connected native transport."""
-        playback_secrets: dict[str, str] = {}
-        if request.encrypted:
-            assert self.media_secrets is not None
-            uuid = request.encryption_uuid.strip()
-            playback_secrets[uuid] = await asyncio.to_thread(self.media_secrets.secret, uuid)
+        request = await self._prepare_playback_request(playback, request, {})
+        playback_secrets, _ = await asyncio.to_thread(self._playback_secrets, request)
         sink = NativePlaybackEventSink(event_handler, protocol=self.protocol)
         started = False
         try:
@@ -1140,6 +1140,8 @@ class NativeRelayRuntimeSession:
             request,
             play_mode_supported=self.config.playback_mode_supported,
         ).validate()
+        catalogs: dict[date, Any] = {}
+        current = await self._prepare_playback_request(playback, current, catalogs)
         playback_secrets, recording_uuid = await asyncio.to_thread(self._playback_secrets, current)
         receive_task: asyncio.Task[Any] | None = None
         paused = False
@@ -1152,6 +1154,7 @@ class NativeRelayRuntimeSession:
         saw_video = False
         empty_media_frames = 0
         deferred_command: tuple[str, NativePlaybackRequest | None] | None = None
+        finished_reason = "user-stop"
         try:
             await self._wait_cancelable(
                 playback.start(
@@ -1224,6 +1227,17 @@ class NativeRelayRuntimeSession:
                         next_request,
                         play_mode_supported=self.config.playback_mode_supported,
                     ).validate()
+                    needs_catalog = current.catalog_day is not None and (
+                        current.catalog_day not in catalogs or not any(
+                            item.start_time <= current.position < item.end_time
+                            for item in catalogs[current.catalog_day].items
+                        )
+                    )
+                    if needs_catalog:
+                        # The SDK cannot query a day during active playback.
+                        await self._wait_cancelable(playback.stop(), timeout=self.signaling_timeout)
+                        catalogs.pop(current.catalog_day, None)
+                    current = await self._prepare_playback_request(playback, current, catalogs)
                     playback_secrets, recording_uuid = await asyncio.to_thread(self._playback_secrets, current)
                     generation += 1
                     audio_codec_info = None
@@ -1232,7 +1246,7 @@ class NativeRelayRuntimeSession:
                     empty_media_frames = 0
                     video_deadline = loop.time() + self.first_frame_timeout
                     await self._wait_cancelable(
-                        playback.seek(
+                        (playback.start if needs_catalog else playback.seek)(
                             start=current.start,
                             end=current.end,
                             play_time=current.position,
@@ -1266,7 +1280,16 @@ class NativeRelayRuntimeSession:
                 done, _ = await asyncio.wait({receive_task}, timeout=0.05)
                 if receive_task not in done:
                     continue
-                frame = receive_task.result()
+                try:
+                    frame = receive_task.result()
+                except NativePlaybackCompleted as err:
+                    if not (saw_video and saw_audio):
+                        raise NativeRelayRuntimeError(
+                            "Camera completed SD playback before delivering both video and audio "
+                            f"(video={saw_video}, audio={saw_audio}; {playback.transport_diagnostics})"
+                        ) from err
+                    finished_reason = "camera-stream-complete"
+                    break
                 receive_task = None
                 if frame.is_audio:
                     if frame.codec_info is not None:
@@ -1303,7 +1326,49 @@ class NativeRelayRuntimeSession:
                         playback.stop(),
                         timeout=_PLAYBACK_STOP_TIMEOUT_SECONDS,
                     )
-        sink.finished({"reason": "user-stop"})
+        sink.finished({"reason": finished_reason})
+
+    async def _prepare_playback_request(
+        self, playback: Any, request: NativePlaybackRequest, catalogs: dict[date, Any]
+    ) -> NativePlaybackRequest:
+        """Select a real day fragment before starting, retaining it for seeks."""
+        day = request.catalog_day
+        if day is None:
+            return request
+        if day not in catalogs:
+            try:
+                page = await self._wait_cancelable(
+                    playback.query_recordings(day), timeout=self.signaling_timeout
+                )
+            except TimeoutError as err:
+                raise NativeRelayRuntimeError(
+                    f"Playback catalog timed out ({playback.transport_diagnostics})"
+                ) from err
+            if page.status != 0:
+                raise NativeRelayRuntimeError("Camera rejected the playback catalog query")
+            catalogs[day] = page
+            _LOGGER.debug("Native playback catalog loaded: day=%s fragments=%s", day, len(page.items))
+        matches = [
+            item for item in catalogs[day].items
+            if item.start_time <= request.position < item.end_time
+        ]
+        if not matches:
+            raise NativeRelayRuntimeError(
+                "Camera's fresh SD catalog does not contain the selected playback position "
+                f"(day={day}, position={request.position}, fragments={len(catalogs[day].items)})"
+            )
+        item = max(matches, key=lambda item: min(item.end_time, request.end) - max(item.start_time, request.start))
+        start, end = max(request.start, item.start_time), min(request.end, item.end_time)
+        encrypted = bool(item.encrypt or (item.uuid and item.encrypt_md5))
+        _LOGGER.debug(
+            "Native playback fragment selected: requested=%s..%s catalog=%s..%s selected=%s..%s position=%s encrypted=%s",
+            request.start, request.end, item.start_time, item.end_time, start, end, request.position, encrypted,
+        )
+        return replace(
+            request, start=start, end=end, encrypted=encrypted,
+            encryption_uuid=item.uuid if encrypted else "",
+            fragments_json=json.dumps({"fragments": [{"start": start, "end": end}]}),
+        ).validate()
 
     def _playback_secrets(
         self,
@@ -1443,6 +1508,13 @@ class NativeRelayRuntimeSession:
                 frame = await self._wait_cancelable(
                     playback.receive_frame(), timeout=min(timeout, remaining)
                 )
+            except NativePlaybackCompleted as err:
+                if saw_audio and saw_video:
+                    return
+                raise NativeRelayRuntimeError(
+                    "Camera completed SD playback before delivering both video and audio "
+                    f"(video={saw_video}, audio={saw_audio}; {playback.transport_diagnostics})"
+                ) from err
             except TimeoutError as err:
                 if saw_audio and saw_video:
                     return

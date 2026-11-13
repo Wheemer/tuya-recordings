@@ -27,6 +27,63 @@ from custom_components.tuya_recordings.lib.native_session import (
 
 OFFER_KEY = bytes(range(16))
 ANSWER_KEY = bytes(range(16, 32))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [(7, 0), (7, 21), (100, 20)])
+async def test_completion_drains_media_and_ignores_other_tasks(command):
+    playback = session()
+    playback._connected = playback._playback_started = True
+    playback._control = object()
+    playback._stream_id = 0x20008
+    playback._ended = asyncio.get_running_loop().create_future()
+
+    def complete(stream_id, key=command):
+        payload = struct.pack("<II", 0, 3)
+        plain = struct.pack("<IIIHHI", 0x12345678, stream_id, 1, *key, len(payload)) + payload
+        playback._on_control_record(encrypt_record(ANSWER_KEY, plain), ANSWER_KEY)
+
+    complete(0x10008)
+    complete(0x20008, (7, 4))
+    assert not playback._playback_complete.is_set()
+    frame = object()
+    playback._media_frames.put_nowait(frame)
+    complete(0x20008)
+    assert f"{command[0]}/{command[1]}:3" in playback._playback_responses
+    assert await playback.receive_frame() is frame
+    with pytest.raises(relay_module.NativePlaybackCompleted):
+        await asyncio.wait_for(playback.receive_frame(), 0.1)
+    playback._reset_media_state()
+    assert not playback._playback_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_takes_priority_over_buffered_media_and_completion():
+    playback = session()
+    playback._connected = playback._playback_started = True
+    playback._control = object()
+    playback._ended = asyncio.get_running_loop().create_future()
+    playback._ended.set_result(NativeRelayPlaybackError("fixture fatal authentication failure"))
+    playback._playback_complete.set()
+    playback._media_frames.put_nowait(object())
+    with pytest.raises(NativeRelayPlaybackError, match="fatal authentication failure"):
+        await playback.receive_frame()
+
+
+@pytest.mark.asyncio
+async def test_completion_wakes_blocked_media_receiver():
+    playback = session()
+    playback._connected = playback._playback_started = True
+    playback._control = object()
+    playback._stream_id = 0x20008
+    playback._ended = asyncio.get_running_loop().create_future()
+    receive = asyncio.create_task(playback.receive_frame())
+    await asyncio.sleep(0)
+    payload = struct.pack("<II", 0, 3)
+    plain = struct.pack("<IIIHHI", 0x12345678, 0x20008, 1, 7, 21, 8) + payload
+    playback._on_control_record(encrypt_record(ANSWER_KEY, plain), ANSWER_KEY)
+    with pytest.raises(relay_module.NativePlaybackCompleted):
+        await asyncio.wait_for(receive, 0.1)
 APP_SESSION = {
     "sid": "sid",
     "ecode": "ecode",

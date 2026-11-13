@@ -35,8 +35,8 @@ class NativePlaybackUnavailable(NativePlaybackError):
 class NativePlaybackSessionRunner:
     """Run one native SD-card playback request through a strict packet muxer.
 
-    The playback session itself performs the required fresh catalog query on
-    the same native connection immediately before starting media.
+    For requests carrying the selected catalog day, the playback session
+    refreshes that day on the same native connection before starting media.
     """
 
     playback_starter: Callable[..., None]

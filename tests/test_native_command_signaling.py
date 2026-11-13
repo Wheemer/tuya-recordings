@@ -265,6 +265,8 @@ class Peer:
         self.closed = asyncio.Event()
         self.errors = []
         self.batched_frames = 0
+        self.handshake_gate = None
+        self.answer_with_offer_key = False
 
     async def __aenter__(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -329,6 +331,8 @@ class Peer:
                     for body in (b"", f6_attribute(9, b"nondata"), f6_attribute(7, b"")):
                         writer.write(struct.pack(">BBH", 0xF6, 0, len(body)) + body)
                 answer = message(sid=payload["header"]["sessionid"])
+                if self.answer_with_offer_key:
+                    answer["msg"]["sdp"] = answer["msg"]["sdp"].replace(ANSWER_KEY.hex(), self.key.hex())
                 answer["header"].update({"from": "camera-device", "to": "account-uid"})
                 if self.mode == "foreign":
                     answer["header"]["sessionid"] = "wrong-session"
@@ -341,6 +345,8 @@ class Peer:
             magic, wire = await self.read(reader)
             assert magic == FRAME_HANDSHAKE
             request = parse_handshake_frame(key, wire)
+            if self.handshake_gate is not None:
+                await self.handshake_gate.wait()
             if self.mode == "stall_handshake":
                 await reader.read()
                 return
@@ -404,8 +410,11 @@ class Peer:
     ] + [(mode, media, False) for mode, media in [("background", False), ("udp_answer", True), ("sd_silence", False), ("offline_report_http", False), ("qos1_wake", False), ("no_answer_udp", False), ("no_answer_udp", True), ("no_answer_udp_silent_control", False)]]
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
-    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False)])
+    + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False)])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media):
+    late_tcp_answer = mode == "late_tcp_answer"
+    if late_tcp_answer:
+        mode = "no_answer_udp"
     endpoint_race = mode == "endpoint_race"
     if endpoint_race:
         mode = "answer"
@@ -440,6 +449,10 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         assert work.allow_wake and not work.retry_offer
         connect_options = {"allow_wake": work.allow_wake, "retry_offer": work.retry_offer}
     async with Peer("silent" if mode.startswith("no_answer_udp") else "batched_answer" if mode == "udp_answer" else "answer" if mode in {"offline_report_http", "qos1_wake"} else mode) as peer, AsyncExitStack() as endpoints:
+        if late_tcp_answer:
+            peer.mode = "answer"
+            peer.handshake_gate = asyncio.Event()
+            peer.answer_with_offer_key = True
         config = camera_config()
         source = json.loads(config.config_json)
         source["p2pConfig"]["tcpRelay"] = token(peer.port).raw
@@ -512,6 +525,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         playback_requests = []
         bootstrap_commands = []
         suppress_sd_media = False
+        complete_sd_media = False
 
         def control(value):
             nonlocal media_sequence
@@ -544,9 +558,18 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 if low not in (4, 5):
                     reply = struct.pack("<IIIHHIii", magic, request, 1, high, low, 8, 0, 1)
                     lan_peer.send(encrypt_record(receive_key, reply))
+                    if complete_sd_media and high == 7 and low in (0, 21):
+                        # Barry's wire sequence: accepted, zero-duration
+                        # fragment end, completed task, and no media packets.
+                        fragment_end = struct.pack("<IIIHHI5i", magic, request, 1, 7, 6, 20, 0, 6, 100, 100, 0)
+                        completed = struct.pack("<IIIHHI2i", magic, request, 1, 7, low, 8, 0, 3)
+                        lan_peer.send(encrypt_record(receive_key, fragment_end))
+                        lan_peer.send(encrypt_record(receive_key, completed))
                 return
             if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
                 events.append("LAN catalog")
+                if late_tcp_answer:
+                    peer.handshake_gate.set()
                 if mode == "no_answer_udp_silent_control":
                     return
                 payload = struct.pack("<9I", 0, 2026, 11, 8, 1, 0, 100, 110, 0)
@@ -643,7 +666,9 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     fields = candidate.split()
                     udp_remote = (fields[4], int(fields[5]))
                     async def nominate():
-                        if mode.startswith("no_answer_udp"):
+                        if late_tcp_answer:
+                            pass  # Nominate before TCP completes, like Barry's log.
+                        elif mode.startswith("no_answer_udp"):
                             async with asyncio.timeout(1):
                                 while not peer.offers or session._command._channel.pending_count:
                                     await asyncio.sleep(0.001)
@@ -709,8 +734,12 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert session._answer_source == "command"
                     assert session._command._blocked == 3
                     assert "source=TCP, tcp_attempts=1" in session._command.diagnostics
-                await asyncio.wait_for(peer.closed.wait(), 1)
+                assert not peer.closed.is_set(), "Signaling must remain alive during the direct session"
                 page = await session.query_recordings(date(2026, 11, 8))
+                if late_tcp_answer:
+                    await asyncio.wait_for(asyncio.shield(session._answer), 1)
+                    assert session._answer_source == "command"
+                    assert peer.offers and session._command._tcp_ready
                 assert len(page.items) == 1
                 assert events == (["wake", "SD status", "offer", "offer", "LAN key", "LAN catalog"] if mode == "candidate_resend"
                                   else ["wake", "SD status", "offer", "LAN catalog"] if mode in {"udp_answer", "no_answer_udp"}
@@ -732,8 +761,13 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 if mode in {"nondata_answer", "batched_answer", "udp_answer"}:
                     assert session._command._connection._empty_data_frames == 3
                     assert session._command._connection._decode_failures == 0
-                assert not session._command._tcp_ready
-                assert session._command._channel._retransmit_task is None
+                assert session._command._tcp_ready
+                # This batched peer holds a candidate ACK until another PUSH.
+                # Retaining that bounded message is not a session failure.
+                if mode == "udp_answer":
+                    assert session._command._channel.pending_count <= 1
+                else:
+                    assert session._command._channel.pending_count == 0
                 if media:
                     if mode == "answer":
                         assert session._moto.low_power_wake_confirmed
@@ -805,7 +839,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         runtime = NativeRelayRuntimeSession(config, app_session=APP_SESSION)
                         async with asyncio.timeout(2):
                             await runtime._interactive_connected(
-                                session, NativePlaybackRequest(start=100, end=110, fragments_json=fragments), emit, commands,
+                                session, NativePlaybackRequest(start=100, end=110, fragments_json=fragments,
+                                                               catalog_day=date(2026, 11, 8)), emit, commands,
                             )
                     assert [event["payload"]["type"] for event in interactive_events] == [
                         "started", "media-codec", "media-codec", "finished",
@@ -829,7 +864,26 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert [low for _, low in playback_requests[-4:]] == [21 if play_mode else 0, 4, 3, 5]
                     assert peer.opened == 1
                     assert not any(high in (6, 9) for high, _ in bootstrap_commands)
-                if mode == "no_answer_udp":
+                    complete_sd_media = True
+                    completed_events = []
+                    runtime = NativeRelayRuntimeSession(config, app_session=APP_SESSION, first_frame_timeout=30)
+                    with pytest.raises(NativeRelayRuntimeError, match="completed SD playback before delivering both"):
+                        async with asyncio.timeout(1):
+                            await runtime._interactive_connected(
+                                session, NativePlaybackRequest(start=100, end=110, fragments_json=fragments,
+                                                               catalog_day=date(2026, 11, 8)),
+                                completed_events.append, queue.Queue(),
+                            )
+                    assert [event["payload"]["type"] for event in completed_events] == ["started"]
+                    assert session._fragment_end == "other_range"
+                    assert not session._playback_started and peer.opened == 1
+                    suppress_sd_media = complete_sd_media = False
+                    await session.start(start=100, end=110, **play_options)
+                    async with asyncio.timeout(1):
+                        assert (await session.receive_frame()).payload == video.payload
+                        assert (await session.receive_frame()).payload == audio.payload
+                    await session.stop()
+                if mode == "no_answer_udp" and not late_tcp_answer:
                     # A late conflicting key must not silently switch the live
                     # authenticated stream or leak either key into diagnostics.
                     session._on_answer(answer_sdp(), source="mqtt")
@@ -837,7 +891,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                     assert "conflicts" in str(session._ended.result())
             elif mode == "no_answer_udp_silent_control":
                 await session.connect(media=False, **connect_options)
-                await asyncio.wait_for(peer.closed.wait(), 1)
+                assert not peer.closed.is_set()
                 with pytest.raises(TimeoutError):
                     await asyncio.wait_for(session.query_recordings(date(2026, 11, 8)), 0.08)
                 assert not session._answer.done()

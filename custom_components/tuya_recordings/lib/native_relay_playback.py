@@ -108,6 +108,10 @@ _LOGGER = logging.getLogger(__name__)
 WAKE_SLOT_TIMEOUT_SECONDS = 61.0
 
 
+class NativePlaybackCompleted(Exception):
+    """The camera finished the current playback task, after queued media."""
+
+
 def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
     """Consume completion from a cleanup task that outlived its deadline."""
     with suppress(BaseException):
@@ -234,6 +238,7 @@ class NativeRelayPlaybackSession:
         self._playback_responses: list[str] = []
         self._playback_response_details: list[str] = []
         self._playback_bounds: tuple[int, int] | None = None
+        self._playback_complete = asyncio.Event()
         self._fragment_end = "not_received"
         self._sd_status_signaling_details = "not_used"
         self._sd_status_deadline: float | None = None
@@ -468,9 +473,9 @@ class NativeRelayPlaybackSession:
             await self._ice.async_gather()
             self._connect_phase = "wait_connection"
             answer = await self._wait_for_connection()
-            if self._command is not None:
-                if not await _bounded_cleanup(self._command.finish_bootstrap()):
-                    raise NativeRelayPlaybackError("Native signaling TCP cleanup timed out")
+            # ICE nomination can precede the native signaling answer. Keep the
+            # bounded command handshake/listener alive until session cleanup;
+            # it never routes TCP media into the direct media conversations.
             if self._ended.done():
                 raise self._ended.result()
             receive_key = self._receive_key()
@@ -1485,7 +1490,32 @@ class NativeRelayPlaybackSession:
         self._require_connected()
         if not self._playback_started:
             raise NativeRelayPlaybackError("Playback has not started")
-        return await self._receive_or_transport_failure(self._media_frames)
+        if self._ended is not None and self._ended.done():
+            raise self._ended.result()
+        try:
+            return self._media_frames.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        if self._playback_complete.is_set():
+            raise NativePlaybackCompleted
+        receive = asyncio.create_task(self._receive_or_transport_failure(self._media_frames))
+        complete = asyncio.create_task(self._playback_complete.wait())
+        try:
+            done, _ = await asyncio.wait((receive, complete), return_when=asyncio.FIRST_COMPLETED)
+            if self._ended is not None and self._ended.done():
+                raise self._ended.result()
+            if receive in done:
+                return receive.result()
+            # Preserve media already received when the control callback fires.
+            try:
+                return self._media_frames.get_nowait()
+            except asyncio.QueueEmpty:
+                raise NativePlaybackCompleted from None
+        finally:
+            for task in (receive, complete):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(receive, complete, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop active SD playback using the native SDK's ordered commands."""
@@ -1522,6 +1552,7 @@ class NativeRelayPlaybackSession:
     def _reset_media_state(self) -> None:
         """Discard every decoder-bound state before a new playback stream."""
         self._media_frames = asyncio.Queue(maxsize=_MEDIA_QUEUE_LIMIT)
+        self._playback_complete = asyncio.Event()
         self._parser = NativePlaybackStreamParser()
         self._rtp_packets.clear()
         self._media_drops.clear()
@@ -1826,8 +1857,20 @@ class NativeRelayPlaybackSession:
             return
         for command in commands:
             classified = f"{command.high_command}/{command.low_command}"
-            if command.control == 1 and command.high_command == 7:
-                if command.low_command in (0, 6, 21):
+            if (
+                self._playback_started
+                and self._stream_id is not None
+                and command.control == 1
+                and command.request_id >> 16 == self._stream_id >> 16
+                and (command.high_command, command.low_command) in {(7, 0), (7, 21), (100, 20)}
+                and len(command.payload) >= 8
+                and int.from_bytes(command.payload[4:8], "little", signed=True) == 3
+            ):
+                self._playback_complete.set()
+            if command.control == 1 and (command.high_command, command.low_command) in {
+                (7, 0), (7, 6), (7, 21), (100, 20),
+            }:
+                if command.low_command in (0, 6, 20, 21):
                     fields = (
                         f"command={classified},request={command.request_id},"
                         f"task={command.request_id >> 16},bytes={len(command.payload)}"
@@ -1850,7 +1893,7 @@ class NativeRelayPlaybackSession:
                         _LOGGER.debug("Native SD playback response: %s", fields)
                     self._playback_response_details.append(fields)
                     del self._playback_response_details[:-8]
-                if command.low_command in (0, 21) and self._stream_id is not None:
+                if command.low_command in (0, 20, 21) and self._stream_id is not None:
                     if command.request_id >> 16 == self._stream_id >> 16:
                         status = (
                             int.from_bytes(command.payload[4:8], "little", signed=True)
