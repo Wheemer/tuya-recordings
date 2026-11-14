@@ -10,6 +10,8 @@ import struct
 
 import av
 
+from .commands import _WORK_CANCEL, CameraWorkCancelled
+
 PACKET_HEADER = struct.Struct(">BBQQI")
 MAX_PACKET_BYTES = 8 * 1024 * 1024
 RAW_AUDIO_FORMATS = {"pcm_s16le": "s16le", "g711u": "mulaw", "g711a": "alaw"}
@@ -227,14 +229,59 @@ def _aac_packet_config(payload):
              ((payload[2] & 1) << 2) | (payload[3] >> 6)), header_size)
 
 
+def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
+    """Decode picture order only; retain the original encoded access units."""
+    if not video.streams.video[0].codec_context.has_b_frames:
+        return None
+    times = []
+    cancellation = _WORK_CANCEL.get()
+    length = packet_path.stat().st_size
+    with packet_path.open("rb") as source:
+        while header := source.read(PACKET_HEADER.size):
+            if cancellation is not None and cancellation.is_set():
+                raise CameraWorkCancelled("Native picture-order analysis cancelled")
+            if len(header) != PACKET_HEADER.size:
+                raise ValueError("Native packet index is truncated")
+            kind, _flags, stamp, scale, size = PACKET_HEADER.unpack(header)
+            if not 0 < size <= MAX_PACKET_BYTES or source.tell() + size > length:
+                raise ValueError("Native packet data is truncated")
+            if kind == 1:
+                if not 0 < scale <= 1_000_000 or len(times) >= 1_000_000:
+                    raise ValueError("Native video reorder metadata exceeds bounds")
+                times.append(round((Fraction(stamp, scale) - origin) * 1_000_000))
+            source.seek(size, 1)
+    decoder = av.CodecContext.create("h264", "r")
+    decoder.thread_count = 1
+    order = []
+    count = 0
+    for packet in video.demux(video.streams.video[0]):
+        if cancellation is not None and cancellation.is_set():
+            raise CameraWorkCancelled("Native picture-order analysis cancelled")
+        if not packet.size:
+            continue
+        packet.pts = count
+        packet.dts = None
+        packet.time_base = Fraction(1, 1000)
+        order.extend(frame.pts for frame in decoder.decode(packet))
+        count += 1
+        if count > len(times):
+            raise ValueError("Native video access units do not match the packet index")
+    order.extend(frame.pts for frame in decoder.decode(None))
+    if count != len(times) or sorted(order) != list(range(count)):
+        raise ValueError("Native video picture order does not match the packet index")
+    ranks = {packet_index: rank for rank, packet_index in enumerate(order)}
+    delay = max((times[i] - times[ranks[i]] for i in range(count)), default=0)
+    return [(times[ranks[i]], times[i] - delay) for i in range(count)]
+
+
 def mux_camera_packets(video_path: Path, audio_path: Path, packet_path: Path,
                        output_path: Path, *, audio_codec: str, sample_rate: int,
                        channels: int, origin: Fraction) -> None:
     """Copy compressed/PCM packets into an ISO/QuickTime-family container."""
     with ExitStack() as stack:
         video = stack.enter_context(av.open(str(video_path), format="h264"))
-        if video.streams.video[0].codec_context.has_b_frames:
-            raise ValueError("Native recording has B frames but no decode timestamps")
+        video_timing = _reordered_video_timing(video, packet_path, origin)
+        video_index = 0
         audio = None
         if audio_codec:
             audio_format = RAW_AUDIO_FORMATS.get(audio_codec, "aac")
@@ -270,9 +317,12 @@ def mux_camera_packets(video_path: Path, audio_path: Path, packet_path: Path,
                 packet.stream = streams[kind]
                 packet.time_base = Fraction(1, 1_000_000)
                 packet.pts = packet.dts = round(time * 1_000_000)
+                if kind == 1 and video_timing is not None:
+                    packet.pts, packet.dts = video_timing[video_index]
+                    video_index += 1
                 if kind in pending:
                     old = pending.pop(kind)
-                    old.duration = packet.pts - old.pts
+                    old.duration = packet.dts - old.dts
                     intervals[kind] = old.duration
                     target.mux(old)
                 pending[kind] = packet

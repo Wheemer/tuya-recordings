@@ -47,10 +47,12 @@ def test_month_request_matches_apk_channel_year_month_reserved(month, channel):
     assert struct.unpack_from("<4i", packet, 20) == (channel, month.year, month.month, 0)
 
 
-@pytest.mark.parametrize("size,offset", [(16, 12), (80, 76)])
+@pytest.mark.parametrize("size,offset", [(16, 12), (20, 12), (80, 76)])
 def test_month_reply_decodes_both_native_callback_layouts(size, offset):
     payload = bytearray(size)
     struct.pack_into("<I", payload, offset, (1 << 1) | (1 << 28) | (1 << 31))
+    if size == 20:
+        struct.pack_into("<I", payload, 16, 1 << 2)
     command = NativeSimpleCommand(42, 1, 3, 0, bytes(payload))
     assert decode_recording_month_reply(command, request_id=42, month=date(2026, 2, 1)) == [date(2026, 2, 1), date(2026, 2, 28)]
     with pytest.raises(NativeSimpleError, match="request ID"):

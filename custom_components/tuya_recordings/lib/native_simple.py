@@ -144,11 +144,13 @@ def decode_recording_month_reply(command: NativeSimpleCommand, *, request_id: in
         raise NativeSimpleError("Recording month response has another request ID")
     if (command.high_command, command.low_command) != (3, 0):
         raise NativeSimpleError("Recording month response has another command")
-    offsets = {16: 12, 80: 76}
+    # The SDK reads the Simple bitmap at +12, including firmware replies
+    # with an additional trailing word; the mask is not the last word.
+    offsets = {16: 12, 20: 12, 80: 76}
     if len(command.payload) not in offsets:
         raise NativeSimpleError(
             f"Recording month response has an invalid size: {len(command.payload)} bytes "
-            "(expected 16 or 80)"
+            "(expected 16, 20 or 80)"
         )
     mask = struct.unpack_from("<I", command.payload, offsets[len(command.payload)])[0]
     maximum = calendar.monthrange(month.year, month.month)[1]

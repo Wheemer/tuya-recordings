@@ -1,5 +1,22 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-29 (2026-11-14)
+
+### Media Sync
+
+- Accept the 20-byte monthly recording reply while reading its bitmap at the offset used by the Smart Life APK.
+- Defer downloads while a camera is on SD-status cooldown, without counting them as failed transfers or blocking other cameras. Pending recordings are reconsidered on a later normal Sync pass.
+- Keep background Sync off by default and add battery-use warnings in setup, options, and switch details. The panel distinguishes waiting for camera cooldown from a failed transfer.
+
+### Local Discovery
+
+- Include the APK's limited-broadcast discovery request alongside subnet discovery, with bounded listening, device-identity checks, and socket cleanup. Receivers are pinned to specific private LAN interfaces and reject replies from outside their subnets; discovery fails closed if interface binding is unavailable. No subnet scanning or device polling is added.
+
+### Cached Video
+
+- Support reordered H.264 when creating local recordings by handling presentation and decode timestamps separately. Original compressed video and audio are copied without transcoding.
+- Preserve the existing live player and seek transport.
+
 ## Tuya Recordings v0.4.13-28 (2026-11-13)
 
 ### Connection Diagnostics

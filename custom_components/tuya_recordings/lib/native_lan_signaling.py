@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 import tinytuya
 
+from .native_lan_discovery import find_lan_device
+
 from ..vendor.tuya_ipc_p2p_sdk.json_types import dp_integer
 
 _LAN_IPC_302 = 32
@@ -315,7 +317,7 @@ class Lan302Client:
         if cached is not None and now - cached[0] < _DISCOVERY_CACHE_SECONDS:
             _, ip_address, protocol_version = cached
         else:
-            discovered = tinytuya.find_device(dev_id=self._device_id)
+            discovered = find_lan_device(self._device_id)
             ip_address = discovered.get("ip") if isinstance(discovered, dict) else None
             version = discovered.get("version") if isinstance(discovered, dict) else None
             try:

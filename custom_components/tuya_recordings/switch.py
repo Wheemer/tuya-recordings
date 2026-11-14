@@ -161,6 +161,7 @@ class TuyaRecordingsMediaSyncSwitch(SwitchEntity):
             "storage_path": self.entry.options.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH),
             "camera_activity_paused": paused,
             "effective_state": "paused" if paused else ("enabled" if self.is_on else "disabled"),
+            "battery_camera_warning": "Background sync can repeatedly wake battery cameras and reduce battery life. Leave disabled unless background downloads are explicitly wanted.",
         }
 
     async def async_turn_on(self, **kwargs) -> None:

@@ -1553,6 +1553,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     const failed = Number(sync?.failed) || 0;
     if (failed > 0) return `${this.formatNumber(failed)} clip${failed === 1 ? "" : "s"} need another try`;
     if (state === "running") return "Syncing new videos";
+    if (state === "deferred") return "Waiting for camera cooldown";
     if (state === "stalled") return "Sync needs attention";
     if (pending > 0) return "Catching up in background";
     return "Recordings are ready";
