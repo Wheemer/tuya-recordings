@@ -24,6 +24,7 @@ from .alerts import (
     watch_camera_notification_sources,
 )
 from .const import DOMAIN, MANUFACTURER, NAME
+from .devices import async_register_camera_device
 
 
 async def async_setup_entry(
@@ -33,6 +34,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up Tuya Recordings detection event entities."""
     def add_source(entity_id, camera_name, tuya_device_id, tuya_manager):
+        async_register_camera_device(hass, entry, tuya_device_id, camera_name, entity_id)
         async_add_entities([
             TuyaRecordingAlertEvent(
                 hass=hass,

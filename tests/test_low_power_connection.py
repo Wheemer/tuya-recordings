@@ -239,7 +239,8 @@ async def test_wake_sd_status_offer_sequence(monkeypatch, outcome):
         else:
             with pytest.raises(playback_module.NativeRelayPlaybackError):
                 await playback._open_signaling("sdp", [], "trace", {}, {})
-            assert events == ["wake", "sd-query"]
+            assert events == (["wake", "sd-query", "sd-query"] if outcome == "awake_only"
+                              else ["wake", "sd-query"])
             assert playback._sd_status_query == ("report_no_card" if outcome in {"no_card", "decimal_no_card"} else "report_timeout")
         assert len(brokers) == 1
         assert playback._moto._dp_query is None

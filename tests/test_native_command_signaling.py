@@ -411,8 +411,11 @@ class Peer:
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
     + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False), ("lossy_seek", True, False)]
-    + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device")])
+    + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device", "wake_resend")])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media, shared_commands=None, lan_key_reconnect=False):
+    wake_resend = mode == "wake_resend"
+    if wake_resend:
+        mode = "answer"
     lossy_seek = mode == "lossy_seek"
     if lossy_seek:
         mode = "answer"
@@ -686,6 +689,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
             async def async_connect(self):
                 self.candidates = []
                 self.awake = False
+                self.sd_queries = 0
                 self._subscription = "granted_qos_1"
                 self._broker_status = "connected"
                 self._client = SimpleNamespace(publish=self.publish)
@@ -711,6 +715,16 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 assert topic == f"smart/mb/out/{config.dev_id}"
                 protocol, body = decode_payload(config.local_key.encode(), payload)
                 if protocol == 5:
+                    self.sd_queries += 1
+                    if wake_resend and self.sd_queries == 1:
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "dps": {"248": 1}}, 0, 4, "2.3"))
+                        self._consume(encode_payload(config.local_key.encode(), 1, b"test",
+                            {"devId": config.dev_id, "online": True, "lowPowerConnect": False,
+                             "lastConnectChangeTime": 101}, 0, 1, "2.3"))
+                        return
+                    if wake_resend:
+                        assert self.sd_queries == 2
                     if lan_connect_fallback:
                         # Independently inspect the APK PV2.3 GCM envelope,
                         # rather than accepting our own decoder's roundtrip.

@@ -1808,6 +1808,11 @@ class TuyaRecordingsClient:
             self._camera_index_cache_until = expiry
             return stale
 
+    @property
+    def camera_inventory(self) -> dict[str, str]:
+        """Return a local snapshot without account or camera requests."""
+        return dict(self._camera_inventory or {})
+
     def set_camera_inventory(
         self, cameras: dict[str, str], *, source: str = "native_app_inventory"
     ) -> None:

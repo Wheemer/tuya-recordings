@@ -333,6 +333,7 @@ def test_setup_prefers_persisted_native_app_camera_inventory(monkeypatch, tmp_pa
     monkeypatch.setattr(integration, "native_app_session", lambda data: None)
     monkeypatch.setattr(integration, "_async_register_services", lambda hass: None)
     monkeypatch.setattr(integration, "_async_register_views", lambda hass: None)
+    monkeypatch.setattr(integration, "async_setup_camera_devices", Mock())
     monkeypatch.setattr(integration, "_async_schedule_media_sync", lambda *args: None)
     monkeypatch.setattr(integration, "async_register_frontend", AsyncMock())
     client = Mock()
@@ -353,6 +354,7 @@ def test_setup_prefers_persisted_native_app_camera_inventory(monkeypatch, tmp_pa
     )
 
     assert asyncio.run(integration.async_setup_entry(hass, entry)) is True
+    integration.async_setup_camera_devices.assert_called_once_with(hass, entry, client)
     client.set_camera_inventory.assert_called_once_with(
         {"tuya-porch": "Porch Cam", "tuya-garage": "Garage"},
         source="native_app_inventory",

@@ -48,6 +48,7 @@ from .const import (
     THUMBNAIL_SYNC_LIMIT,
 )
 from .frontend import FRONTEND_URL_PATH, async_register_frontend
+from .devices import async_setup_camera_devices
 from .http import (
     TuyaRecordingsDebugView,
     TuyaRecordingsPanelDataView,
@@ -215,13 +216,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         def update_legacy_camera_inventory(event=None):
             device_registry = dr.async_get(hass)
             entity_entries = list(er.async_get(hass).entities.values())
-            client.set_camera_inventory(
-                _official_tuya_camera_device_ids(
-                    entity_entries,
-                    [device_registry.async_get(entity.device_id) for entity in entity_entries if entity.device_id],
-                ),
-                source="legacy_official_tuya_registry",
+            inventory = _official_tuya_camera_device_ids(
+                entity_entries,
+                [device_registry.async_get(entity.device_id) for entity in entity_entries if entity.device_id],
             )
+            changed = inventory != client.camera_inventory
+            client.set_camera_inventory(inventory, source="legacy_official_tuya_registry")
+            if changed:
+                async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry.entry_id)
 
         update_legacy_camera_inventory()
         entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", update_legacy_camera_inventory))
@@ -229,6 +231,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.async_add_executor_job(client.load_cache)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"client": client, "entry": entry}
+    async_setup_camera_devices(hass, entry, client)
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     _async_register_services(hass)
     _async_register_views(hass)

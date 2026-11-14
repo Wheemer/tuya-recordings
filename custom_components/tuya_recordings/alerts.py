@@ -8,7 +8,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
@@ -126,6 +126,7 @@ def watch_camera_notification_sources(hass, entry, add_source):
     """Discover late-loaded official sources without duplicating account entities."""
     seen = set()
 
+    @callback
     def discover(event=None):
         if event is not None and getattr(event, "event_type", None) == EVENT_STATE_CHANGED:
             if not str(event.data.get("entity_id", "")).startswith("event."):

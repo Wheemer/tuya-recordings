@@ -36,6 +36,7 @@ from .const import (
     MANUFACTURER,
     NAME,
 )
+from .devices import async_register_camera_device
 
 PERSON_CODES = frozenset({"ipc_human", "ipc_linger", "ipc_passby"})
 MOTION_CODES = frozenset(
@@ -50,6 +51,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up detection sensors from the official Tuya event sources."""
     def add_source(entity_id, camera_name, tuya_device_id, tuya_manager):
+        async_register_camera_device(hass, entry, tuya_device_id, camera_name, entity_id)
         async_add_entities(
             (
                 TuyaRecordingAlertBinarySensor(
