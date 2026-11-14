@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-36 (2026-11-14)
+
+### Recordings Panel
+
+- Keep pending recordings and their dates visible with an Awaiting download status instead of showing No recordings.
+- Enable local playback as soon as the cached video is ready, even if its thumbnail is missing. Pending entries do not start uncached playback.
+
+### Media Sync
+
+- After a recording transfer or remux failure, skip that camera for the rest of the pass and continue with other cameras. Preserve failure cooldowns, cancellation and safety limits.
+- Correct non-picture H.264 extension metadata being indexed as video frames, addressing a reproduced second-packet remux failure while retaining the encoded data.
+- Include bounded NAL type and length details in remaining picture-decoding errors.
+- Preserve playback, seeking, recording-boundary filtering and original video/audio without transcoding.
+
 ## Tuya Recordings v0.4.13-35 (2026-11-14)
 
 ### Recording Catalog

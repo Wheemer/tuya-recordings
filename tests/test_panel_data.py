@@ -97,7 +97,7 @@ def test_build_panel_data_marks_cached_files(tmp_path, mapped_media_root):
     }
 
 
-def test_build_panel_data_hides_junk_mp4(tmp_path):
+def test_build_panel_data_retains_catalog_but_rejects_junk_mp4_playback(tmp_path):
     client = FakeClient(tmp_path)
     video_path = client.clip_path("camera 1", 100, 130)
     video_path.parent.mkdir(parents=True)
@@ -120,17 +120,20 @@ def test_build_panel_data_hides_junk_mp4(tmp_path):
     )
 
     camera = data["cameras"][0]
-    assert camera["dates"] == []
-    assert camera["clips"] == []
+    assert camera["dates"] == ["2026-06-28"]
+    assert len(camera["clips"]) == 1
+    assert camera["clips"][0]["pending"] is True
+    assert camera["clips"][0]["playback_url"] == ""
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 0
     assert data["stats"]["pending_clips"] == 1
-    assert data["stats"]["visible_clips"] == 0
-    assert data["stats"]["latest_clip"] is None
+    assert data["stats"]["visible_clips"] == 1
+    assert data["stats"]["latest_clip"]["start"] == 100
 
 
-def test_build_panel_data_hides_uncached_files(tmp_path):
+def test_build_panel_data_shows_pending_without_native_playback_fallback(tmp_path):
     client = FakeClient(tmp_path)
+    client._recordings_backend = FakePlayableBackend()
 
     data = build_panel_data(
         client,
@@ -149,16 +152,18 @@ def test_build_panel_data_hides_uncached_files(tmp_path):
     )
 
     camera = data["cameras"][0]
-    assert camera["dates"] == []
-    assert camera["clips"] == []
+    assert camera["dates"] == ["2026-06-28"]
+    assert len(camera["clips"]) == 1
+    assert camera["clips"][0]["pending"] is True
+    assert camera["clips"][0]["playback_url"] == ""
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 0
     assert data["stats"]["pending_clips"] == 1
-    assert data["stats"]["visible_clips"] == 0
-    assert data["stats"]["latest_clip"] is None
+    assert data["stats"]["visible_clips"] == 1
+    assert data["stats"]["latest_clip"]["start"] == 100
 
 
-def test_build_panel_data_hides_cached_video_without_thumbnail(tmp_path):
+def test_build_panel_data_plays_cached_video_without_thumbnail(tmp_path):
     client = FakeClient(tmp_path)
     video_path = client.clip_path("camera 1", 100, 130)
     video_path.parent.mkdir(parents=True)
@@ -181,15 +186,18 @@ def test_build_panel_data_hides_cached_video_without_thumbnail(tmp_path):
     )
 
     camera = data["cameras"][0]
-    assert camera["dates"] == []
-    assert camera["clips"] == []
+    assert camera["dates"] == ["2026-06-28"]
+    assert len(camera["clips"]) == 1
+    assert camera["clips"][0]["pending"] is False
+    assert camera["clips"][0]["playback_url"].endswith("?transport=file")
+    assert camera["clips"][0]["thumbnail_url"] == ""
     assert data["stats"]["indexed_clips"] == 1
-    assert data["stats"]["ready_clips"] == 0
-    assert data["stats"]["pending_clips"] == 1
+    assert data["stats"]["ready_clips"] == 1
+    assert data["stats"]["pending_clips"] == 0
     assert data["stats"]["cached_videos"] == 1
     assert data["stats"]["cached_thumbnails"] == 0
-    assert data["stats"]["visible_clips"] == 0
-    assert data["stats"]["latest_clip"] is None
+    assert data["stats"]["visible_clips"] == 1
+    assert data["stats"]["latest_clip"]["start"] == 100
 
 
 @pytest.mark.parametrize("online", [True, False, None])

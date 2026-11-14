@@ -1104,9 +1104,10 @@ def _h264_nals(payload: bytes) -> tuple[bytes, ...]:
 
 def _h264_metadata_only(payload: bytes) -> bool:
     """Recognize configuration/delimiter packets, not corrupt or unknown NALs."""
+    # SPS extensions, prefixes and subset SPS (13..15) are not pictures either.
     nals = _h264_nals(payload)
     return bool(nals) and all(
-        not nal[0] & 0x80 and nal[0] & 0x1F in {6, 7, 8, 9, 10, 11, 12}
+        not nal[0] & 0x80 and nal[0] & 0x1F in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
         for nal in nals
     )
 

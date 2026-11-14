@@ -1,4 +1,4 @@
-const PANEL_BUILD = "20261114-camera-availability-37";
+const PANEL_BUILD = "20261114-pending-recordings-38";
 
 class TuyaRecordingsPanel extends HTMLElement {
   constructor() {
@@ -143,7 +143,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       if (this.selectedCamera) params.set("camera", this.selectedCamera);
       if (this.selectedDate) params.set("date", this.selectedDate);
       if (this.calendarOpen && this.calendarMonth) params.set("month", this.calendarMonth);
-      let data = this.withReadyThumbnails(
+      let data = this.preparePanelData(
         await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
       );
       if (revision !== this.dataLoadRevision || playbackRevision !== this.playbackRevision) return;
@@ -163,7 +163,7 @@ class TuyaRecordingsPanel extends HTMLElement {
         if (!params.has("camera") && this.selectedCamera) {
           params.set("camera", this.selectedCamera);
           params.set("date", this.selectedDate);
-          data = this.withReadyThumbnails(
+          data = this.preparePanelData(
             await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
           );
           if (revision !== this.dataLoadRevision || playbackRevision !== this.playbackRevision) return;
@@ -491,7 +491,8 @@ class TuyaRecordingsPanel extends HTMLElement {
           padding: 0;
           font: inherit;
         }
-        .clip:hover { border-color: var(--recordings-accent); }
+        .clip[role="button"]:hover { border-color: var(--recordings-accent); }
+        .clip.pending { cursor: default; }
         .clip[playing] {
           border-color: var(--recordings-accent);
         }
@@ -886,7 +887,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     </section>`;
   }
 
-  withReadyThumbnails(data) {
+  preparePanelData(data) {
     for (const camera of data?.cameras || []) {
       if (camera.playback_mode === "timeline") {
         camera.recording_ranges = camera.recording_ranges || [];
@@ -896,9 +897,7 @@ class TuyaRecordingsPanel extends HTMLElement {
         ])].sort().reverse();
         continue;
       }
-      camera.clips = (camera.clips || []).filter(
-        (clip) => clip.thumbnail_cached && clip.thumbnail_url,
-      );
+      camera.clips = camera.clips || [];
       camera.dates = [...new Set(camera.clips.map((clip) => clip.date).filter(Boolean))].sort().reverse();
     }
     return data;
@@ -917,19 +916,21 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   renderClip(clip) {
+    const pending = Boolean(this.data?.stats?.cache_only && !clip.cached);
+    const playable = !pending && Boolean(clip.playback_url);
     const isPlaying = this.selectedClip && this.selectedClip.dev_id === clip.dev_id && this.selectedClip.start === clip.start && this.selectedClip.end === clip.end;
     return `
-      <div class="clip" role="button" aria-label="Play recording at ${this.escape(this.formatClipTime(clip))}" tabindex="0" data-start="${clip.start}" data-end="${clip.end}" ${isPlaying ? "playing" : ""}>
+      <div class="clip${pending ? " pending" : ""}" role="${playable ? "button" : "article"}" aria-label="${pending ? "Awaiting download: recording" : "Play recording"} at ${this.escape(this.formatClipTime(clip))}" ${playable ? 'tabindex="0"' : 'aria-disabled="true"'} data-start="${clip.start}" data-end="${clip.end}" ${isPlaying ? "playing" : ""}>
         <div class="thumb">
           ${
             isPlaying
               ? (clip.signed_playback_url ? this.renderPlayer(clip, "clip-video") : '<div class="no-video">Preparing playback...</div>')
-              : `${clip.signed_thumbnail_url ? `<img src="${this.escape(clip.signed_thumbnail_url)}" loading="lazy" alt="">` : `<div class="missing-thumb"><ha-icon icon="mdi:cctv"></ha-icon></div>`}<span class="play-mark"><ha-icon icon="mdi:play-circle"></ha-icon></span><span class="badge">${this.escape(this.formatDuration(clip.duration))}</span>`
+              : `${clip.signed_thumbnail_url ? `<img src="${this.escape(clip.signed_thumbnail_url)}" loading="lazy" alt="">` : `<div class="missing-thumb"><ha-icon icon="${pending ? "mdi:clock-outline" : "mdi:cctv"}"></ha-icon></div>`}${playable ? '<span class="play-mark"><ha-icon icon="mdi:play-circle"></ha-icon></span>' : ''}<span class="badge">${this.escape(this.formatDuration(clip.duration))}</span>`
           }
         </div>
         <div class="meta">
           <div class="title">${this.escape(this.formatClipTime(clip))}</div>
-          <div class="sub">${isPlaying ? "Now playing" : this.data?.stats?.cache_only && clip.cached ? "Saved locally" : this.escape(this.cameraName(clip.dev_id))}</div>
+          <div class="sub">${isPlaying ? "Now playing" : pending ? "Awaiting download" : this.data?.stats?.cache_only && clip.cached ? "Saved locally" : this.escape(this.cameraName(clip.dev_id))}</div>
         </div>
       </div>
     `;
@@ -999,7 +1000,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       const range = this.rangeForTime(time);
       if (range) await this.openTimelineRange(range, time);
     });
-    this.shadowRoot.querySelectorAll(".clip").forEach((button) => {
+    this.shadowRoot.querySelectorAll('.clip[role="button"]').forEach((button) => {
       this.boundClipButtons ||= new WeakSet();
       if (this.boundClipButtons.has(button)) return;
       this.boundClipButtons.add(button);
@@ -1120,6 +1121,7 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   async openClip(clip) {
+    if (!clip.playback_url || (this.data?.stats?.cache_only && !clip.cached)) return;
     this.stopPlayback();
     const revision = this.playbackRevision;
     this.error = "";
@@ -1585,6 +1587,7 @@ class TuyaRecordingsPanel extends HTMLElement {
   friendlySyncState(sync, pending) {
     const state = String(sync?.state || sync?.status || "idle").toLowerCase();
     const failed = Number(sync?.failed) || 0;
+    if (failed > 0 && state === "running") return "Syncing other cameras";
     if (failed > 0) return `${this.formatNumber(failed)} clip${failed === 1 ? "" : "s"} need another try`;
     const unavailable = sync?.unavailable_cameras?.length || 0;
     if (unavailable) {

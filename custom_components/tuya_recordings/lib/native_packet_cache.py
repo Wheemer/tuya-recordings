@@ -249,7 +249,7 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
                 raise CameraWorkCancelled("Native picture-order analysis cancelled")
             if len(header) != PACKET_HEADER.size:
                 raise ValueError("Native packet index is truncated")
-            kind, _flags, stamp, scale, size = PACKET_HEADER.unpack(header)
+            kind, flags, stamp, scale, size = PACKET_HEADER.unpack(header)
             if not 0 < size <= MAX_PACKET_BYTES or source.tell() + size > length:
                 raise ValueError("Native packet data is truncated")
             if kind == 1:
@@ -266,9 +266,13 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
                 try:
                     order.extend(frame.pts for frame in decoder.decode(packet))
                 except av.error.FFmpegError as err:
+                    # Report framing, never compressed footage or credentials.
+                    from .native_mux import _h264_nals
+                    layout = [(nal[0] & 0x1f, len(nal)) for nal in _h264_nals(bytes(packet))][:8]
                     raise ValueError(
                         f"Native indexed H264 picture decode failed: picture={len(times) - 1} "
-                        f"bytes={size} timestamp={stamp}/{scale}: {err}"
+                        f"bytes={size} timestamp={stamp}/{scale} "
+                        f"keyframe={bool(flags & 1)} nals={layout}: {err}"
                     ) from err
             else:
                 source.seek(size, 1)
