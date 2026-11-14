@@ -20,5 +20,5 @@ def test_panel_reload_does_not_register_static_route_twice(monkeypatch):
     assert register.await_count == 1
     assert panel.await_count == 2
     assert panel.await_args.kwargs["module_url"].endswith(
-        "panel.js?v=20261114-cached-playback-33"
+        "panel.js?v=20261114-private-cache-35"
     )

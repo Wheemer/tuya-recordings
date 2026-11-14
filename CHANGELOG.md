@@ -1,5 +1,22 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-32 (2026-11-14)
+
+### Cached Playback
+
+- Serve cached videos and thumbnails through authenticated integration URLs instead of assuming Home Assistant has a media source named local.
+- Keep existing cached recordings accessible when Media Sync is off. Missing local files do not trigger a camera download.
+- Correct cached-video MIME types and playable media-browser entries. The Tuya Recordings provider lists ready videos, not thumbnail folders or unrelated files.
+- Add cached-player initialization and thumbnail-error diagnostics.
+
+### Camera Safety And Diagnostics
+
+- Avoid sending a wake when the required SD-status schema is missing, following the APK's early query failure. Report unavailable query routes explicitly.
+- Include a standalone SD-status timeout summary with the selected route, subscription and reader state, publish timing, and messages received after query dispatch.
+- Distinguish MQTT broker acknowledgement from camera wake confirmation. Preserve the APK's SD-status deadline, existing cooldowns, playback, seeking and download interval filtering.
+
+The intermittent zero-reply SD-status timeout remains under investigation; this prerelease improves the evidence available when it occurs.
+
 ## Tuya Recordings v0.4.13-31 (2026-11-14)
 
 ### Media Sync

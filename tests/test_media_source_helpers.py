@@ -106,54 +106,49 @@ def test_clip_node_is_playable():
 
     assert node.children[0].can_play is True
     assert node.children[0].can_expand is False
+    assert node.children[0].media_content_type == "video/mp4"
 
 
-def test_safe_clip_url_uses_local_media_path():
+def test_safe_clip_url_uses_private_cache_path():
     source = TuyaRecordingsMediaSource(hass=None)
 
-    assert source._clip_url_name("cam 1_10_20.mp4") == f"/media/local/{DOMAIN}/videos/cam%201_10_20.mp4"
+    assert source._cached_clip_playback_url(CachedClipClient(), "cam 1", 10, 20) == f"/api/{DOMAIN}/play/cam%201/10/20?transport=file"
 
 
-def test_cached_clip_playback_url_prefers_local_media(monkeypatch):
+def test_cached_clip_playback_url_uses_private_cache():
     source = TuyaRecordingsMediaSource(hass=None)
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}")
 
-    assert source._cached_clip_playback_url(CachedClipClient(), "cam", 10, 20) == f"/media/local/{DOMAIN}/videos/cam_10_20.mp4"
+    assert source._cached_clip_playback_url(CachedClipClient(), "cam", 10, 20) == f"/api/{DOMAIN}/play/cam/10/20?transport=file"
 
 
-def test_require_cached_clip_playback_url_returns_cached_local_media(monkeypatch):
+def test_require_cached_clip_playback_url_returns_private_cache():
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
     client.path.cached = True
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
 
-    assert source._require_cached_clip_playback_url(client, "cam", 10, 20) == f"/media/local/{DOMAIN}/videos/cam_10_20.mp4"
+    assert source._require_cached_clip_playback_url(client, "cam", 10, 20) == f"/api/{DOMAIN}/play/cam/10/20?transport=file"
     assert client.downloaded == []
 
 
-def test_require_cached_clip_playback_url_rejects_uncached_clip(monkeypatch):
+def test_require_cached_clip_playback_url_rejects_uncached_clip():
     source = TuyaRecordingsMediaSource(hass=None)
     client = FailedDownloadClient()
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
 
     with pytest.raises(RuntimeError, match="not cached"):
         source._require_cached_clip_playback_url(client, "cam", 10, 20)
     assert client.downloaded == []
 
 
-def test_require_cached_clip_playback_url_rejects_storage_outside_media(monkeypatch):
+def test_require_cached_clip_playback_url_does_not_require_media_mapping():
     source = TuyaRecordingsMediaSource(hass=None)
     client = CachedClipClient()
-    monkeypatch.setattr(source, "_local_media_url", lambda path: None)
 
-    with pytest.raises(RuntimeError, match="under /media"):
-        source._require_cached_clip_playback_url(client, "cam", 10, 20)
+    assert source._require_cached_clip_playback_url(client, "cam", 10, 20) == f"/api/{DOMAIN}/play/cam/10/20?transport=file"
 
 
-def test_media_browser_rejects_uncached_recording(monkeypatch):
+def test_media_browser_rejects_uncached_recording():
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
-    monkeypatch.setattr(source, "_local_media_url", lambda path: f"/media/local/{DOMAIN}/videos/{path.name}" if path.exists() else None)
 
     with pytest.raises(RuntimeError, match="not cached"):
         source._resolve_clip_playback_url(client, "cam", 10, 20)

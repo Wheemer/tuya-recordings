@@ -123,17 +123,23 @@ class TuyaRecordingsMediaSource(MediaSource):
             return self._directory_node(identifier=identifier, title=clip_date, children=children)
 
         if dev_id and start and end:
+            try:
+                start_int, end_int = int(start), int(end)
+            except ValueError as exc:
+                raise Unresolvable("Invalid Tuya recording clip identifier") from exc
+            camera = self._find_camera(cameras, dev_id)
+            if client is None or camera is None:
+                raise Unresolvable("Unknown Tuya recording camera")
+            visible = await self.hass.async_add_executor_job(self._visible_clips, client, camera)
+            clip = next((clip for clip in visible if int(clip["start"]) == start_int
+                         and int(clip["end"]) == end_int), None)
+            if clip is None:
+                raise Unresolvable("Tuya recording is not cached and thumbnailed")
             use_12h = await self._async_use_12h_time()
-            return BrowseMediaSource(
-                domain=DOMAIN,
-                identifier=identifier,
-                media_class=MediaClass.VIDEO,
-                media_content_type="",
-                title=self._clip_title(int(start), int(end), use_12h=use_12h),
-                can_play=False,
-                can_expand=False,
-                children=[],
-                thumbnail=None,
+            return self._clip_node(
+                client=client, clip=clip, dev_id=dev_id, clip_date=str(clip.get("date") or ""),
+                start=start_int, end=end_int,
+                title=self._clip_title(start_int, end_int, use_12h=use_12h),
             )
 
         if query.get("empty"):
@@ -230,27 +236,22 @@ class TuyaRecordingsMediaSource(MediaSource):
     def _find_camera(cameras: list[dict[str, Any]], dev_id: str) -> dict[str, Any] | None:
         return next((camera for camera in cameras if camera.get("devId") == dev_id), None)
 
-    @staticmethod
-    def _clip_url(path: Path) -> str:
-        return TuyaRecordingsMediaSource._clip_url_name(path.name)
-
-    @staticmethod
-    def _clip_url_name(name: str) -> str:
-        return f"/media/local/{DOMAIN}/videos/{quote(name)}"
+    def _account_id(self, client: Any) -> str | None:
+        return next((key for key, value in self._clients().items() if value["client"] is client), None)
 
     def _cached_clip_playback_url(self, client: Any, dev_id: str, start: int, end: int) -> str | None:
         path = client.clip_path(dev_id, start, end)
         if not self._clip_ready(client, dev_id, start, end, path):
             return None
-        return self._local_media_url(path)
+        account = self._account_id(client)
+        query = urlencode({"transport": "file", **({"entry_id": account} if account else {})})
+        return f"/api/{DOMAIN}/play/{quote(dev_id, safe='')}/{start}/{end}?{query}"
 
     def _require_cached_clip_playback_url(self, client: Any, dev_id: str, start: int, end: int) -> str:
         cached = self._cached_clip_playback_url(client, dev_id, start, end)
         if cached:
             return cached
         path = client.clip_path(dev_id, start, end)
-        if self._path_ready(path) and self._local_media_url(path) is None:
-            raise RuntimeError("Cached Tuya recording must be stored under /media to play in Home Assistant.")
         if self._path_ready(path):
             raise RuntimeError("Cached Tuya recording is not browser-ready yet.")
         raise RuntimeError("Tuya recording is not cached yet.")
@@ -296,17 +297,15 @@ class TuyaRecordingsMediaSource(MediaSource):
         return TuyaRecordingsMediaSource._path_ready(path)
 
     @staticmethod
-    def _thumbnail_url_name(name: str) -> str:
-        return f"/media/local/{DOMAIN}/thumbs/{quote(name)}"
-
-    @staticmethod
     def _thumbnail_url_for_clip(dev_id: str, start: int, end: int) -> str:
         return f"/api/{DOMAIN}/thumb/{quote(dev_id)}/{start}/{end}"
 
     def _thumbnail_url(self, client: Any, clip: dict[str, Any], dev_id: str, start: int, end: int) -> str | None:
         thumbnail_path = client.thumbnail_path(dev_id, start, end)
         if thumbnail_path.exists() and thumbnail_path.stat().st_size > 0:
-            return self._thumbnail_url_for_clip(dev_id, start, end)
+            path = self._thumbnail_url_for_clip(dev_id, start, end)
+            account = self._account_id(client)
+            return f"{path}?{urlencode({'entry_id': account})}" if account else path
         if getattr(client, "cloud_activity_paused", False):
             return None
 
@@ -316,14 +315,6 @@ class TuyaRecordingsMediaSource(MediaSource):
         if live_thumbnail:
             return self._absolute_url(client, live_thumbnail)
         return None
-
-    @staticmethod
-    def _local_media_url(path: Path) -> str | None:
-        try:
-            relative = path.resolve().relative_to(Path("/media").resolve())
-        except ValueError:
-            return None
-        return f"/media/local/{quote(relative.as_posix())}"
 
     @staticmethod
     def _raw_thumbnail_url(raw: dict[str, Any]) -> str:
@@ -363,7 +354,7 @@ class TuyaRecordingsMediaSource(MediaSource):
         return url
 
     def _clip_node(self, client: Any, clip: dict[str, Any], dev_id: str, clip_date: str, start: int, end: int, title: str) -> BrowseMediaSource:
-        account = next((key for key, value in self._clients().items() if value["client"] is client), None)
+        account = self._account_id(client)
         return BrowseMediaSource(
             domain=DOMAIN,
             identifier=build_identifier(
@@ -376,7 +367,7 @@ class TuyaRecordingsMediaSource(MediaSource):
                 }
             ),
             media_class=MediaClass.VIDEO,
-            media_content_type="",
+            media_content_type="video/mp4",
             title=title,
             can_play=True,
             can_expand=False,

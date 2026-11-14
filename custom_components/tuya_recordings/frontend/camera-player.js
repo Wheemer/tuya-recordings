@@ -1,5 +1,7 @@
 import './vendor/plyr/plyr.min.js';
 
+export const CAMERA_PLAYER_BUILD = '20261114-private-cache-36';
+
 // Plyr owns presentation; camera seeks remain signed, serialized server requests.
 export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   if (video.plyr) {
@@ -49,6 +51,8 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   const continuous = options.mode === 'timeline' && initialClip.playback_url.includes('/timeline/');
   const initialOffset = Math.max(0, Number(options.initialOffset) || 0);
   const debug = (phase, detail = null) => options.debug?.({ phase, ...(detail || {}) });
+  debug('initialize', {player_build: CAMERA_PLAYER_BUILD, cached: Boolean(clip.cached),
+    readyState: video.readyState, hasSource: Boolean(video.getAttribute('src'))});
   let streamTransport = clip.cached ? 'file' : (clip.stream_transport || 'native');
   let isControlledStream = streamTransport === 'native' && !clip.cached;
   const selectClip = nextClip => {
@@ -755,6 +759,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     source.start(startTime);
     audioNextTime = startTime + buffer.duration;
   };
+  debug('controls-create');
   player = new window.Plyr(video, {
     controls: continuous
       ? ['play', 'mute', 'volume', 'fullscreen']
@@ -783,8 +788,13 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       },
     },
   });
+  debug('controls-ready', {enhanced: Boolean(player.supported?.ui)});
   const controller = new AbortController();
   const on = (target, event, callback) => target.addEventListener(event, callback, { signal: controller.signal });
+  on(video, 'loadedmetadata', () => debug('metadata', {
+    transport: streamTransport, duration: Number.isFinite(video.duration) ? video.duration : null,
+    width: video.videoWidth, height: video.videoHeight, readyState: video.readyState,
+  }));
   on(video, 'timeupdate', syncAac);
   on(video, 'playing', syncAac);
   on(video, 'pause', syncAac);

@@ -43,7 +43,8 @@ class FakePlayableBackend:
     name = "apk-native"
     clip_playback_available = True
 
-def test_build_panel_data_marks_cached_files(tmp_path):
+@pytest.mark.parametrize("mapped_media_root", [True, False])
+def test_build_panel_data_marks_cached_files(tmp_path, mapped_media_root):
     client = FakeClient(tmp_path)
     video_path = client.clip_path("camera 1", 100, 130)
     thumb_path = client.thumbnail_path("camera 1", 100, 130)
@@ -65,7 +66,7 @@ def test_build_panel_data_marks_cached_files(tmp_path):
                 }
             ],
         },
-        media_root=tmp_path,
+        media_root=tmp_path if mapped_media_root else tmp_path / "unrelated_media_source",
     )
 
     camera = data["cameras"][0]
@@ -76,9 +77,9 @@ def test_build_panel_data_marks_cached_files(tmp_path):
     assert clip["duration"] == 30
     assert clip["cached"] is True
     assert clip["thumbnail_cached"] is True
-    assert clip["playback_url"] == "/media/local/tuya_recordings/videos/camera%201_100_130.mp4"
+    assert clip["playback_url"] == "/api/tuya_recordings/play/camera%201/100/130?transport=file"
     assert clip["stream_transport"] == "file"
-    assert clip["thumbnail_url"] == "/media/local/tuya_recordings/thumbs/camera%201_100_130.jpg"
+    assert clip["thumbnail_url"] == "/api/tuya_recordings/thumb/camera%201/100/130"
     assert data["stats"]["indexed_clips"] == 1
     assert data["stats"]["ready_clips"] == 1
     assert data["stats"]["pending_clips"] == 0
