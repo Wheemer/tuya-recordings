@@ -22,7 +22,7 @@ from .native_frames import (
     validate_playback_frame_event,
 )
 from .native_packet_cache import (
-    PACKET_HEADER, NativePresentationClock, TimestampedVideoMuxer,
+    MAX_PACKET_BYTES, PACKET_HEADER, NativePresentationClock, TimestampedVideoMuxer,
     TimestampedAacMuxer, mux_camera_packets,
 )
 
@@ -128,6 +128,7 @@ class NativePlaybackMuxer:
     _audio_bytes: int = field(default=0, init=False, repr=False)
     _started: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
+    _pending_video_headers: bytes = field(default=b"", init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.output_path = Path(self.output_path)
@@ -216,13 +217,21 @@ class NativePlaybackMuxer:
         self._cleanup_intermediates()
 
     def cleanup(self) -> None:
+        self._pending_video_headers = b""
         for path in (self._video_path, self._audio_path, self._packet_path, self._temp_path, self.output_path):
             path.unlink(missing_ok=True)
 
     def _write_media_codec_packet(self, data: bytes, info: dict[str, Any]) -> None:
         codec = _codec_name(info)
         if codec in {"h264", "avc"}:
+            if len(self._pending_video_headers) + len(data) > MAX_PACKET_BYTES:
+                raise NativeMuxError("Native cached video headers exceed packet limit")
             _append_bytes(self._video_path, data)
+            if _h264_metadata_only(data):
+                self._pending_video_headers += data
+                return
+            data = self._pending_video_headers + data
+            self._pending_video_headers = b""
             self._video_bytes += len(data)
             self._record_packet(1, data, info)
             return
@@ -255,6 +264,7 @@ class NativePlaybackMuxer:
         _append_bytes(self._packet_path, PACKET_HEADER.pack(kind, int(bool(info.get("isKeyFrame"))), timestamp, scale, len(data)) + data)
 
     def _cleanup_intermediates(self) -> None:
+        self._pending_video_headers = b""
         self._video_path.unlink(missing_ok=True)
         self._audio_path.unlink(missing_ok=True)
         self._temp_path.unlink(missing_ok=True)
@@ -1066,6 +1076,15 @@ def _h264_nals(payload: bytes) -> tuple[bytes, ...]:
             units.append(payload[start:end])
         offset = end
     return tuple(units)
+
+
+def _h264_metadata_only(payload: bytes) -> bool:
+    """Recognize configuration/delimiter packets, not corrupt or unknown NALs."""
+    nals = _h264_nals(payload)
+    return bool(nals) and all(
+        not nal[0] & 0x80 and nal[0] & 0x1F in {6, 7, 8, 9, 10, 11, 12}
+        for nal in nals
+    )
 
 
 def _h264_parameter_sets(payload: bytes) -> bytes:

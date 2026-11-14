@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-30 (2026-11-14)
+
+### Recording Catalog
+
+- Preserve valid V1 recording ranges when a reply also contains unfinished or zero-length ranges, following the Smart Life APK's per-record handling.
+- Include reply size and count fields when a V1 catalog layout cannot be decoded.
+
+### Media Sync
+
+- Handle separate H.264 configuration packets without treating them as video pictures, following the APK's separation of SPS/PPS data from coded frames. This fixes a reproduced cached-video remux failure.
+- Preserve original compressed video and audio without transcoding, including reordered pictures and recording-fragment transitions.
+- Keep existing playback, seeking, camera cooldowns, and background scheduling unchanged.
+
 ## Tuya Recordings v0.4.13-29 (2026-11-14)
 
 ### Media Sync

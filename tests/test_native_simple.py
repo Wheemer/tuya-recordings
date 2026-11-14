@@ -414,6 +414,16 @@ def test_decodes_apk_v1_extended_binary_catalog_envelope():
     assert page.items[0].end_time == 220
 
 
+@pytest.mark.parametrize("offset", [0x10, 0x50])
+def test_v1_catalog_preserves_valid_siblings_of_unplayable_ranges(offset):
+    payload = bytearray(offset + 4 + 4 * 12)
+    struct.pack_into("<I", payload, offset, 4)
+    for index, (start, end) in enumerate([(100, 110), (120, 120), (150, 0), (160, 180)]):
+        struct.pack_into("<III", payload, offset + 4 + index * 12, 0, start, end)
+    page = decode_catalog_reply(NativeSimpleCommand(7, 1, 3, 1, bytes(payload)), request_id=7)
+    assert [(item.start_time, item.end_time) for item in page.items] == [(100, 110), (160, 180)]
+
+
 def test_decodes_apk_v2_binary_catalog_items():
     payload = bytearray(0x14 + 0x40)
     struct.pack_into("<5I", payload, 0, 0, 2026, 9, 18, 1)
@@ -459,7 +469,7 @@ def test_decodes_apk_v3_binary_catalog_items_with_variable_event_types():
 
 
 def test_rejects_truncated_apk_v1_binary_catalog():
-    payload = bytearray(0x18 + 11)
+    payload = bytearray(0x14 + 11)
     struct.pack_into("<I", payload, 0x10, 1)
     reply = NativeSimpleCommand(2, 1, 3, 1, bytes(payload))
 

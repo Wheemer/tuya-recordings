@@ -158,7 +158,9 @@ def media(data, codec, timestamp, *, audio=False):
 
 @pytest.mark.parametrize("audio_codec,width", [("g711u", 1), ("pcm_s16le", 2)])
 @pytest.mark.parametrize("fragment_reset", [False, True])
-def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, audio_codec, width, fragment_reset):
+@pytest.mark.parametrize("separate_headers", [False, True])
+@pytest.mark.parametrize("via_sync", [False, True])
+def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, monkeypatch, audio_codec, width, fragment_reset, separate_headers, via_sync):
     import hashlib
     path = tmp_path / "bframes.h264"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
@@ -184,16 +186,46 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
     audio = (bytes([0x80, 0, 0xAA, 0x2A]) * 4000 if width == 1
              else struct.pack("<hhhh", 0, 8192, -8192, 16384) * 4000)
     output = tmp_path / "cached.mp4"
-    with NativePlaybackMuxer(output) as muxer:
+    from custom_components.tuya_recordings.lib.native_mux import _h264_parameter_sets
+    headers = _h264_parameter_sets(packets[0][0])
+    def receive(_dev, _one, _two, _start, _end, destination, **kwargs):
+        with NativePlaybackMuxer(destination) as muxer:
+            write_events(muxer)
+
+    def write_events(muxer):
         for index, (packet, keyframe) in enumerate(packets):
             stamp = 100000 + index * 100 + (60000 if fragment_reset and index >= 10 else 0)
+            if separate_headers and keyframe:
+                muxer.handle_event(media(headers, "h264", stamp))
             event = media(packet, "h264", stamp)
             event["payload"]["info"]["isKeyFrame"] = keyframe
             muxer.handle_event(event)
             muxer.handle_event(media(audio[index * 800 * width:(index + 1) * 800 * width], audio_codec, stamp, audio=True))
-    final = tmp_path / "final.mp4"
-    finalize_mp4_for_browser(output, final)
-    output = final
+        if separate_headers:
+            muxer.handle_event(media(headers, "h264", stamp + 100))
+    if via_sync:
+        from types import SimpleNamespace
+        from custom_components.tuya_recordings import client as module
+        from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+        monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
+        client = module.TuyaRecordingsClient({"media_sync_enabled": True}, media_storage_path=tmp_path / "library")
+        monkeypatch.setattr(client, "_backend", SimpleNamespace(clip_playback_available=True, receive_clip=receive))
+        monkeypatch.setattr(client, "_clip_playback_metadata", lambda *args: {})
+        monkeypatch.setattr(client, "refresh_recent_recordings", lambda: {
+            "cameras": [{"devId": "camera", "clips": [{"start": 100, "end": 102}]}],
+        })
+        monkeypatch.setattr(client, "cleanup_cached_media", lambda *args: {})
+        result = client.sync_recordings()
+        assert result["downloaded"] == 1 and result["failed"] == 0
+        assert client._media_failures == {}
+        output = client.clip_path("camera", 100, 102)
+        assert client.sync_recordings()["skipped"] == 1
+    else:
+        with NativePlaybackMuxer(output) as muxer:
+            write_events(muxer)
+        final = tmp_path / "final.mp4"
+        finalize_mp4_for_browser(output, final)
+        output = final
     with av.open(str(output)) as result:
         assert hashes(result) == expected
     with av.open(str(output)) as result:
@@ -284,6 +316,34 @@ def test_cache_rejects_invalid_camera_clock_and_cleans_up(tmp_path, encoded_vide
             muxer.handle_event(event)
     assert not output.exists()
     assert not list(tmp_path.glob("*.tmp*"))
+
+
+def test_cache_bounds_header_only_packets_and_cleans_up(tmp_path, monkeypatch):
+    from custom_components.tuya_recordings.lib import native_mux
+    monkeypatch.setattr(native_mux, "MAX_PACKET_BYTES", 16)
+    output = tmp_path / "headers.mp4"
+    with pytest.raises(NativeMuxError, match="exceed packet limit"):
+        with NativePlaybackMuxer(output) as muxer:
+            for _ in range(4):
+                muxer.handle_event(media(b"\x00\x00\x01\x67\x01", "h264", 100))
+    assert not output.exists()
+    assert not list(tmp_path.glob("*.tmp*"))
+    assert muxer._pending_video_headers == b""
+
+
+@pytest.mark.parametrize("nal_type", [0, 1, 5, 13, 20, 31, 0x87])
+def test_cache_does_not_classify_pictures_or_invalid_nals_as_headers(nal_type):
+    from custom_components.tuya_recordings.lib.native_mux import _h264_metadata_only
+    assert not _h264_metadata_only(b"\x00\x00\x01" + bytes([nal_type]) + b"data")
+
+
+def test_cache_does_not_count_configuration_as_received_video(tmp_path):
+    output = tmp_path / "no-pictures.mp4"
+    with pytest.raises(NativeMuxError, match="no video packets"):
+        with NativePlaybackMuxer(output, require_audio=False) as muxer:
+            muxer.handle_event(media(b"\x00\x00\x01\x67\x01", "h264", 100))
+    assert not output.exists()
+    assert not list(tmp_path.glob("*.h264"))
 
 
 def test_cache_preserves_aac_packets_without_encoding(tmp_path, encoded_video):
