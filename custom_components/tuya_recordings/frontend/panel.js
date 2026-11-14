@@ -131,6 +131,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     }
     const revision = ++this.dataLoadRevision;
     if (!quiet) this.stopPlayback();
+    const playbackRevision = this.playbackRevision;
     this.loading = true;
     this.error = "";
     if (!quiet) this.render();
@@ -143,7 +144,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       let data = this.withReadyThumbnails(
         await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
       );
-      if (revision !== this.dataLoadRevision) return;
+      if (revision !== this.dataLoadRevision || playbackRevision !== this.playbackRevision) return;
       this.data = data;
       this.selectedAccount = data.entry_id || this.selectedAccount;
       if (this.selectedAccount) params.set("entry_id", this.selectedAccount);
@@ -163,7 +164,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           data = this.withReadyThumbnails(
             await this._hass.callApi("GET", `tuya_recordings/panel?${params}`),
           );
-          if (revision !== this.dataLoadRevision) return;
+          if (revision !== this.dataLoadRevision || playbackRevision !== this.playbackRevision) return;
           this.data = data;
         }
       }
@@ -177,7 +178,9 @@ class TuyaRecordingsPanel extends HTMLElement {
         await this.signClip(this.selectedClip);
       }
     } catch (err) {
-      if (revision === this.dataLoadRevision) this.error = err?.message || String(err);
+      if (revision === this.dataLoadRevision && playbackRevision === this.playbackRevision) {
+        this.error = err?.message || String(err);
+      }
     } finally {
       this.loading = false;
       if (this.pendingDataLoad) {
@@ -1024,7 +1027,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     const revision = this.playbackRevision;
     try {
       this.debugPlayback("player-import", this.selectedClip);
-      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261108-native-clock-32');
+      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261114-cached-playback-34');
       if (revision !== this.playbackRevision || !video.isConnected) return;
       this.disposePlayer?.();
       this.disposePlayer = null;

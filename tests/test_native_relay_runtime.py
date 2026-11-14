@@ -48,6 +48,151 @@ TOKEN = {
 }
 
 
+@pytest.mark.parametrize("start,end,other", [
+    (1794647115, 1794647134, 1794648815),
+    (1794603272, 1794603289, 1794605023),
+])
+@pytest.mark.parametrize("scale", [1000, 1_000_000])
+def test_cached_recording_rejects_other_fragment_before_clock_mapping(start, end, other, scale):
+    from custom_components.tuya_recordings.lib.native_relay_playback import NativePlaybackCompleted
+    import base64
+
+    def frame(payload, kind, timestamp, codec=4):
+        timestamp *= scale // 1000
+        return replace(wire_frame(payload, frame_type=kind, codec=codec if kind == 3 else None),
+                       field_8=timestamp >> 32, field_12=timestamp & 0xFFFFFFFF,
+                       timestamp_scale=scale)
+
+    class Download(Playback):
+        transport_diagnostics = "fixture-LAN"
+
+        async def start(self, **kwargs):
+            self.start_calls.append(kwargs)
+            for packet in [
+                frame(b"stale-video", 1, (start - 60) * 1000),
+                frame(b"stale-audio", 3, (start - 60) * 1000),
+                frame(b"wanted-video", 1, start * 1000),
+                frame(b"", 3, start * 1000),
+                replace(frame(b"wanted-audio", 3, start * 1000), codec_info=None),
+                frame(b"stale-codec", 3, (start - 60) * 1000, codec=133),
+                frame(b"wanted-tail", 1, end * 1000 + 999),
+                frame(b"other-video", 1, other * 1000),
+                replace(frame(b"wanted-audio-tail", 3, end * 1000 + 999), codec_info=None),
+                frame(b"other-audio", 3, other * 1000),
+            ]:
+                self.frames.put_nowait(packet)
+
+        async def receive_frame(self):
+            if self.frames.empty():
+                raise NativePlaybackCompleted
+            return await super().receive_frame()
+
+    playback = Download()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    events = []
+    asyncio.run(runtime._stream_connected(playback, NativePlaybackRequest(start=start, end=end), events.append))
+    payloads = [base64.b64decode(e["payload"]["payloadBase64"])
+                for e in events if e["payload"]["type"] == "media-codec"]
+    assert payloads == [b"wanted-video", b"wanted-audio", b"wanted-tail", b"wanted-audio-tail"]
+    audio = [e["payload"]["info"]["codecId"] for e in events
+             if e["payload"]["type"] == "media-codec" and e["payload"]["info"]["avChannel"] == 1]
+    assert audio == [4, 4]
+    assert playback.stop_count == 1
+
+
+def test_media_sync_keeps_sequential_downloads_inside_selected_fragments(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    import av
+    from custom_components.tuya_recordings import client as module
+    from custom_components.tuya_recordings.lib.commands import CameraCommandQueue
+    from custom_components.tuya_recordings.lib.native_mux import NativePlaybackMuxer
+    from custom_components.tuya_recordings.lib.native_relay_playback import NativePlaybackCompleted
+
+    raw = tmp_path / "source.h264"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc=size=160x90:rate=5:duration=1", "-pix_fmt", "yuv420p",
+                    "-c:v", "libx264", "-bf", "0", "-y", str(raw)],
+                   check=True, timeout=20)
+    with av.open(str(raw), format="h264") as source:
+        packets = [bytes(packet) for packet in source.demux(video=0) if packet.size]
+    assert len(packets) == 5
+
+    def packet(payload, kind, timestamp):
+        frame = wire_frame(payload, frame_type=kind, codec=133 if kind == 3 else None)
+        if kind == 3:
+            info = frame.codec_info
+            frame = replace(frame, codec_info=replace(
+                info, sample_rate_index=0, channels_index=0, bit_width_index=0,
+                raw=struct.pack(">6H", 133, 0, 0, 0, 0, 0) + info.raw[12:],
+            ))
+        return replace(frame, field_8=timestamp >> 32, field_12=timestamp & 0xFFFFFFFF,
+                       timestamp_scale=1000)
+
+    class Download(Playback):
+        transport_diagnostics = "fixture-LAN"
+
+        async def start(self, **kwargs):
+            self.start_calls.append(kwargs)
+            start = kwargs["start"]
+            # Include a prior download's tail and then another recording.
+            self.frames.put_nowait(packet(packets[0], 1, (start - 1800) * 1000))
+            for base in (start, start + 1800):
+                for index, video in enumerate(packets):
+                    timestamp = base * 1000 + index * 200
+                    self.frames.put_nowait(packet(video, 1, timestamp))
+                    audio = bytes([base & 0xFF, 0, 0xAA, 0x2A]) * 200
+                    self.frames.put_nowait(packet(audio, 3, timestamp))
+                    self.frames.put_nowait(packet(audio, 3, timestamp))
+
+        async def receive_frame(self):
+            if self.frames.empty():
+                raise NativePlaybackCompleted
+            return await super().receive_frame()
+
+        async def stop(self):
+            await super().stop()
+            while not self.frames.empty():
+                self.frames.get_nowait()
+
+    playback = Download()
+    runtime = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+
+    def receive(_dev, _config, _auth, start, end, output, **kwargs):
+        with NativePlaybackMuxer(output) as muxer:
+            asyncio.run(runtime._stream_connected(playback, NativePlaybackRequest(start=start, end=end),
+                                                  muxer.handle_event))
+
+    monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
+    monkeypatch.setattr(module, "MEDIA_SYNC_INTER_ATTEMPT_DELAY", 0)
+    client = module.TuyaRecordingsClient({"media_sync_enabled": True}, media_storage_path=tmp_path / "library")
+    monkeypatch.setattr(client, "_backend", SimpleNamespace(clip_playback_available=True, receive_clip=receive))
+    monkeypatch.setattr(client, "_clip_playback_metadata", lambda *args: {})
+    monkeypatch.setattr(client, "refresh_recent_recordings", lambda: {
+        "cameras": [{"devId": "camera", "clips": [{"start": start, "end": start + 1} for start in (10000, 11800)]}],
+    })
+    monkeypatch.setattr(client, "cleanup_cached_media", lambda *args: {})
+    result = client.sync_recordings()
+    assert result["downloaded"] == 2 and result["failed"] == 0
+    assert len(playback.start_calls) == playback.stop_count == 2
+    for start in (10000, 11800):
+        output = client.clip_path("camera", start, start + 1)
+        with av.open(str(output)) as saved:
+            pictures = list(saved.decode(video=0))
+            assert len(pictures) == 5
+            assert [float(frame.pts * frame.time_base) for frame in pictures] == pytest.approx(
+                [0, 0.2, 0.4, 0.6, 0.8], abs=0.001,
+            )
+        with av.open(str(output)) as saved:
+            assert sum(frame.samples for frame in saved.decode(audio=0)) == 8000
+        with av.open(str(output)) as saved:
+            assert saved.streams.video[0].codec_context.name == "h264"
+            assert saved.streams.audio[0].codec_context.name == "pcm_mulaw"
+            assert b"".join(bytes(packet) for packet in saved.demux(audio=0) if packet.size) == (
+                bytes([start & 0xFF, 0, 0xAA, 0x2A]) * 400 * 5
+            )
+
+
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("interactive", [False, True])
 def test_fresh_catalog_start_and_camera_completion(empty, interactive):
@@ -470,7 +615,7 @@ def wire_frame(payload, *, frame_type, codec=None):
         info = struct.pack(">6H", codec, 8, 1, 1, 0, 0) + bytes(
             PLAYBACK_CODEC_INFO_BYTES - 12
         )
-    wire = struct.pack(">HH7I", frame_type, flag, len(payload), 1, 2, 3, 4, 5, 6)
+    wire = struct.pack(">HH7I", frame_type, flag, len(payload), 0, 100000, 3, 4, 5, 6)
     return NativePlaybackStreamParser().feed(wire + info + payload)[0]
 
 
@@ -485,7 +630,7 @@ def encrypted_wire_frame(payload, *, frame_type, codec, uuid, secret, iv):
     struct.pack_into(">6H", info, 0, codec, 8, 1, 1, 1, 0)
     info[12 : 12 + len(uuid)] = uuid.encode()
     info[44:60] = iv
-    wire = struct.pack(">HH7I", frame_type, 1, len(encrypted), 1, 2, 3, 4, 5, 6)
+    wire = struct.pack(">HH7I", frame_type, 1, len(encrypted), 0, 100000, 3, 4, 5, 6)
     return NativePlaybackStreamParser().feed(wire + bytes(info) + encrypted)[0]
 
 
@@ -521,6 +666,10 @@ class Playback:
             )
         )
         self.frames.put_nowait(wire_frame(b"aac", frame_type=3, codec=4))
+        timestamp = kwargs["play_time"] * 1000
+        for _ in range(self.frames.qsize()):
+            packet = self.frames.get_nowait()
+            self.frames.put_nowait(replace(packet, field_8=timestamp >> 32, field_12=timestamp & 0xFFFFFFFF))
 
     async def stop(self):
         self._playback_started = False

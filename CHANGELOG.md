@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-31 (2026-11-14)
+
+### Media Sync
+
+- Keep downloaded recordings inside the selected time range, following the APK's fragment-timestamp checks. Prevent footage from another recording being folded into the current MP4.
+- Advance audio blocks that share a timestamp by their sample duration, following the APK's sample-based timing without shifting the video clock. Video and audio remain untranscoded.
+
+### Playback
+
+- Keep the cached player running when an overlapping panel refresh completes or fails, instead of clearing the selected recording.
+- Distinguish browser autoplay restrictions from cached-file failures and include cached playback progress and media errors in debug logs.
+- Preserve existing SD playback, seeking, camera cooldowns, and background scheduling.
+
+These download fixes apply to new downloads; existing cached files are not automatically rewritten.
+
 ## Tuya Recordings v0.4.13-30 (2026-11-14)
 
 ### Recording Catalog

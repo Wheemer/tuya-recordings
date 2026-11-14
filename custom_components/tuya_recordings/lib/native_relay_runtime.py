@@ -1115,7 +1115,7 @@ class NativeRelayRuntimeSession:
             await self._receive_media(
                 playback,
                 sink,
-                request.end - request.position,
+                request,
                 playback_secrets=playback_secrets,
                 recording_uuid=request.encryption_uuid,
             )
@@ -1478,7 +1478,7 @@ class NativeRelayRuntimeSession:
         self,
         playback: Any,
         sink: NativePlaybackEventSink,
-        duration: int,
+        request: NativePlaybackRequest,
         *,
         playback_secrets: dict[str, str],
         recording_uuid: str,
@@ -1489,6 +1489,8 @@ class NativeRelayRuntimeSession:
         saw_audio = False
         saw_video = False
         audio_codec_info = None
+        ended_tracks: set[int] = set()
+        rejected: dict[str, int] = {}
         while True:
             if self._cancelled():
                 raise NativeRelayRuntimeError("Native playback was cancelled")
@@ -1523,6 +1525,32 @@ class NativeRelayRuntimeSession:
                     f"(video={saw_video}, audio={saw_audio}; "
                     f"{playback.transport_diagnostics})"
                 ) from err
+            timestamp = (frame.field_8 << 32) | frame.field_12
+            scale = frame.timestamp_scale or 1000
+            if type(timestamp) is not int or timestamp < 0 or type(scale) is not int or not 0 < scale <= 1_000_000:
+                raise NativeRelayRuntimeError("Native recording frame has invalid source timing")
+            # getFragmentIdByTimestramp compares whole camera seconds against
+            # inclusive selected fragment bounds, before presentation mapping.
+            second = timestamp // scale
+            track = int(frame.is_audio)
+            if second < request.start or second > request.end:
+                reason = "before_start" if second < request.start else "after_end"
+                key = f"{reason}_{track}"
+                rejected[key] = rejected.get(key, 0) + 1
+                if rejected[key] == 1:
+                    _LOGGER.debug(
+                        "Native recording frame excluded: requested=%s..%s source=%s/%s track=%s reason=%s",
+                        request.start, request.end, timestamp, scale, track, reason,
+                    )
+                if frame.payload and second > request.end and (saw_audio if track else saw_video):
+                    ended_tracks.add(track)
+                if ended_tracks == {0, 1} and saw_audio and saw_video:
+                    _LOGGER.debug(
+                        "Native recording interval complete: requested=%s..%s excluded=%s",
+                        request.start, request.end, rejected,
+                    )
+                    return
+                continue
             if frame.is_audio:
                 if frame.codec_info is not None:
                     audio_codec_info = frame.codec_info
@@ -1531,9 +1559,9 @@ class NativeRelayRuntimeSession:
             converted = self._convert_frame(frame, playback_secrets, recording_uuid)
             if converted is None:
                 continue
-            if media_deadline is None:
-                media_deadline = loop.time() + max(float(duration), 0.1)
             info = converted.info or {}
+            if media_deadline is None:
+                media_deadline = loop.time() + max(float(request.end - request.position + 1), 0.1)
             if info.get("avChannel") == 1:
                 saw_audio = True
             else:

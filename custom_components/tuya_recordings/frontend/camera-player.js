@@ -835,11 +835,12 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   on(video, 'timeupdate', () => {
     lastPlaybackProgress = performance.now();
     clearWaitingStatus();
-    if (isControlledStream && progressReportedRevision !== revision) {
+    if (progressReportedRevision !== revision) {
       progressReportedRevision = revision;
       debug('progress', {
         position: Math.round(position() * 100) / 100,
         readyState: video.readyState,
+        transport: streamTransport,
       });
     }
     // The old MediaSource can emit one last timeupdate after a timeline seek.
@@ -896,12 +897,26 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     // Loading the fresh MediaSource during a timeline seek can emit a stale
     // error from the detached buffer. The current stream is still valid.
     if (!video.getAttribute('src') || (streamStarting && !video.error)) return;
+    debug('media-error', {
+      transport: streamTransport,
+      code: video.error?.code || null,
+      readyState: video.readyState,
+      networkState: video.networkState,
+    });
     paused = true;
     release();
     status.textContent = 'Playback unavailable: ' + (video.error?.message || 'video error');
   });
   if (clip.cached) {
-    video.play().catch(() => { status.textContent = 'Tap play to start'; });
+    debug('cached-play-request');
+    video.play().catch(error => {
+      if (disposed) return;
+      const blocked = error?.name === 'NotAllowedError';
+      debug(blocked ? 'play-blocked' : 'play-failed', {
+        transport: 'file', name: error?.name || 'Error', code: video.error?.code || null,
+      });
+      status.textContent = blocked ? 'Tap play to start' : 'Playback unavailable: ' + messageFor(error);
+    });
   } else if (options.autoplay) {
     resume(initialOffset);
   }
