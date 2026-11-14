@@ -89,7 +89,6 @@ def main() -> None:
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(
                     headless=True,
-                    args=["--autoplay-policy=no-user-gesture-required"],
                 )
                 for width in (1280, 390, 320):
                     page = browser.new_page(viewport={"width": width, "height": 900})
@@ -142,11 +141,11 @@ def main() -> None:
                           root.querySelector('#pause-toggle').click();
                           await new Promise(resolve => setTimeout(resolve, 0));
                           const pauseAfter = root.querySelector('#pause-toggle').textContent.trim();
-                          root.querySelector('.clip').click();
                           return {pauseBefore, pauseAfter, services, idleRefreshCalls, playbackRefreshCalls, onDemandRefreshCalls};
                         }""",
                         {"base": f"http://127.0.0.1:{server.server_port}"},
                     )
+                    page.locator("tuya-recordings-panel").locator(".clip").click()
                     page.wait_for_function(
                         "document.querySelector('tuya-recordings-panel').shadowRoot.querySelector('video')?.currentTime > 0.1",
                         timeout=10_000,
@@ -175,6 +174,60 @@ def main() -> None:
                         }"""
                     )
                     assert not errors
+                    race = page.evaluate("""async () => {
+                      const results = [];
+                      for (const fail of [false, true]) {
+                      const panel = document.querySelector('tuya-recordings-panel');
+                      panel.stopPlayback();
+                      panel.selectedClip = null;
+                      panel.render();
+                      const originalApi = panel._hass.callApi;
+                      let resolveRefresh, rejectRefresh;
+                      panel._hass.callApi = (method, path, ...args) => method === 'GET'
+                        ? new Promise((resolve, reject) => {resolveRefresh = resolve; rejectRefresh = reject;})
+                        : originalApi(method, path, ...args);
+                      const refresh = panel.loadData({quiet: true});
+                      panel.shadowRoot.querySelector('.clip').click();
+                      for (let i = 0; i < 100 && !panel.selectedClip; i++)
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                      const selectedBefore = Boolean(panel.selectedClip);
+                      for (let i = 0; i < 100 && !(panel.shadowRoot.querySelector('video')?.currentTime > 0.1); i++)
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                      const video = panel.shadowRoot.querySelector('video');
+                      const before = video?.currentTime || 0;
+                      if (fail) rejectRefresh(new Error('fixture refresh failed'));
+                      else resolveRefresh(structuredClone(panel.data));
+                      await refresh;
+                      panel._hass.callApi = originalApi;
+                      for (let i = 0; i < 100 && !(video?.currentTime > before + 0.1); i++)
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                      results.push({selectedBefore, selectedAfter: Boolean(panel.selectedClip),
+                        viewerAfter: Boolean(panel.shadowRoot.querySelector('video')),
+                        sameVideo: panel.shadowRoot.querySelector('video') === video,
+                        progressed: video?.currentTime > before + 0.1, error: panel.error});
+                      }
+                      return results;
+                    }""")
+                    assert race == [{"selectedBefore": True, "selectedAfter": True, "viewerAfter": True,
+                                     "sameVideo": True, "progressed": True, "error": ""}] * 2, race
+                    page.evaluate("""async () => {
+                      const panel = document.querySelector('tuya-recordings-panel');
+                      window.cachedDebug = [];
+                      const originalApi = panel._hass.callApi;
+                      panel._hass.callApi = (method, path, body) => {
+                        if (method === 'POST' && path === 'tuya_recordings/debug') cachedDebug.push(body);
+                        return originalApi(method, path, body);
+                      };
+                      const clip = panel.data.cameras[0].clips[0];
+                      clip.playback_url = '/missing.mp4';
+                      clip.signed_playback_url = '';
+                      await panel.openClip(clip);
+                    }""")
+                    page.wait_for_function("""() => {
+                      const root = document.querySelector('tuya-recordings-panel').shadowRoot;
+                      return root.querySelector('[role=status]')?.textContent.includes('Playback unavailable')
+                        && cachedDebug.some(event => event.detail?.phase === 'media-error');
+                    }""", timeout=5000)
                     assert report["pauseBefore"] == "Pause"
                     assert report["pauseAfter"] == "Resume"
                     assert report["services"][0]["service"] == "turn_on"

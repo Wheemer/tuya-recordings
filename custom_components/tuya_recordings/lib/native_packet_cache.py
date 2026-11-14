@@ -54,9 +54,10 @@ class NativePresentationClock:
         offset = previous.offset if previous else Fraction(0)
         epoch = previous.epoch if previous else 0
         delta = stamp - previous.source if previous else None
+        repeated_audio = previous is not None and kind == 2 and duration is not None and delta == 0
         if previous and delta is not None and 0 < delta < _SD_CLOCK_GAP:
             interval = duration or delta
-        elif previous:
+        elif previous and not repeated_audio:
             if epoch != self._epoch and self._latest_source is not None and abs(stamp - self._latest_source) < _SD_CLOCK_GAP:
                 offset, epoch = self._offset, self._epoch
             else:
@@ -82,7 +83,9 @@ class NativePresentationClock:
             # A late joining track may have moved the shared synchronizer
             # forward since this track's last packet. Adopt that same reset.
             offset = self._offset
-        presented = stamp + offset
+        # Multiple audio blocks can share one camera timestamp. Advance their
+        # sample clock without moving the shared video/fragment epoch.
+        presented = previous.presented + previous.interval if repeated_audio else stamp + offset
         if previous and presented <= previous.presented:
             # Old-fragment frames can finish after the other track has already
             # started a new epoch. Re-anchor both tracks at the completed tail;

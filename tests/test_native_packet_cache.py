@@ -60,6 +60,20 @@ def test_presentation_clock_keeps_scale_and_valid_sparse_cadence():
     assert clock._epoch == 1
 
 
+def test_audio_packets_sharing_a_source_timestamp_do_not_reset_video_clock():
+    from fractions import Fraction
+    clock = NativePresentationClock()
+    base = 1794650510000
+    duration = Fraction(62, 1000)
+    for offset in (0, 124, 248, 374, 498, 622, 748, 874):
+        video, scale = clock.map(1, base + offset, 1000)
+        assert (video, scale) == (base + offset, 1000)
+        first, _ = clock.map(2, base + offset, 1000, duration=duration)
+        second, _ = clock.map(2, base + offset, 1000, duration=duration)
+        assert second - first == 62
+        assert clock._epoch == 0
+
+
 def test_presentation_clock_allows_queued_old_track_to_finish_before_joining_new_epoch():
     from fractions import Fraction
     clock = NativePresentationClock()
@@ -253,13 +267,14 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
 @pytest.mark.parametrize("codec,expected,width", [
     ("pcm_s16le", "pcm_s16le", 2), ("g711u", "pcm_mulaw", 1), ("g711a", "pcm_alaw", 1),
 ])
-def test_cache_preserves_raw_audio_and_uneven_video_clock(tmp_path, encoded_video, codec, expected, width):
+@pytest.mark.parametrize("repeated_audio_clock", [False, True])
+def test_cache_preserves_raw_audio_and_uneven_video_clock(tmp_path, encoded_video, codec, expected, width, repeated_audio_clock):
     audio = (struct.pack("<hhhh", 0, 8192, -8192, 16384) * 2000 if width == 2
              else bytes([0x80, 0, 0xAA, 0x2A]) * 2000)
     events = [(100 + stamp, packet, False) for stamp, packet in
               zip([0, 180, 410, 600, 840], encoded_video, strict=True)]
     stride = 160 * width
-    events.extend((offset // stride * 20, audio[offset:offset + stride], True)
+    events.extend(((offset // stride // 2 * 40 if repeated_audio_clock else offset // stride * 20), audio[offset:offset + stride], True)
                   for offset in range(0, len(audio), stride))
     output = tmp_path / "clip.mp4"
     epoch = 1_790_000_000_000
@@ -346,7 +361,8 @@ def test_cache_does_not_count_configuration_as_received_video(tmp_path):
     assert not list(tmp_path.glob("*.h264"))
 
 
-def test_cache_preserves_aac_packets_without_encoding(tmp_path, encoded_video):
+@pytest.mark.parametrize("repeated_audio_clock", [False, True])
+def test_cache_preserves_aac_packets_without_encoding(tmp_path, encoded_video, repeated_audio_clock):
     audio_path = tmp_path / "source.aac"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
         "sine=frequency=500:sample_rate=8000:duration=1", "-c:a", "aac", "-y", str(audio_path)],
@@ -354,7 +370,8 @@ def test_cache_preserves_aac_packets_without_encoding(tmp_path, encoded_video):
     with av.open(str(audio_path), format="aac") as audio:
         packets = [bytes(packet) for packet in audio.demux(audio=0) if packet.size]
     events = [(index * 200, packet, False) for index, packet in enumerate(encoded_video)]
-    events.extend((index * 128, packet, True) for index, packet in enumerate(packets))
+    events.extend(((index // 2 * 256 if repeated_audio_clock else index * 128), packet, True)
+                  for index, packet in enumerate(packets))
     output = tmp_path / "aac.mp4"
     with NativePlaybackMuxer(output) as muxer:
         for stamp, payload, is_audio in sorted(events, key=lambda row: row[0]):
