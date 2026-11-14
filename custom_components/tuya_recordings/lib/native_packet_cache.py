@@ -254,11 +254,24 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
     decoder.thread_count = 1
     order = []
     count = 0
+    # Deferred to avoid the muxer's import of this packet-cache module.
+    from .native_mux import _h264_metadata_only
+
+    headers = b""
     for packet in video.demux(video.streams.video[0]):
         if cancellation is not None and cancellation.is_set():
             raise CameraWorkCancelled("Native picture-order analysis cancelled")
         if not packet.size:
             continue
+        data = bytes(packet)
+        if _h264_metadata_only(data):
+            if len(headers) + len(data) > MAX_PACKET_BYTES:
+                raise ValueError("Native video decoder headers exceed packet limit")
+            headers += data
+            continue
+        if headers:
+            packet = av.Packet(headers + data)
+            headers = b""
         packet.pts = count
         packet.dts = None
         packet.time_base = Fraction(1, 1000)

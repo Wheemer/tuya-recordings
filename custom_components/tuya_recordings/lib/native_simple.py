@@ -467,6 +467,9 @@ def _catalog_page_from_v1_binary(
                 packed_type, start_time, end_time = _CATALOG_ENTRY.unpack_from(
                     payload, offset
                 )
+                # The SDK forwards individual ranges, including unfinished ones.
+                if end_time <= start_time:
+                    continue
                 items.append(
                     NativeV4Recording(
                         start_time=start_time,
@@ -483,7 +486,14 @@ def _catalog_page_from_v1_binary(
         candidates.append(tuple(items))
 
     if not candidates:
-        raise NativeSimpleError("Catalog response has an invalid V1 binary layout")
+        counts = {
+            offset: struct.unpack_from("<I", payload, offset)[0]
+            for offset in _CATALOG_V1_COUNT_OFFSETS
+            if len(payload) >= offset + 4
+        }
+        raise NativeSimpleError(
+            f"Catalog response has an invalid V1 binary layout: bytes={len(payload)}, counts={counts}"
+        )
     items = max(candidates, key=len)
     return NativeV4CatalogPage(request_id, 0, "", 1, len(items), 1, items)
 
