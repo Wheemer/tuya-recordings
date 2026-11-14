@@ -138,6 +138,9 @@ class MotoClient:
         self.low_power_wake_confirmed = False
         self._low_power_change_time: int | None = None
         self._low_power_ready = False
+        self._wake_confirmation_stamp: int | None = None
+        self._sd_query_wake_notice: asyncio.Event | None = None
+        self._dp_query_resends = 0
 
     @property
     def diagnostics(self) -> str:
@@ -152,6 +155,8 @@ class MotoClient:
                 f"device_online={self.device_online}, low_power_connect={self.low_power_connect}, "
                 f"low_power_wake_confirmed={self.low_power_wake_confirmed}, "
                 f"dp_query={self._last_dp_query}, dp_report_keys={self._last_dp_report_keys}, "
+                f"dp_query_resends={self._dp_query_resends}, "
+                f"dp_resend_reason={'fresh_wake_confirmation' if self._dp_query_resends else 'none'}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}, "
                 f"account_subscription={self._account_subscription}, "
                 f"wake_dispatch={self._wake_dispatch}, wake_qos={self._wake_qos}, "
@@ -225,7 +230,7 @@ class MotoClient:
             return
         try:
             async for message in client.messages:
-                self._consume_message(str(message.topic), message.payload)
+                self._consume_message(str(message.topic), message.payload, retained=getattr(message, "retain", False))
         except asyncio.CancelledError:
             raise
         except Exception as exception:
@@ -240,7 +245,7 @@ class MotoClient:
         if self._on_failure is not None:
             self._on_failure(self._reader_failure)
 
-    def _consume_message(self, topic: str, payload: object) -> None:
+    def _consume_message(self, topic: str, payload: object, *, retained: bool = False) -> None:
         """Route camera envelopes and APK account updates without cross-device delivery."""
         if topic != self._subscribe_topic and topic not in self._account_topics:
             self._received += 1
@@ -249,7 +254,7 @@ class MotoClient:
             self._received += 1
             self._inbound["non_binary"] += 1
         elif topic == self._subscribe_topic:
-            self._consume(payload)
+            self._consume(payload, retained=retained)
         else:
             self._received += 1
             self._inbound["account_received"] += 1
@@ -280,7 +285,7 @@ class MotoClient:
                 return
             self._consume_dp_report({"devId": self._device_id, "dps": dps})
 
-    def _consume(self, payload: bytes) -> None:
+    def _consume(self, payload: bytes, *, retained: bool = False) -> None:
         """Decode one payload and dispatch it to the session."""
         self._received += 1
         wire_version = payload[:3]
@@ -301,7 +306,7 @@ class MotoClient:
             bucket = "other"
         self._inbound_protocols[bucket] += 1
         if protocol == 1:
-            self._consume_connection_report(data)
+            self._consume_connection_report(data, retained=retained)
             return
         if protocol == _DP_REPORT_PROTOCOL:
             self._consume_dp_report(data)
@@ -320,7 +325,7 @@ class MotoClient:
             return
         self._dispatch(optional_str(header, "type"), message)
 
-    def _consume_connection_report(self, data: JsonObject) -> None:
+    def _consume_connection_report(self, data: JsonObject, *, retained: bool = False) -> None:
         """Match both APKs' protocol-1 low-power interceptor, not a DP report."""
         if data.get("devId") != self._device_id or data.get("cid") not in (None, ""):
             self._inbound["connection_device_mismatch"] += 1
@@ -356,6 +361,12 @@ class MotoClient:
                 self.low_power_wake_confirmed = True
         if self.low_power_wake_confirmed:
             self._inbound["low_power_wake_confirmed"] += 1
+            if stamp is not None:
+                previous = self._wake_confirmation_stamp
+                self._wake_confirmation_stamp = max(previous or 0, stamp)
+                if (not retained and (previous is None or stamp > previous)
+                        and self._sd_query_wake_notice is not None):
+                    self._sd_query_wake_notice.set()
 
     def _consume_dp_report(self, data: JsonObject) -> None:
         if self._dp_query is None:
@@ -393,9 +404,36 @@ class MotoClient:
 
     async def async_query_direct_dp(self, dp_id: str) -> int:
         """Query one schema DP and wait for a report, not the publish acknowledgement."""
-        return await self.async_wait_for_dp_report(
-            dp_id, lambda: self.async_send_dp_query(dp_id),
-        )
+        with self.dp_report_listener(dp_id) as reply:
+            notice = asyncio.Event()
+            waiter = None
+            self._dp_query_resends = 0
+            self._sd_query_wake_notice = notice
+            try:
+                # Both sends share the original report future and timeout budget.
+                async with asyncio.timeout(_DP_REPORT_TIMEOUT_SECONDS):
+                    await self.async_send_dp_query(dp_id)
+                    baseline = self._dp_query_received_baseline
+                    while not reply.done():
+                        waiter = asyncio.create_task(notice.wait())
+                        await asyncio.wait((reply, waiter), return_when=asyncio.FIRST_COMPLETED)
+                        if reply.done():
+                            break
+                        notice.clear()
+                        if (self.device_online is True and self.low_power_wake_confirmed
+                                and self._reader_failure == "none"):
+                            self._dp_query_resends = 1
+                            try:
+                                await self.async_send_dp_query(dp_id)
+                            finally:
+                                self._dp_query_received_baseline = baseline
+                            break
+                    return await reply
+            finally:
+                self._sd_query_wake_notice = None
+                if waiter is not None:
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
 
     async def async_send_dp_query(self, dp_id: str) -> None:
         """Dispatch once; the caller owns the matching device report listener."""

@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-34 (2026-11-14)
+
+### Camera Devices
+
+- Show every discovered camera on the integration's device list, including cameras without notification entities.
+- Preserve existing camera associations, entity IDs, user names and areas when notification sources become available.
+
+### SD Status
+
+- Resend the SD-status query once when a fresh camera wake confirmation arrives while its reply is still missing.
+- Keep the resend on the existing connection and inside the original 30-second deadline. Do not send another wake or retry on silence, stale messages or ordinary online notifications.
+- Include the resend count and reason in connection diagnostics.
+- Preserve existing playback, seeking, Media Sync, wake limits and cooldowns.
+
 ## Tuya Recordings v0.4.13-33 (2026-11-14)
 
 ### Cached Playback
