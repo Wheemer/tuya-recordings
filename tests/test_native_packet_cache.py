@@ -156,6 +156,68 @@ def media(data, codec, timestamp, *, audio=False):
         "timestampScale": 1000, "sampleRate": 8000, "channels": 1}), protocol=1)
 
 
+@pytest.mark.parametrize("audio_codec,width", [("g711u", 1), ("pcm_s16le", 2)])
+@pytest.mark.parametrize("fragment_reset", [False, True])
+def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, audio_codec, width, fragment_reset):
+    import hashlib
+    path = tmp_path / "bframes.h264"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        "testsrc=size=160x90:rate=10:duration=2", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "medium", "-bf", "2", "-g", "10",
+        "-x264-params", "b-adapt=0:b-pyramid=0:scenecut=0", "-an", "-y", str(path)],
+        check=True, timeout=20)
+    with av.open(str(path), format="h264") as source:
+        assert source.streams.video[0].codec_context.has_b_frames
+        packets = [(bytes(packet), packet.is_keyframe) for packet in source.demux(video=0) if packet.size]
+    def hashes(source):
+        result = []
+        for frame in source.decode(video=0):
+            rgb = frame.reformat(format="rgb24")
+            plane = rgb.planes[0]
+            raw = bytes(plane)
+            pixels = b"".join(raw[y * plane.line_size:y * plane.line_size + rgb.width * 3]
+                              for y in range(rgb.height))
+            result.append(hashlib.sha256(pixels).hexdigest())
+        return result
+    with av.open(str(path), format="h264") as source:
+        expected = hashes(source)
+    audio = (bytes([0x80, 0, 0xAA, 0x2A]) * 4000 if width == 1
+             else struct.pack("<hhhh", 0, 8192, -8192, 16384) * 4000)
+    output = tmp_path / "cached.mp4"
+    with NativePlaybackMuxer(output) as muxer:
+        for index, (packet, keyframe) in enumerate(packets):
+            stamp = 100000 + index * 100 + (60000 if fragment_reset and index >= 10 else 0)
+            event = media(packet, "h264", stamp)
+            event["payload"]["info"]["isKeyFrame"] = keyframe
+            muxer.handle_event(event)
+            muxer.handle_event(media(audio[index * 800 * width:(index + 1) * 800 * width], audio_codec, stamp, audio=True))
+    final = tmp_path / "final.mp4"
+    finalize_mp4_for_browser(output, final)
+    output = final
+    with av.open(str(output)) as result:
+        assert hashes(result) == expected
+    with av.open(str(output)) as result:
+        data = [packet for packet in result.demux() if packet.size]
+        video = [packet for packet in data if packet.stream.type == "video"]
+        assert all(a.dts < b.dts for a, b in zip(video, video[1:]))
+        assert any(packet.pts != packet.dts for packet in video)
+        assert b"".join(bytes(packet) for packet in data if packet.stream.type == "audio") == audio
+        assert result.streams.video[0].codec_context.name == "h264"
+        assert result.streams.audio[0].codec_context.name == ("pcm_mulaw" if width == 1 else "pcm_s16le")
+    with av.open(str(output)) as result:
+        times = [float(frame.pts * frame.time_base) for frame in result.decode(video=0)]
+        assert times == pytest.approx([i / 10 for i in range(20)], abs=0.001)
+    with av.open(str(output)) as result:
+        audio_frames = list(result.decode(audio=0))
+        assert sum(frame.samples for frame in audio_frames) == 16000
+        assert float(audio_frames[0].pts * audio_frames[0].time_base) == pytest.approx(0, abs=0.001)
+        assert any(bytes(audio_frames[0].planes[0]))
+    with av.open(str(output)) as result:
+        result.seek(1_000_000)
+        seeked = hashes(result)
+        assert seeked[-10:] == expected[-10:]
+
+
 @pytest.mark.parametrize("codec,expected,width", [
     ("pcm_s16le", "pcm_s16le", 2), ("g711u", "pcm_mulaw", 1), ("g711a", "pcm_alaw", 1),
 ])

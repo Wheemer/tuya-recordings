@@ -15,6 +15,11 @@ from custom_components.tuya_recordings.lib.native_lan_signaling import (
 )
 
 
+@pytest.fixture(autouse=True)
+def stub_discovery(monkeypatch):
+    monkeypatch.setattr(lan_module, "find_lan_device", lambda dev: lan_module.tinytuya.find_device(dev_id=dev))
+
+
 class FakeDevice:
     def __init__(self, *args, **kwargs):
         self.args = args

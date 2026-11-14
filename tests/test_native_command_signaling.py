@@ -566,6 +566,7 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                 )}, socket=lambda *a: Socket(),
             ))
             monkeypatch.setattr(tiny, "find_device", lambda **k: {"ip": "192.0.2.9", "version": "3.5"})
+            monkeypatch.setattr(lan, "find_lan_device", lambda dev: tiny.find_device(dev_id=dev))
             class InterleavedLan(lan.Lan302Client):
                 def _open_device(self):
                     device = super()._open_device()
