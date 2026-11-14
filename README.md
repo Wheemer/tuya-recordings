@@ -151,6 +151,12 @@ the wrong moment.
 
 ### Optional: local MP4 cache
 
+Background sync is off by default and must be explicitly enabled. For
+battery-powered cameras, leave it off unless you accept the battery cost
+of repeated wake-ups and background downloads. Cameras on SD-status
+cooldown are deferred until a later normal sync pass; cooldown does not
+count as a failed recording download.
+
 With **Pre-cache recordings** on, Tuya Recordings downloads the selected
 SD-card recordings into the configured private storage path. Cached clips
 appear in the panel and Home Assistant Media Browser. Thumbnails are rendered

@@ -1088,6 +1088,8 @@ class TuyaRecordingsClient:
             LOGGER.info("Using cached Tuya recording for %s %s-%s at %s", dev_id, start, end, output_path)
             return output_path
         self._raise_if_cloud_paused()
+        if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+            raise CameraWorkBusy("Recording download deferred during SD-status cooldown")
         if output_path.exists():
             LOGGER.warning("Removing invalid cached Tuya recording for %s %s-%s at %s", dev_id, start, end, output_path)
             output_path.unlink(missing_ok=True)
@@ -1126,6 +1128,9 @@ class TuyaRecordingsClient:
             if cancellation.is_set():
                 self._cleanup_failed_download(temp_output_path, output_path)
                 raise CameraWorkCancelled("Recording download cancelled") from exc
+            if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+                self._cleanup_failed_download(temp_output_path, output_path)
+                raise CameraWorkBusy("Recording download deferred during SD-status cooldown") from exc
             self._log_download_failure(dev_id, start, end, temp_output_path, output_path, log_traceback)
             raise
         try:
@@ -1326,7 +1331,7 @@ class TuyaRecordingsClient:
             self._media_sync_lock.release()
 
     def _sync_recordings(self, cancellation: Cancellation, deadline: Deadline) -> dict[str, Any]:
-        result = {"enabled": self.media_sync_enabled, "downloaded": 0, "skipped": 0, "failed": 0,
+        result = {"enabled": self.media_sync_enabled, "downloaded": 0, "skipped": 0, "failed": 0, "deferred": 0,
                   "deleted_videos": 0, "deleted_thumbnails": 0, "recovered_partials": 0, "stalled_cameras": []}
         if self.cloud_activity_paused:
             result.update(enabled=False, paused=True)
@@ -1364,7 +1369,7 @@ class TuyaRecordingsClient:
                 CachedClipKey.from_raw(dev_id, int(clip["start"]), int(clip["end"]))
                 for dev_id, clip in clips if cutoff is None or int(clip["end"]) >= cutoff
             }
-            self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0,
+            self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0, deferred=0,
                                         total=len(desired_clips), current=None, last_error=None)
             newest_sync_end = int(time.time()) - MEDIA_SYNC_MIN_CLIP_AGE
             attempts: dict[str, int] = {}
@@ -1385,6 +1390,10 @@ class TuyaRecordingsClient:
                     failures_changed |= self._media_failures.pop(key, None) is not None
                     result["skipped"] += 1
                     continue
+                if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+                    result["deferred"] += 1
+                    LOGGER.debug("Media Sync deferred recording for %s during SD-status cooldown", dev_id)
+                    continue
                 failed_at = self._media_failures.get(key)
                 if attempts.get(dev_id, 0) >= MEDIA_MAX_ATTEMPTS_PER_CAMERA or (
                     failed_at is not None and time.time() - failed_at < MEDIA_FAILURE_COOLDOWN
@@ -1404,7 +1413,12 @@ class TuyaRecordingsClient:
                     with camera_work_scope(operation_deadline):
                         self.download_clip(dev_id, start, end, output_path, verify_clip=False, log_traceback=False)
                     check_cancelled()
-                except (CameraWorkCancelled, CameraWorkBusy, TuyaRecordingsAuthError):
+                except CameraWorkBusy:
+                    if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+                        result["deferred"] += 1
+                        continue
+                    raise
+                except (CameraWorkCancelled, TuyaRecordingsAuthError):
                     raise
                 except Exception as exc:
                     check_cancelled()
@@ -1420,7 +1434,7 @@ class TuyaRecordingsClient:
                 failures_changed = True
                 result["downloaded"] += 1
             check_cancelled()
-            if desired_clips and not result["failed"]:
+            if desired_clips and not result["failed"] and not result["deferred"]:
                 result.update(self.cleanup_cached_media(desired_clips, cutoff))
         except CameraWorkCancelled:
             result["cancelled"] = True
@@ -1437,7 +1451,9 @@ class TuyaRecordingsClient:
             if failures_changed:
                 self._store_media_failures()
 
-        self._set_media_sync_status(state, downloaded=result["downloaded"], skipped=result["skipped"],
+        if result["deferred"] and not result["failed"] and state == "idle":
+            state = "deferred"
+        self._set_media_sync_status(state, downloaded=result["downloaded"], skipped=result["skipped"], deferred=result["deferred"],
                                     failed=result["failed"], current=None,
                                     deleted_videos=result["deleted_videos"], deleted_thumbnails=result["deleted_thumbnails"],
                                     recovered_partials=result["recovered_partials"],

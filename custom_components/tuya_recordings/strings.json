@@ -18,7 +18,7 @@
           "app_profile": "Choose the app that contains the cameras. Scan the QR code using this same app.",
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
-          "media_sync_enabled": "Download recordings in the background so only cached, thumbnailed clips are shown.",
+          "media_sync_enabled": "Optional, off by default. Download recordings in the background so only cached, thumbnailed clips are shown. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space.",
           "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
         }
@@ -63,7 +63,7 @@
           "lookback_days": "Use 0 to scan up to 31 days, stopping after 7 consecutive empty days. This does not enumerate the entire SD card.",
           "catalog_sync_minutes": "How often to refresh SD-card recording lists while local video caching is off. Playback pauses this work automatically. Use a longer interval for cameras that permit only one P2P session.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
-          "media_sync_enabled": "When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips.",
+          "media_sync_enabled": "Optional, off by default. When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
           "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",
           "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media.",
           "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."

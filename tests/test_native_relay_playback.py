@@ -637,7 +637,7 @@ def test_refreshed_pv_completes_mqtt_handshake_and_catalog_without_restart(
                 if background_followup and (high, low) == (3, 0):
                     assert struct.unpack_from("<4i", command, 20) == (0, 2026, 9, 0)
                     events.append("month")
-                    payload = struct.pack("<4I", 0, 0, 0, 1 << 14)
+                    payload = struct.pack("<5I", 0, 2026, 9, 1 << 14, 1 << 2)
                     self.handler(encrypt_record(ANSWER_KEY, struct.pack(
                         "<IIIHHI", 0x12345678, request, 1, 3, 0, len(payload),
                     ) + payload))

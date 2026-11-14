@@ -85,6 +85,7 @@ class TuyaRecordingsClipCountSensor(SensorEntity):
             "media_sync_downloaded": media_sync_status.get("downloaded"),
             "media_sync_skipped": media_sync_status.get("skipped"),
             "media_sync_failed": media_sync_status.get("failed"),
+            "media_sync_deferred": media_sync_status.get("deferred", 0),
             "media_sync_deleted_videos": media_sync_status.get("deleted_videos"),
             "media_sync_deleted_thumbnails": media_sync_status.get("deleted_thumbnails"),
             "media_sync_last_error": media_sync_status.get("last_error"),
