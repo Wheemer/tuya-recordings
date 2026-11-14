@@ -831,6 +831,11 @@ class NativeRelayPlaybackSession:
             (self._on_demand_catalog or self._connector_wake_allowed)
             and config.sd_low_power_wake is True and config.wake_direct
         )
+        if eligible and not (dp.isascii() and dp.isdecimal()):
+            self._sd_status_query = "route_or_schema_unconfirmed"
+            raise NativeRelayPlaybackError(
+                f"Camera SD status query route is unavailable ({self.transport_diagnostics})"
+            )
         if eligible and dp.isascii() and dp.isdecimal():
             # One device listener survives wake, connection, dispatch, socket
             # teardown and fallback. Nested same-task operations borrow it.
@@ -944,14 +949,18 @@ class NativeRelayPlaybackSession:
             lan_connect_failed = self._sd_status_query == "lan_unavailable"
             route = config.sd_status_lan_error_route
             if route not in {"mqtt", "http"}:
-                return
+                raise NativeRelayPlaybackError(
+                    f"Camera SD status query route is unavailable after LAN failure ({self.transport_diagnostics})"
+                )
             dp = config.sd_status_lan_dp
             use_mqtt = route == "mqtt"
             self._sd_status_route_basis = "lan_connect_error" if lan_connect_failed else "lan_send_error"
         if not dp.isascii() or not dp.isdecimal():
             if self._sd_status_query != "lan_send_failed":
                 self._sd_status_query = "route_or_schema_unconfirmed"
-            return
+            raise NativeRelayPlaybackError(
+                f"Camera SD status query route is unavailable ({self.transport_diagnostics})"
+            )
         self._connect_phase = "mqtt_sd_status" if use_mqtt else "http_sd_status"
         self._sd_status_query = "waiting_for_report"
         self._sd_status_send_route = "mqtt" if use_mqtt else "http"
@@ -990,6 +999,19 @@ class NativeRelayPlaybackSession:
     def _missing_sd_status_report(self) -> NativeRelayPlaybackError:
         self._sd_status_query = "report_timeout"
         CAMERA_COMMANDS.mark_wake_report_missing(self._native_config.dev_id)
+        _LOGGER.warning(
+            "Native SD status timeout: dev=%s phase=%s timeout_seconds=%s route=%s basis=%s dispatch=%s "
+            "wake=%s wake_confirmed=%s online=%s mqtt=(%s) lan=(%s)",
+            self._native_config.dev_id, self._connect_phase,
+            _SD_STATUS_TIMEOUT_SECONDS, self._sd_status_send_route,
+            self._sd_status_route_basis,
+            getattr(self._moto, "dp_query_dispatch", self._sd_status_dispatch)
+            if self._sd_status_send_route == "mqtt" else self._sd_status_dispatch,
+            self._wake_status, getattr(self._moto, "low_power_wake_confirmed", False),
+            getattr(self._moto, "device_online", None),
+            getattr(self._moto, "diagnostics", "unavailable"),
+            getattr(self._status_lan, "diagnostics", self._sd_status_lan_details),
+        )
         return NativeRelayPlaybackError(
             f"Camera did not report SD status after wake ({self.transport_diagnostics})"
         )

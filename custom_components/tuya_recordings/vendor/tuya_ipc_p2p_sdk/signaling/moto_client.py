@@ -127,6 +127,11 @@ class MotoClient:
         self._reader_failure = "none"
         self.device_online: bool | None = None
         self.dp_query_dispatch = "not_requested"
+        self._dp_query_publish_ms: int | None = None
+        self._dp_query_received_baseline: int | None = None
+        self._wake_dispatch = "not_requested"
+        self._wake_qos: int | None = None
+        self._wake_publish_ms: int | None = None
         self._last_dp_query = "none"
         self._last_dp_report_keys: tuple[str, ...] = ()
         self.low_power_connect: bool | None = None
@@ -148,7 +153,12 @@ class MotoClient:
                 f"low_power_wake_confirmed={self.low_power_wake_confirmed}, "
                 f"dp_query={self._last_dp_query}, dp_report_keys={self._last_dp_report_keys}, "
                 f"reader_done={self._reader is not None and self._reader.done()}, failure={self._reader_failure}, "
-                f"account_subscription={self._account_subscription}")
+                f"account_subscription={self._account_subscription}, "
+                f"wake_dispatch={self._wake_dispatch}, wake_qos={self._wake_qos}, "
+                f"wake_publish_ms={self._wake_publish_ms}, "
+                f"dp_dispatch={self.dp_query_dispatch}, dp_publish_ms={self._dp_query_publish_ms}, "
+                f"dp_broker_acknowledged={self.dp_query_dispatch == 'sent'}, "
+                f"received_after_dp_dispatch={None if self._dp_query_received_baseline is None else self._received - self._dp_query_received_baseline}")
 
     async def async_connect(self) -> None:
         """Connect the broker, subscribe, and start consuming inbound payloads."""
@@ -392,11 +402,15 @@ class MotoClient:
         if self._protocol_version == "1.1":
             raise TuyaIpcP2pConnectionError("PV 1.1 does not serialize a null DP query")
         self.dp_query_dispatch = "sending"
+        self._dp_query_received_baseline = self._received
+        started = time.monotonic()
         try:
             await self._async_publish(_DP_QUERY_PROTOCOL, {"dps": {dp_id: None}})
         except BaseException:
             self.dp_query_dispatch = "cancelled_or_failed"
             raise
+        finally:
+            self._dp_query_publish_ms = int((time.monotonic() - started) * 1000)
         self.dp_query_dispatch = "sent"
 
     @contextmanager
@@ -463,14 +477,27 @@ class MotoClient:
 
     async def _async_publish_wake(self, *, qos: int) -> None:
         if self._client is None or self._subscription not in {"granted_qos_0", "granted_qos_1"}:
+            self._wake_dispatch = "not_ready"
             raise TuyaIpcP2pConnectionError("MQTT is not ready for a camera wake")
+        self._wake_dispatch = "sending"
+        self._wake_qos = qos
+        started = time.monotonic()
         try:
             await self._client.publish(
                 f"m/w/{self._device_id}", crc32(self._key).to_bytes(4, "big"),
                 qos=qos, retain=False, timeout=_CONNECT_TIMEOUT_SECONDS,
             )
         except aiomqtt.MqttError as error:
+            self._wake_dispatch = "publish_failed"
             raise TuyaIpcP2pConnectionError("Native camera wake send failed") from error
+        except BaseException:
+            self._wake_dispatch = "cancelled_or_failed"
+            raise
+        else:
+            # PUBACK proves broker receipt, never that the camera woke.
+            self._wake_dispatch = "broker_acknowledged" if qos == 1 else "submitted"
+        finally:
+            self._wake_publish_ms = int((time.monotonic() - started) * 1000)
 
     def configure_offer_metadata(
         self, *, moto_id: str, security_level: int, preconnect: bool

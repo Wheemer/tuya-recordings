@@ -46,6 +46,40 @@ def test_get_dp_http_fallback_does_not_require_an_http_mode():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["missing_schema", "lan_without_fallback"])
+async def test_required_sd_preparation_cannot_succeed_without_a_query_route(monkeypatch, route):
+    commands = CameraCommandQueue()
+    monkeypatch.setattr(playback_module, "CAMERA_COMMANDS", commands)
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True,
+        sd_status_lan_dp="247" if route == "lan_without_fallback" else "",
+        sd_status_mqtt_dp="", sd_status_http_dp="", sd_status_lan_error_route="",
+    )
+    playback = playback_module.NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._on_demand_catalog = True
+    calls = []
+
+    class Broker(StatusBroker):
+        async def async_send_wake(self):
+            calls.append("wake")
+
+    async def unavailable(*args):
+        calls.append("lan")
+        playback._sd_status_query = "lan_unavailable"
+        return False
+
+    monkeypatch.setattr(playback, "_try_lan_sd_status", unavailable)
+    broker = Broker()
+    with pytest.raises(playback_module.NativeRelayPlaybackError, match="SD status query route"):
+        await playback._maybe_send_wake(broker)
+    assert not playback._sd_status_prepared
+    assert broker._dp_query is None
+    assert playback._sd_status_deadline is None
+    assert calls == (["wake", "lan"] if route == "lan_without_fallback" else [])
+    assert not commands.wake_report_on_cooldown(config.dev_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("arrival", ["wake", "lan_connect", "lan_close"])
 async def test_one_dp_listener_spans_the_entire_transaction(monkeypatch, arrival):
     monkeypatch.setattr(playback_module, "CAMERA_COMMANDS", CameraCommandQueue())

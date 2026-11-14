@@ -87,7 +87,10 @@ class _TimelineCommands(queue.Queue):
 
 
 def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_root: Path = Path("/media")) -> dict[str, Any]:
-    """Build cache-backed panel data from the recording index."""
+    """Build panel data with private cache URLs independent of media mappings.
+
+    media_root is retained for callers using the older helper signature.
+    """
     cameras: list[dict[str, Any]] = []
     stats: dict[str, Any] = _empty_stats(client)
     storage_root = getattr(client, "media_storage_path", None)
@@ -165,7 +168,7 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 "title": str(clip.get("title") or _clip_title(start, end)),
                 "cached": clip_cached,
                 "thumbnail_cached": thumbnail_cached,
-                "thumbnail_url": _local_media_url(thumbnail_path, media_root) if thumbnail_cached else "",
+                "thumbnail_url": f"/api/{DOMAIN}/thumb/{quote(dev_id, safe='')}/{start}/{end}" if thumbnail_cached else "",
             }
             event_type = clip.get("event_type")
             event_types = clip.get("event_types")
@@ -181,7 +184,7 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 if not ready:
                     continue
                 dates.add(clip_date)
-                item["playback_url"] = _local_media_url(clip_path, media_root)
+                item["playback_url"] = f"/api/{DOMAIN}/play/{quote(dev_id, safe='')}/{start}/{end}?transport=file"
                 item["stream_transport"] = "file"
                 clips.append(item)
             else:
@@ -422,14 +425,6 @@ def _clip_ready(client: TuyaRecordingsClient, dev_id: str, start: int, end: int,
     return _path_ready(path)
 
 
-def _local_media_url(path: Path, media_root: Path) -> str:
-    try:
-        relative = path.resolve().relative_to(media_root.resolve())
-    except ValueError:
-        return ""
-    return f"/media/local/{quote(relative.as_posix())}"
-
-
 def _timeline_socket_url(dev_id: str) -> str:
     return f"/api/{DOMAIN}/timeline/{quote(dev_id)}"
 
@@ -592,9 +587,10 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
             data["pause_entity_id"] = None
         for camera in data.get("cameras", []):
             for clip in [*camera.get("clips", []), *camera.get("recording_ranges", [])]:
-                path = clip.get("playback_url") or ""
-                if path.startswith(f"/api/{DOMAIN}/"):
-                    clip["playback_url"] = f"{path}{'&' if '?' in path else '?'}entry_id={quote(entry_id)}"
+                for key in ("playback_url", "thumbnail_url"):
+                    path = clip.get(key) or ""
+                    if path.startswith(f"/api/{DOMAIN}/"):
+                        clip[key] = f"{path}{'&' if '?' in path else '?'}entry_id={quote(entry_id, safe='')}"
         try:
             selected_day = date.fromisoformat(data.get("selected_date") or request.query.get("date") or dt_util.now().date().isoformat())
         except ValueError as err:
@@ -692,6 +688,12 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
 
+    async def head(self, request: web.Request, dev_id: str, start: str, end: str) -> web.StreamResponse:
+        """Allow file metadata requests without ever starting camera playback."""
+        if request.query.get("transport") != "file" or request.query.get("mode", "clip") != "clip":
+            raise web.HTTPMethodNotAllowed("HEAD", ["GET"])
+        return await self.get(request, dev_id, start, end)
+
     async def get(self, request: web.Request, dev_id: str, start: str, end: str) -> web.StreamResponse:
         try:
             start_int = int(start)
@@ -752,8 +754,13 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         ):
             raise web.HTTPNotFound(reason="Unknown recording")
         if transport == "file":
-            if not clip_cached or not clip_path.exists() or clip_path.stat().st_size <= 0:
+            size = await self.hass.async_add_executor_job(_file_size, clip_path)
+            if not clip_cached or size <= 0:
                 raise web.HTTPNotFound(reason="Tuya recording is not cached")
+            _LOGGER.debug(
+                "Tuya Recordings cached video response dev=%s start=%s end=%s bytes=%s range_requested=%s",
+                dev_id, start_int, end_int, size, bool(request.headers.get("Range")),
+            )
             return web.FileResponse(
                 clip_path,
                 headers={
@@ -1142,6 +1149,10 @@ class TuyaRecordingsThumbnailView(http.HomeAssistantView):
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
 
+    async def head(self, request: web.Request, dev_id: str, start: str, end: str) -> web.FileResponse:
+        """Return cached image metadata without generating a thumbnail."""
+        return await self.get(request, dev_id, start, end)
+
     async def get(self, request: web.Request, dev_id: str, start: str, end: str) -> web.FileResponse:
         try:
             start_int = int(start)
@@ -1150,12 +1161,17 @@ class TuyaRecordingsThumbnailView(http.HomeAssistantView):
             raise web.HTTPBadRequest(reason="Invalid recording time") from exc
 
         client = self._client(request.query.get("entry_id"), dev_id)
+        if start_int <= 0 or end_int <= start_int:
+            raise web.HTTPBadRequest(reason="Invalid recording time range")
         thumbnail_path = client.thumbnail_path(dev_id, start_int, end_int)
-        if not getattr(client, "media_sync_enabled", False):
-            raise web.HTTPNotFound(reason="Tuya recording thumbnails are available only in local cache mode")
-        if not thumbnail_path.exists() or thumbnail_path.stat().st_size <= 0:
+        size = await self.hass.async_add_executor_job(_file_size, thumbnail_path)
+        if size <= 0:
             raise web.HTTPNotFound(reason="Tuya recording thumbnail is not cached yet")
-        return web.FileResponse(thumbnail_path, headers={"Cache-Control": "private, max-age=3600"})
+        _LOGGER.debug(
+            "Tuya Recordings cached thumbnail response dev=%s start=%s end=%s bytes=%s",
+            dev_id, start_int, end_int, size,
+        )
+        return web.FileResponse(thumbnail_path, headers={"Cache-Control": "private, max-age=3600", "Content-Type": "image/jpeg"})
 
     def _client(self, entry_id=None, dev_id=None) -> TuyaRecordingsClient:
         return _select_client(self.hass, entry_id, dev_id)

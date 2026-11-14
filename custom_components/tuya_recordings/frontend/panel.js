@@ -1,3 +1,5 @@
+const PANEL_BUILD = "20261114-private-cache-35";
+
 class TuyaRecordingsPanel extends HTMLElement {
   constructor() {
     super();
@@ -1016,6 +1018,15 @@ class TuyaRecordingsPanel extends HTMLElement {
         event.preventDefault();
         open(event);
       });
+      const image = button.querySelector(".thumb img");
+      if (image && !image.dataset.errorBound) {
+        image.dataset.errorBound = "true";
+        image.addEventListener("error", () => {
+          const clip = this.clips.find(item => item.start === Number(button.dataset.start)
+            && item.end === Number(button.dataset.end));
+          if (clip) this.debugPlayback("thumbnail-error", clip);
+        }, {once: true});
+      }
     });
   }
 
@@ -1027,13 +1038,13 @@ class TuyaRecordingsPanel extends HTMLElement {
     const revision = this.playbackRevision;
     try {
       this.debugPlayback("player-import", this.selectedClip);
-      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261114-cached-playback-34');
+      const { attachCameraPlayer, CAMERA_PLAYER_BUILD } = await import('/tuya_recordings_static/camera-player.js?v=20261114-private-cache-36');
       if (revision !== this.playbackRevision || !video.isConnected) return;
       this.disposePlayer?.();
       this.disposePlayer = null;
       const autoplay = this.autoplaySelectedClip;
       this.autoplaySelectedClip = false;
-      this.debugPlayback("player-attach", this.selectedClip, { autoplay });
+      this.debugPlayback("player-attach", this.selectedClip, { autoplay, player_build: CAMERA_PLAYER_BUILD || "unknown" });
       this.disposePlayer = attachCameraPlayer(video, this.selectedClip, path => this.signPath(path), {
         autoplay,
         mode: this.timelineMode ? "timeline" : "clip",
@@ -1043,6 +1054,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       });
       this.playerVideo = video;
       this.playerRevision = revision;
+      this.debugPlayback("player-ready", this.selectedClip, {player_build: CAMERA_PLAYER_BUILD || "unknown"});
     } catch (error) {
       this.debugPlayback("player-error", this.selectedClip, { message: error?.message || String(error) });
       console.error("Tuya Recordings player could not load", error);
@@ -1130,7 +1142,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       dev_id: clip.dev_id,
       start: clip.start,
       end: clip.end,
-      detail,
+      detail: {panel_build: PANEL_BUILD, ...(detail || {})},
     }).catch(() => undefined);
   }
 
@@ -1181,10 +1193,19 @@ class TuyaRecordingsPanel extends HTMLElement {
       path,
       expires: 3600,
     });
+    let timer;
     const timeout = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`Timed out signing ${path}`)), 8000);
+      timer = setTimeout(() => reject(new Error("Timed out signing media path")), 8000);
     });
-    const result = await Promise.race([request, timeout]);
+    let result;
+    try {
+      result = await Promise.race([request, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (typeof result?.path !== "string" || !result.path) {
+      throw new Error("Home Assistant did not return a signed media path");
+    }
     if (this.signedPaths.size >= 512) this.signedPaths.delete(this.signedPaths.keys().next().value);
     this.signedPaths.set(path, { path: result.path, expires: Date.now() + 3500 * 1000 });
     return result.path;

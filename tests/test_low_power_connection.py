@@ -38,6 +38,75 @@ def connection(client, **data):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["ack", "failure", "cancel", "qos0"])
+async def test_wake_publish_diagnostics_never_claim_camera_confirmation(outcome):
+    client = make_client()
+    client._subscription = "granted_qos_1"
+
+    async def publish(*args, **kwargs):
+        if outcome == "failure":
+            raise moto_client.aiomqtt.MqttError("private broker detail")
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+
+    client._client = SimpleNamespace(publish=publish)
+    if outcome == "failure":
+        with pytest.raises(moto_client.TuyaIpcP2pConnectionError):
+            await client.async_send_playback_wake()
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await client.async_send_playback_wake()
+    elif outcome == "qos0":
+        await client.async_send_wake()
+    else:
+        await client.async_send_playback_wake()
+    expected = {
+        "ack": "broker_acknowledged", "failure": "publish_failed",
+        "cancel": "cancelled_or_failed", "qos0": "submitted",
+    }[outcome]
+    assert f"wake_dispatch={expected}" in client.diagnostics
+    assert "low_power_wake_confirmed=False" in client.diagnostics
+    assert "private broker detail" not in client.diagnostics
+    assert type(client._wake_publish_ms) is int and client._wake_publish_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_sd_timeout_log_preserves_dispatch_and_subscription_evidence(monkeypatch, caplog):
+    monkeypatch.setattr(playback_module, "CAMERA_COMMANDS", CameraCommandQueue())
+    monkeypatch.setattr(playback_module, "_SD_STATUS_TIMEOUT_SECONDS", 0.02)
+    config = replace(
+        camera_config(), wake_direct=True, sd_low_power_wake=True, sd_status_mqtt_dp="110",
+    )
+    playback = playback_module.NativeRelayPlaybackSession(config, APP_SESSION)
+    playback._on_demand_catalog = True
+    client = make_client()
+    client._subscription = "granted_qos_1"
+    client._account_subscription = "rejected"
+    # Prior traffic must not masquerade as a response to this query.
+    connection(client, online=True)
+
+    async def publish(*args, **kwargs):
+        pass
+
+    client._client = SimpleNamespace(publish=publish)
+    playback._moto = client
+    with pytest.raises(playback_module.NativeRelayPlaybackError, match="did not report SD status"):
+        await playback._maybe_send_wake(client)
+    summary = next(record.getMessage() for record in caplog.records
+                   if record.getMessage().startswith("Native SD status timeout:"))
+    for evidence in (
+        "phase=mqtt_sd_status", "route=mqtt", "basis=inventory", "dispatch=sent",
+        "wake_dispatch=broker_acknowledged", "dp_broker_acknowledged=True",
+        "received=1", "received_after_dp_dispatch=0", "account_subscription=rejected",
+        "reader_done=False", "failure=none", "wake_confirmed=False",
+    ):
+        assert evidence in summary
+    assert config.local_key not in summary
+    assert APP_SESSION["sid"] not in summary
+    assert client._dp_query is None
+
+
+@pytest.mark.asyncio
 async def test_low_power_online_does_not_complete_sd_query_or_confirm_wake():
     client = make_client()
     with client.dp_report_listener("110") as report:
@@ -279,7 +348,7 @@ async def test_native_lan_cannot_bypass_or_duplicate_sd_preparation(monkeypatch,
         if outcome in {"no_card", "status_timeout", "sd_send_error", "missing_route"}:
             with pytest.raises(playback_module.NativeRelayPlaybackError):
                 await playback._open_signaling("sdp", [], "trace", {}, {})
-            assert events == (["subscribe", "wake"] if outcome == "missing_route" else ["subscribe", "wake", "status"])
+            assert events == (["subscribe"] if outcome == "missing_route" else ["subscribe", "wake", "status"])
         else:
             await playback._open_signaling("sdp", [], "trace", {}, {})
             if outcome == "lan":
@@ -335,7 +404,7 @@ async def test_wake_throttle_or_failure_does_not_bypass_sd_query(monkeypatch, ou
     if outcome in {"sd_send_failure", "missing_route"}:
         with pytest.raises(playback_module.NativeRelayPlaybackError):
             await playback._open_signaling("sdp", [], "trace", {}, {})
-        assert events == (["wake", "query"] if outcome == "sd_send_failure" else ["wake"])
+        assert events == (["wake", "query"] if outcome == "sd_send_failure" else [])
     else:
         await playback._open_signaling("sdp", [], "trace", {}, {})
         assert events == ["wake", "query", "offer"]
