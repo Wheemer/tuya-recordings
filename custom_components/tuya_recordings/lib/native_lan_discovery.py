@@ -12,32 +12,64 @@ import tinytuya
 from tinytuya.scanner import get_ip_to_broadcast
 
 
+def _lan_interface(address: str):
+    """Resolve the concrete Linux interface and subnet; never fall back wide."""
+    if not hasattr(socket, "SO_BINDTODEVICE"):
+        raise OSError("Interface-scoped LAN discovery is not supported")
+    try:
+        import fcntl
+    except ImportError as error:
+        raise OSError("Interface-scoped LAN discovery requires Linux") from error
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        for _index, name in socket.if_nameindex():
+            request = struct.pack("256s", name.encode()[:15])
+            try:
+                result = fcntl.ioctl(probe.fileno(), 0x8915, request)
+                if socket.inet_ntoa(result[20:24]) != address:
+                    continue
+                mask = fcntl.ioctl(probe.fileno(), 0x891B, request)
+                return name, ipaddress.ip_network((address, socket.inet_ntoa(mask[20:24])), strict=False)
+            except OSError:
+                continue
+    raise OSError("LAN discovery interface could not be resolved")
+
+
 def find_lan_device(device_id: str) -> dict:
     """Listen before sending command 37 to limited and subnet broadcasts."""
     with ExitStack() as stack:
         listeners = []
-        for port in (6666, 6667, 7000):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            stack.callback(listener.close)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                listener.bind(("", port))
-            except OSError:
-                continue
-            listeners.append(listener)
-        if not listeners:
-            raise OSError("No LAN discovery listener could be opened")
+        networks = {}
         senders = []
-        for broadcast, address in get_ip_to_broadcast().items():
+        for address in dict.fromkeys(get_ip_to_broadcast().values()):
             try:
                 local = ipaddress.ip_address(address)
             except ValueError:
                 continue
-            if local.version != 4 or local.is_loopback or local.is_unspecified:
+            if local.version != 4 or not local.is_private or local.is_loopback or local.is_unspecified:
                 continue
+            interface, network = _lan_interface(address)
+            if not network.is_private:
+                continue
+            broadcast = str(network.broadcast_address)
+            for destination in {address, broadcast, "255.255.255.255"}:
+                for port in (6666, 6667, 7000):
+                    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    stack.callback(listener.close)
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    # Linux treats a limited-broadcast bind like ANY. Pin the
+                    # socket to its interface before bind, or fail closed.
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode() + b"\0")
+                    try:
+                        listener.bind((destination, port))
+                    except OSError:
+                        continue
+                    listeners.append(listener)
+                    networks[listener] = network
             sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             stack.callback(sender.close)
             sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode() + b"\0")
             try:
                 sender.bind((address, 0))
             except OSError:
@@ -50,6 +82,8 @@ def find_lan_device(device_id: str) -> dict:
                 sender.sendto(payload, ("255.255.255.255", 7000))
             except OSError:
                 pass
+        if not listeners:
+            raise OSError("No interface-scoped LAN discovery listener could be opened")
         start = time.monotonic()
         subnet_sent = False
         received = 0
@@ -72,6 +106,8 @@ def find_lan_device(device_id: str) -> dict:
                 raw, peer = listener.recvfrom(65536)
                 received += 1
                 try:
+                    if ipaddress.ip_address(peer[0]) not in networks[listener]:
+                        continue
                     header = tinytuya.parse_header(raw)
                     if header.prefix == tinytuya.PREFIX_6699_VALUE:
                         packet = tinytuya.unpack_message(raw, hmac_key=tinytuya.udpkey, no_retcode=None)
@@ -84,7 +120,7 @@ def find_lan_device(device_id: str) -> dict:
                         continue
                     address = ipaddress.ip_address(data.get("ip", peer[0]))
                     version = str(data.get("version", ""))
-                    if (address.version != 4 or not address.is_private or address.is_loopback
+                    if (address.version != 4 or address not in networks[listener] or address.is_loopback
                             or address.is_unspecified or version not in {"3.1", "3.2", "3.3", "3.4", "3.5"}):
                         continue
                     return {"id": device_id, "ip": str(address), "version": version}

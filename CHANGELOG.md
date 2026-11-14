@@ -10,7 +10,7 @@
 
 ### Local Discovery
 
-- Include the APK's limited-broadcast discovery request alongside subnet discovery, with bounded listening, device-identity checks, and socket cleanup. No subnet scanning or device polling is added.
+- Include the APK's limited-broadcast discovery request alongside subnet discovery, with bounded listening, device-identity checks, and socket cleanup. Receivers are pinned to specific private LAN interfaces and reject replies from outside their subnets; discovery fails closed if interface binding is unavailable. No subnet scanning or device polling is added.
 
 ### Cached Video
 

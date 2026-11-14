@@ -2,6 +2,7 @@
 
 import json
 import struct
+import ipaddress
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,7 @@ from custom_components.tuya_recordings.lib import native_lan_discovery as module
 
 @pytest.mark.parametrize("reply_on", ["limited", "subnet", "silent"])
 @pytest.mark.parametrize("legacy", [False, True])
-def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legacy):
+def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legacy, bind_denied=False):
     clock = [0.0]
     sent = []
     sockets = []
@@ -31,9 +32,15 @@ def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legac
     class Socket:
         def __init__(self, *args):
             self.closed = False
+            self.options = []
             sockets.append(self)
-        def setsockopt(self, *args): pass
-        def bind(self, address): self.address = address
+        def setsockopt(self, *args):
+            if bind_denied and args[1] == module.socket.SO_BINDTODEVICE:
+                raise PermissionError("interface binding denied")
+            self.options.append(args)
+        def bind(self, address):
+            assert (module.socket.SOL_SOCKET, module.socket.SO_BINDTODEVICE, b"eth0\0") in self.options
+            self.address = address
         def close(self): self.closed = True
         def sendto(self, payload, destination):
             nonlocal returned
@@ -46,9 +53,10 @@ def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legac
                 returned = True
                 damaged = bytearray(response("camera"))
                 damaged[-8] ^= 1
-                queued.extend([b"invalid", bytes(damaged), response("wrong-camera"), response("camera")])
+                queued.extend([b"invalid", bytes(damaged), (response("camera"), ("10.9.1.3", 6667)), response("wrong-camera"), response("camera")])
         def recvfrom(self, size):
-            return queued.pop(0), ("192.168.4.9", 6667)
+            item = queued.pop(0)
+            return item if isinstance(item, tuple) else (item, ("192.168.4.9", 6667))
 
     def ready(readers, _write, _error, timeout):
         clock[0] += timeout
@@ -56,12 +64,18 @@ def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legac
 
     real = module.socket
     monkeypatch.setattr(module, "socket", SimpleNamespace(
-        **{name: getattr(real, name) for name in ("AF_INET", "SOCK_DGRAM", "SOL_SOCKET", "SO_REUSEADDR", "SO_BROADCAST")},
+        **{name: getattr(real, name) for name in ("AF_INET", "SOCK_DGRAM", "SOL_SOCKET", "SO_REUSEADDR", "SO_BROADCAST", "SO_BINDTODEVICE")},
         socket=Socket,
     ))
     monkeypatch.setattr(module.select, "select", ready)
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(module, "get_ip_to_broadcast", lambda: {"192.168.4.255": "192.168.4.2"})
+    monkeypatch.setattr(module, "_lan_interface", lambda address: ("eth0", ipaddress.ip_network("192.168.4.0/24")))
+    if bind_denied:
+        with pytest.raises(PermissionError, match="interface binding denied"):
+            module.find_lan_device("camera")
+        assert not sent and all(sock.closed for sock in sockets)
+        return
     found = module.find_lan_device("camera")
     assert found == ({} if reply_on == "silent" else {"id": "camera", "ip": "192.168.4.9", "version": "3.5"})
     assert sent[0] == (0, ("255.255.255.255", 7000))
@@ -69,3 +83,8 @@ def test_apk_discovery_requests_and_strict_identity(monkeypatch, reply_on, legac
         assert sent[1] == (3, ("192.168.4.255", 7000))
     assert len(sent) <= 2 and clock[0] <= 6
     assert all(sock.closed for sock in sockets)
+    assert all(sock.address[0] not in ("", "0.0.0.0") for sock in sockets)
+
+
+def test_discovery_fails_closed_when_interface_binding_is_denied(monkeypatch):
+    test_apk_discovery_requests_and_strict_identity(monkeypatch, "limited", False, bind_denied=True)
