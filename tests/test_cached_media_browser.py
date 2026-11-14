@@ -27,10 +27,8 @@ from homeassistant.helpers import device_registry, entity_registry
 
 from custom_components.tuya_recordings.client import TuyaRecordingsClient
 from custom_components.tuya_recordings.const import DOMAIN
-from custom_components.tuya_recordings.http import (
-    TuyaRecordingsPanelDataView, TuyaRecordingsPlaybackView,
-    TuyaRecordingsThumbnailView, TuyaRecordingsDebugView,
-)
+from types import SimpleNamespace
+from custom_components.tuya_recordings import _async_register_views
 from custom_components.tuya_recordings.lib.ffmpeg import finalize_mp4_for_browser
 from custom_components.tuya_recordings.lib.native_frames import (
     NativePlaybackFrame, NativePlaybackFrameType, playback_frame_event,
@@ -92,6 +90,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
         shutil.copyfile(client.clip_path("fixture", 100, 103), folder / f"fixture_{start}_{start + 3}.mp4")
         shutil.copyfile(client.thumbnail_path("fixture", 100, 103), client.thumbnail_path("fixture", start, start + 3))
     index = {"cameras": [{"devId": "fixture", "name": "Cached camera", "online": False,
+                          "bridgeStatus": {"status": "not_responding"},
                           "clips": [{"start": start, "end": start + 3, "date": date.today().isoformat()}
                                     for start in (100, 200, 300, 400)]}]}
     monkeypatch.setattr(client, "cached_camera_index", lambda: index)
@@ -136,8 +135,13 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     refresh_token_id=request[KEY_HASS_REFRESH_TOKEN_ID],
                 )})
 
-        for view in (TuyaRecordingsPanelDataView(hass), TuyaRecordingsPlaybackView(hass),
-                     TuyaRecordingsThumbnailView(hass), TuyaRecordingsDebugView(hass), SignView(),
+        hass.http = SimpleNamespace(
+            register_view=lambda view: view.register(hass, app, app.router),
+            supervisor_unix_socket_path=None,
+        )
+        _async_register_views(hass)
+        _async_register_views(hass)
+        for view in (SignView(),
                      LocalMediaView(hass, LocalSource(hass, "local", "My media", hass.config.media_dirs, "/media"))):
             view.register(hass, app, app.router)
         async def home(request):
@@ -298,7 +302,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     assert {"initialize", "controls-create", "controls-ready", "cached-play-request",
                             "playing", "progress", "player-ready"}.issubset(result["stages"]), result
                     assert result["safeDebug"], result
-                    assert {"20261114-private-cache-35", "20261114-private-cache-36"}.issubset(
+                    assert {"20261114-camera-availability-37", "20261114-private-cache-36"}.issubset(
                         result["builds"]), result
                     if directory := os.environ.get("TUYA_TEST_ARTIFACT_DIR"):
                         artifacts = Path(directory)

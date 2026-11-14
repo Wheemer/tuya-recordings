@@ -214,6 +214,7 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 "dev_id": dev_id,
                 "name": str(camera.get("name") or dev_id),
                 "online": camera.get("online"),
+                "catalog_status": camera.get("bridgeStatus", {}).get("status", ""),
                 "dates": sorted(dates, reverse=True),
                 "playback_mode": playback_mode,
                 "clips": clips,
@@ -633,11 +634,15 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
                     day,
                 )
             except Exception:
-                _LOGGER.exception(
-                    "Tuya Recordings catalog refresh failed for %s on %s",
-                    target or "camera discovery",
-                    day,
-                )
+                status = client.camera_catalog_status(target)
+                if status in {"offline", "not_responding"}:
+                    _LOGGER.info("Tuya Recordings catalog unavailable for %s on %s: %s",
+                                 target, day, status)
+                else:
+                    _LOGGER.exception(
+                        "Tuya Recordings catalog refresh failed for %s on %s",
+                        target or "camera discovery", day,
+                    )
             finally:
                 self._catalog_refresh_tasks.pop(key, None)
 

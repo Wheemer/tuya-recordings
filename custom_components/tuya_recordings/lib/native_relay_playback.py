@@ -140,6 +140,10 @@ class NativeRelayPlaybackError(RuntimeError):
     """The native IMM playback session could not complete."""
 
 
+class NativeSdStatusTimeout(NativeRelayPlaybackError):
+    """The camera did not report SD readiness within the existing deadline."""
+
+
 class NativeRelayPlaybackSession:
     """One bounded Smart Life signaled, direct-LAN SD playback session.
 
@@ -1012,7 +1016,7 @@ class NativeRelayPlaybackSession:
             getattr(self._moto, "diagnostics", "unavailable"),
             getattr(self._status_lan, "diagnostics", self._sd_status_lan_details),
         )
-        return NativeRelayPlaybackError(
+        return NativeSdStatusTimeout(
             f"Camera did not report SD status after wake ({self.transport_diagnostics})"
         )
 

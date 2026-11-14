@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-33 (2026-11-14)
+
+### Cached Playback
+
+- Register the cached-video HTTP route during integration startup, fixing the missing endpoint behind the unsupported-source playback error in v0.4.13-32.
+- Exercise production route registration in the authenticated cached-player browser tests instead of registering test-only playback routes.
+
+### Camera Availability
+
+- Distinguish cameras reported offline from cameras that do not answer the SD-status query. Do not infer that a silent camera is powered off.
+- Keep the last known recording list visible and existing cached videos playable while a camera is unavailable.
+- Defer that camera's pending Media Sync downloads and continue with available cameras. Do not count unavailable cameras as transfer failures or prune caches during an incomplete pass.
+- Clear the unavailable status after a successful refresh and show when Sync is waiting for unavailable cameras.
+- Preserve existing playback, seeking, download filtering, wake limits and cooldowns.
+
 ## Tuya Recordings v0.4.13-32 (2026-11-14)
 
 ### Cached Playback
