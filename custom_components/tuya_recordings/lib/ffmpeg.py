@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 import av
 
+_LOGGER = logging.getLogger(__name__)
+
 
 def finalize_mp4_for_browser(input_path: Path, output_path: Path, *, require_audio: bool = True) -> None:
-    streams = _probe_stream_codecs(input_path)
-    raw_audio = any(stream.get("codec_name") in {"pcm_s16le", "pcm_mulaw", "pcm_alaw"}
-                    for stream in streams or [])
     temp_path = output_path.with_suffix(".faststart.tmp.mp4")
     temp_path.unlink(missing_ok=True)
+    streams = _probe_stream_codecs(input_path)
+    _log_streams(streams, "before_finalization", input_path.name)
+    if require_audio:
+        _validate_audio_video_streams(streams, "before_finalization")
+    raw_audio = any(stream.get("codec_name") in {"pcm_s16le", "pcm_mulaw", "pcm_alaw"}
+                    for stream in streams or [])
     result = subprocess.run(
         [
             "ffmpeg",
@@ -104,6 +110,17 @@ def extract_thumbnail_from_mp4(input_path: Path, output_path: Path) -> None:
 
 def _require_audio_video_streams(path: Path) -> None:
     streams = _probe_stream_codecs(path)
+    _log_streams(streams, "after_finalization", path.name)
+    _validate_audio_video_streams(streams, "after_finalization")
+
+
+def _log_streams(streams: list[dict] | None, stage: str, recording: str) -> None:
+    summary = [{key: stream.get(key) for key in ("codec_type", "codec_name", "width", "height", "sample_rate", "channels")}
+               for stream in (streams or [])[:8]]
+    _LOGGER.debug("Tuya cached recording streams: recording=%s stage=%s streams=%s", recording, stage, summary)
+
+
+def _validate_audio_video_streams(streams: list[dict] | None, stage: str) -> None:
     if streams is None:
         return
     has_video = any(stream.get("codec_type") == "video" for stream in streams)
@@ -111,7 +128,7 @@ def _require_audio_video_streams(path: Path) -> None:
     if not has_video or not has_audio:
         raise RuntimeError(
             "Tuya recording is not playable with audio: "
-            f"video_stream={has_video} audio_stream={has_audio}"
+            f"video_stream={has_video} audio_stream={has_audio} stage={stage}"
         )
 
 

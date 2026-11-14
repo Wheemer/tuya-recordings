@@ -1030,6 +1030,8 @@ class TuyaRecordingsClient:
                         if not queried:
                             raise RuntimeError("Recording catalog batch returned no days")
                         for day, day_clips in queried:
+                            LOGGER.debug("Tuya Recordings day catalog received request_id=%s dev=%s day=%s clips=%s",
+                                         MANUAL_REFRESH_ID.get(), dev_id, day, len(day_clips))
                             days_checked.append(day.isoformat())
                             clips.extend(day_clips)
                         remaining_days = remaining_days[len(queried):]

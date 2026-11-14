@@ -237,6 +237,10 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
     if not video.streams.video[0].codec_context.has_b_frames:
         return None
     times = []
+    order = []
+    decoder = av.CodecContext.create("h264", "r")
+    decoder.thread_count = 1
+    decoder.extradata = video.streams.video[0].codec_context.extradata
     cancellation = _WORK_CANCEL.get()
     length = packet_path.stat().st_size
     with packet_path.open("rb") as source:
@@ -252,38 +256,25 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
                 if not 0 < scale <= 1_000_000 or len(times) >= 1_000_000:
                     raise ValueError("Native video reorder metadata exceeds bounds")
                 times.append(round((Fraction(stamp, scale) - origin) * 1_000_000))
-            source.seek(size, 1)
-    decoder = av.CodecContext.create("h264", "r")
-    decoder.thread_count = 1
-    order = []
-    count = 0
-    # Deferred to avoid the muxer's import of this packet-cache module.
-    from .native_mux import _h264_metadata_only
-
-    headers = b""
-    for packet in video.demux(video.streams.video[0]):
-        if cancellation is not None and cancellation.is_set():
-            raise CameraWorkCancelled("Native picture-order analysis cancelled")
-        if not packet.size:
-            continue
-        data = bytes(packet)
-        if _h264_metadata_only(data):
-            if len(headers) + len(data) > MAX_PACKET_BYTES:
-                raise ValueError("Native video decoder headers exceed packet limit")
-            headers += data
-            continue
-        if headers:
-            packet = av.Packet(headers + data)
-            headers = b""
-        packet.pts = count
-        packet.dts = None
-        packet.time_base = Fraction(1, 1000)
-        order.extend(frame.pts for frame in decoder.decode(packet))
-        count += 1
-        if count > len(times):
-            raise ValueError("Native video access units do not match the packet index")
+                # The index preserves the camera callback's picture boundary
+                # and its buffered SPS/PPS. Re-demuxing the concatenated raw
+                # file can split those boundaries or create a header-only tail.
+                packet = av.Packet(source.read(size))
+                packet.pts = len(times) - 1
+                packet.dts = None
+                packet.time_base = Fraction(1, 1000)
+                try:
+                    order.extend(frame.pts for frame in decoder.decode(packet))
+                except av.error.FFmpegError as err:
+                    raise ValueError(
+                        f"Native indexed H264 picture decode failed: picture={len(times) - 1} "
+                        f"bytes={size} timestamp={stamp}/{scale}: {err}"
+                    ) from err
+            else:
+                source.seek(size, 1)
     order.extend(frame.pts for frame in decoder.decode(None))
-    if count != len(times) or sorted(order) != list(range(count)):
+    count = len(times)
+    if sorted(order) != list(range(count)):
         raise ValueError("Native video picture order does not match the packet index")
     ranks = {packet_index: rank for rank, packet_index in enumerate(order)}
     delay = max((times[i] - times[ranks[i]] for i in range(count)), default=0)

@@ -411,8 +411,11 @@ class Peer:
     + [(mode, False, True) for mode in ("no_answer_udp", "sd_silence", "no_answer_udp_silent_control", "offline_report_http")]
     + [(mode, False, automatic) for mode in ("cooldown_ready", "cooldown_sd_silence", "cooldown_lan_after_wake") for automatic in (False, True)]
     + [("play_mode", True, False), ("checked_peer_udp", True, False), ("endpoint_race", True, False), ("late_tcp_answer", True, False), ("lan_connect_fallback", True, False), ("lossy_seek", True, False)]
-    + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device", "wake_resend")])
+    + [(mode, True, False) for mode in ("account_sd_report", "account_sd_silence", "account_wrong_device", "wake_resend", "paged_day")])
 async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profile, mode, media, automatic, decodable_media, shared_commands=None, lan_key_reconnect=False):
+    paged_day = mode == "paged_day"
+    if paged_day:
+        mode = "answer"
     wake_resend = mode == "wake_resend"
     if wake_resend:
         mode = "answer"
@@ -476,6 +479,8 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
         config = replace(config, token=json.dumps(source["p2pConfig"]), config_json=json.dumps(source), app_profile_id=profile)
         if play_mode:
             config = replace(config, skill='{"localStorage":128}')
+        if paged_day:
+            config = replace(config, skill='{"localStorage":33554432}')
         config = replace(config, sd_low_power_wake=True, wake_direct=True,
                          sd_status_mqtt_dp="110", sd_status_mqtt_capable=True,
                          sd_status_lan_dp="")
@@ -649,14 +654,17 @@ async def test_tcp_command_answer_then_catalog_uses_only_lan(monkeypatch, profil
                         lan_peer.send(encrypt_record(receive_key, fragment_end))
                         lan_peer.send(encrypt_record(receive_key, completed))
                 return
-            if magic == 0x12345678 and (high, low) == (3, 1) and length == len(plain) - 20:
+            if magic == 0x12345678 and (high, low) == (3, 2 if paged_day else 1) and length == len(plain) - 20:
                 events.append("LAN catalog")
                 if late_tcp_answer:
                     peer.handshake_gate.set()
                 if mode == "no_answer_udp_silent_control":
                     return
                 payload = struct.pack("<9I", 0, 2026, 11, 8, 1, 0, 100, 110, 0)
-                reply = struct.pack("<IIIHHI", 0x12345678, request, 1, 3, 1, len(payload)) + payload
+                if paged_day:
+                    assert plain[20:] == struct.pack("<64x5I", 0, 2026, 11, 8, 0)
+                    payload = struct.pack("<80x4I3I", 0, 1, 50, 1, 0, 100, 110)
+                reply = struct.pack("<IIIHHI", 0x12345678, request, 1, 3, low, len(payload)) + payload
                 lan_peer.send(encrypt_record(receive_key, reply))
         lan_peer.set_message_handler(control)
 

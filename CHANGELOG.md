@@ -1,5 +1,20 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-35 (2026-11-14)
+
+### Recording Catalog
+
+- Follow the APK's paginated day-catalog route for cameras advertising legacy event-fragment support, collecting pages on the existing LAN control session.
+- Keep unfinished ranges from hiding playable recordings on later pages. Add clearer catalog route and result diagnostics.
+
+### Media Sync
+
+- Follow the APK recorder's startup gate: wait for an I-frame with SPS/PPS configuration before accepting cached video and audio.
+- Use indexed camera packets for H.264 picture-order timing, preserving compressed video and original audio without transcoding.
+- Mark actual IDR frames as seekable even when the incoming keyframe flag is missing.
+- Check audio and video tracks before and after finalization, reject incomplete files, and identify the failing stage in debug logs.
+- Preserve existing playback, seeking, recording-boundary filtering, wake limits and cooldowns.
+
 ## Tuya Recordings v0.4.13-34 (2026-11-14)
 
 ### Camera Devices
