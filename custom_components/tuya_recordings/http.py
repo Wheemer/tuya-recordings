@@ -155,7 +155,7 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 size = thumbnail_files.get(thumbnail_path, 0) if thumbnail_files is not None else _file_size(thumbnail_path)
                 camera_stats["thumbnail_bytes"] += size
             playback_ready = clip_cached or live_playback_available
-            ready = thumbnail_cached and (clip_cached if media_cache_only else playback_ready)
+            ready = clip_cached if media_cache_only else thumbnail_cached and playback_ready
             if ready:
                 stats["ready_clips"] += 1
                 camera_stats["ready_clips"] += 1
@@ -181,10 +181,9 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
             for detection in _native_ai_detections(clip.get("raw"), start, end):
                 ai_detections.append(detection)
             if media_cache_only:
-                if not ready:
-                    continue
                 dates.add(clip_date)
-                item["playback_url"] = f"/api/{DOMAIN}/play/{quote(dev_id, safe='')}/{start}/{end}?transport=file"
+                item["pending"] = not clip_cached
+                item["playback_url"] = f"/api/{DOMAIN}/play/{quote(dev_id, safe='')}/{start}/{end}?transport=file" if clip_cached else ""
                 item["stream_transport"] = "file"
                 clips.append(item)
             else:

@@ -9,6 +9,68 @@ from custom_components.tuya_recordings import client as module
 from custom_components.tuya_recordings.lib.commands import _WORK_CANCEL, CameraCommandQueue
 
 
+def test_remux_failure_skips_only_that_camera_and_keeps_other_downloads(monkeypatch, tmp_path):
+    monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
+    monkeypatch.setattr(module, "MEDIA_SYNC_INTER_ATTEMPT_DELAY", 0)
+    client = module.TuyaRecordingsClient({"media_sync_enabled": True}, media_storage_path=tmp_path)
+    index = {"cameras": [
+        {"devId": "ptz", "clips": [{"start": 300, "end": 310}, {"start": 250, "end": 260}]},
+        {"devId": "doorbell", "clips": [{"start": 200, "end": 210}]},
+        {"devId": "working", "clips": [{"start": 100, "end": 110}]},
+    ]}
+    monkeypatch.setattr(client, "refresh_recent_recordings", lambda: index)
+    monkeypatch.setattr(client, "_recover_interrupted_media_sync", lambda: 0)
+    store = Mock()
+    cleanup = Mock(return_value={})
+    monkeypatch.setattr(client, "_store_media_failures", store)
+    monkeypatch.setattr(client, "cleanup_cached_media", cleanup)
+    calls = []
+
+    def download(dev, start, end, path, **kwargs):
+        calls.append((dev, start))
+        assert not _WORK_CANCEL.get().is_set()
+        if dev == "ptz":
+            raise RuntimeError("Native H264 remux failed")
+
+    monkeypatch.setattr(client, "download_clip", download)
+    result = client.sync_recordings()
+    assert calls == [("ptz", 300), ("doorbell", 200), ("working", 100)]
+    assert result["downloaded"] == 2 and result["failed"] == 1 and result["skipped"] == 1
+    assert result["failed_cameras"] == ["ptz"]
+    assert result["unavailable_cameras"] == []
+    assert set(client._media_failures) == {("ptz", 300, 310)}
+    assert client._media_sync_status.to_dict()["last_error"] == "Native H264 remux failed"
+    store.assert_called_once()
+    cleanup.assert_not_called()
+    assert not client._media_sync_lock.locked()
+
+
+@pytest.mark.parametrize("failure", ["cancel", "auth"])
+def test_sync_does_not_continue_after_cancellation_or_auth_failure(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
+    client = module.TuyaRecordingsClient({"media_sync_enabled": True}, media_storage_path=tmp_path)
+    index = {"cameras": [{"devId": dev, "clips": [{"start": start, "end": start + 10}]}
+                         for dev, start in [("first", 200), ("second", 100)]]}
+    monkeypatch.setattr(client, "refresh_recent_recordings", lambda: index)
+    monkeypatch.setattr(client, "_recover_interrupted_media_sync", lambda: 0)
+    calls = []
+
+    def download(dev, *args, **kwargs):
+        calls.append(dev)
+        if failure == "cancel":
+            raise module.CameraWorkCancelled("playback priority")
+        raise module.TuyaRecordingsAuthError("expired session")
+
+    monkeypatch.setattr(client, "download_clip", download)
+    if failure == "auth":
+        with pytest.raises(module.TuyaRecordingsAuthError):
+            client.sync_recordings()
+    else:
+        assert client.sync_recordings()["cancelled"] is True
+    assert calls == ["first"]
+    assert not client._media_sync_lock.locked()
+
+
 @pytest.mark.parametrize("race", [False, True])
 def test_sync_defers_cooldown_without_failure_and_resumes_next_pass(monkeypatch, tmp_path, race):
     clock = [0.0]

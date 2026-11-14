@@ -174,7 +174,7 @@ def media(data, codec, timestamp, *, audio=False):
 @pytest.mark.parametrize("fragment_reset", [False, True])
 @pytest.mark.parametrize("separate_headers", [False, True])
 @pytest.mark.parametrize("via_sync", [False, True])
-def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, monkeypatch, audio_codec, width, fragment_reset, separate_headers, via_sync, leading_pictures=False):
+def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, monkeypatch, audio_codec, width, fragment_reset, separate_headers, via_sync, leading_pictures=False, extension_packet=False):
     import hashlib
     path = tmp_path / "bframes.h264"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
@@ -220,6 +220,12 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
             muxer.handle_event(media(audio[:800 * width], audio_codec, 99900, audio=True))
         for index, (packet, keyframe) in enumerate(packets):
             stamp = 100000 + index * 100 + (60000 if fragment_reset and index >= 10 else 0)
+            if extension_packet and index in {1, 5, 10, 19}:
+                # A non-picture SPS-extension NAL at a callback boundary.
+                # 1133 bytes matches the reported second indexed packet size;
+                # its contents are a fixture, not a capture from the camera.
+                extension = b"\x00\x00\x00\x01\x6d\xd0" + bytes(1127)
+                muxer.handle_event(media(extension, "h264", stamp - 1))
             if separate_headers and keyframe:
                 muxer.handle_event(media(headers, "h264", stamp))
             event = media(packet, "h264", stamp)
@@ -228,6 +234,8 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
             muxer.handle_event(media(audio[index * 800 * width:(index + 1) * 800 * width], audio_codec, stamp, audio=True))
         if separate_headers:
             muxer.handle_event(media(headers, "h264", stamp + 100))
+        if extension_packet:
+            muxer.handle_event(media(extension, "h264", stamp + 100))
     if via_sync:
         from types import SimpleNamespace
         from custom_components.tuya_recordings import client as module
@@ -273,6 +281,12 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
         result.seek(1_000_000)
         seeked = hashes(result)
         assert seeked[-10:] == expected[-10:]
+
+
+@pytest.mark.parametrize("via_sync", [False, True])
+def test_cached_nonpicture_second_callback_retains_video_audio_and_sync(tmp_path, monkeypatch, via_sync):
+    test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
+        tmp_path, monkeypatch, "g711u", 1, True, True, via_sync, extension_packet=True)
 
 
 @pytest.mark.parametrize("via_sync", [False, True])
@@ -393,10 +407,19 @@ def test_cache_bounds_header_only_packets_and_cleans_up(tmp_path, monkeypatch):
     assert muxer._pending_video_headers == b""
 
 
-@pytest.mark.parametrize("nal_type", [0, 1, 5, 13, 20, 31, 0x87])
+@pytest.mark.parametrize("nal_type", [0, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21, 22, 23, 31, 0x87, 0x8d, 0x8e, 0x8f])
 def test_cache_does_not_classify_pictures_or_invalid_nals_as_headers(nal_type):
     from custom_components.tuya_recordings.lib.native_mux import _h264_metadata_only
     assert not _h264_metadata_only(b"\x00\x00\x01" + bytes([nal_type]) + b"data")
+
+
+@pytest.mark.parametrize("nal_type", range(6, 16))
+@pytest.mark.parametrize("start", [b"\x00\x00\x01", b"\x00\x00\x00\x01"])
+def test_cache_recognizes_nonpicture_nals_without_hiding_mixed_pictures(nal_type, start):
+    from custom_components.tuya_recordings.lib.native_mux import _h264_metadata_only
+    header = start + bytes([nal_type]) + b"data"
+    assert _h264_metadata_only(header)
+    assert not _h264_metadata_only(header + start + b"\x61picture")
 
 
 def test_cache_does_not_count_configuration_as_received_video(tmp_path):

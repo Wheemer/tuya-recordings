@@ -1354,7 +1354,7 @@ class TuyaRecordingsClient:
     def _sync_recordings(self, cancellation: Cancellation, deadline: Deadline) -> dict[str, Any]:
         result = {"enabled": self.media_sync_enabled, "downloaded": 0, "skipped": 0, "failed": 0, "deferred": 0,
                   "deleted_videos": 0, "deleted_thumbnails": 0, "recovered_partials": 0, "stalled_cameras": [],
-                  "unavailable_cameras": []}
+                  "unavailable_cameras": [], "failed_cameras": []}
         if self.cloud_activity_paused:
             result.update(enabled=False, paused=True)
             self._set_media_sync_status("paused", last_result=result)
@@ -1409,9 +1409,10 @@ class TuyaRecordingsClient:
             }
             self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0, deferred=0,
                                         total=len(desired_clips), current=None, last_error=None,
-                                        unavailable_cameras=sorted(unavailable_cameras))
+                                        unavailable_cameras=sorted(unavailable_cameras), failed_cameras=[])
             newest_sync_end = int(time.time()) - MEDIA_SYNC_MIN_CLIP_AGE
             attempts: dict[str, int] = {}
+            failed_cameras: set[str] = set()
             for position, (dev_id, clip) in enumerate(clips, start=1):
                 check_cancelled()
                 if deadline.is_set():
@@ -1420,6 +1421,9 @@ class TuyaRecordingsClient:
                 current_device = dev_id
                 start, end = int(clip["start"]), int(clip["end"])
                 key = (dev_id, start, end)
+                if dev_id in failed_cameras:
+                    result["skipped"] += 1
+                    continue
                 if (cutoff is not None and end < cutoff) or end > newest_sync_end:
                     result["skipped"] += 1
                     continue
@@ -1474,10 +1478,11 @@ class TuyaRecordingsClient:
                     self._media_failures[key] = time.time()
                     failures_changed = True
                     result["failed"] += 1
-                    result["skipped"] += len(clips) - position
-                    self._set_media_sync_status("idle", last_error=str(exc))
-                    LOGGER.warning("Media Sync stopped after recording failure for %s %s-%s: %s", dev_id, start, end, exc)
-                    break
+                    failed_cameras.add(dev_id)
+                    result["failed_cameras"] = sorted(failed_cameras)
+                    self._set_media_sync_status("running", last_error=str(exc), failed_cameras=result["failed_cameras"])
+                    LOGGER.warning("Media Sync skipped remaining recordings for %s after failure %s-%s; continuing other cameras: %s", dev_id, start, end, exc)
+                    continue
                 self._media_failures.pop(key, None)
                 failures_changed = True
                 result["downloaded"] += 1
@@ -1506,6 +1511,7 @@ class TuyaRecordingsClient:
                                     deleted_videos=result["deleted_videos"], deleted_thumbnails=result["deleted_thumbnails"],
                                     recovered_partials=result["recovered_partials"],
                                     unavailable_cameras=result["unavailable_cameras"],
+                                    failed_cameras=result["failed_cameras"],
                                     stalled_cameras=result["stalled_cameras"], last_result=result)
         return result
 

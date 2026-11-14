@@ -178,7 +178,11 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
         headers = {"Authorization": f"Bearer {token}"}
         response = requests.get(base + "/api/tuya_recordings/panel", headers=headers, timeout=5)
         assert response.status_code == 200, response.text
-        clip = response.json()["cameras"][0]["clips"][0]
+        listed = response.json()["cameras"][0]["clips"]
+        clip = next(item for item in listed if item["start"] == 200)
+        pending = [item for item in listed if item["pending"]]
+        assert {item["start"] for item in pending} == {300, 400}
+        assert all(item["playback_url"] == "" for item in pending)
         item = MediaSourceItem(state["hass"], DOMAIN, build_identifier({
             "entry_id": "fixture-entry", "dev_id": "fixture", "start": "200", "end": "203",
         }), None)
@@ -275,7 +279,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                       const image = document.querySelector('tuya-recordings-panel').shadowRoot.querySelector('.thumb img');
                       return image?.complete && image.naturalWidth > 0;
                     }""", timeout=10000)
-                    page.locator("tuya-recordings-panel").locator(".clip").first.click()
+                    page.locator("tuya-recordings-panel").locator('.clip[role="button"]').first.click()
                     page.wait_for_function("""() =>
                       document.querySelector('tuya-recordings-panel').shadowRoot.querySelector('video')?.currentTime > 0.2
                     """, timeout=10000)
@@ -302,13 +306,13 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     assert {"initialize", "controls-create", "controls-ready", "cached-play-request",
                             "playing", "progress", "player-ready"}.issubset(result["stages"]), result
                     assert result["safeDebug"], result
-                    assert {"20261114-camera-availability-37", "20261114-private-cache-36"}.issubset(
+                    assert {"20261114-pending-recordings-38", "20261114-private-cache-36"}.issubset(
                         result["builds"]), result
                     if directory := os.environ.get("TUYA_TEST_ARTIFACT_DIR"):
                         artifacts = Path(directory)
                         artifacts.mkdir(parents=True, exist_ok=True)
                         page.screenshot(path=str(artifacts / f"{codec}-{width}.png"), full_page=True)
-                    page.locator("tuya-recordings-panel").locator(".clip").nth(1).click()
+                    page.locator("tuya-recordings-panel").locator('.clip[role="button"]').nth(1).click()
                     page.wait_for_function("""() => {
                       const panel = document.querySelector('tuya-recordings-panel');
                       return panel.selectedClip.start === 100 && panel.shadowRoot.querySelector('video')?.currentTime > 0.2;
@@ -321,7 +325,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     """, timeout=5000)
                     page.evaluate("""async () => {
                       const panel = document.querySelector('tuya-recordings-panel');
-                      const clip = panel.data.cameras[0].clips[0];
+                      const clip = panel.data.cameras[0].clips.find(clip => clip.start === 200);
                       clip.thumbnail_url = '/api/tuya_recordings/thumb/fixture/900/903?entry_id=fixture-entry';
                       await panel.signClip(clip, {playback:false, thumbnail:true});
                       panel.render();
@@ -333,7 +337,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                       const panel = document.querySelector('tuya-recordings-panel');
                       panel.signedPaths.clear();
                       panel._hass.connection.sendMessagePromise = async () => ({});
-                      await panel.openClip(panel.data.cameras[0].clips[0]);
+                      await panel.openClip(panel.data.cameras[0].clips.find(clip => clip.start === 200));
                       return panel.error;
                     }""")
                     assert "did not return a signed media path" in sign_error

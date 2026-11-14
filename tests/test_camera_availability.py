@@ -54,7 +54,7 @@ def test_failed_browse_preserves_catalog_and_success_clears_status(tmp_path, err
 
 
 @pytest.mark.parametrize("failure", ["timeout", "offline", "known_offline", "invalid_media"])
-def test_sync_continues_other_cameras_only_for_unavailability(monkeypatch, tmp_path, failure):
+def test_sync_continues_other_cameras_for_unavailability_or_invalid_media(monkeypatch, tmp_path, failure):
     client = module.TuyaRecordingsClient({"media_sync_enabled": True}, media_storage_path=tmp_path)
     index = {"cameras": [
         {"devId": "missing", "online": failure != "known_offline",
@@ -81,7 +81,9 @@ def test_sync_continues_other_cameras_only_for_unavailability(monkeypatch, tmp_p
     monkeypatch.setattr(client, "download_clip", download)
     result = client.sync_recordings()
     if failure == "invalid_media":
-        assert calls == ["missing"] and result["failed"] == 1
+        assert calls == ["missing", "healthy"] and result["failed"] == 1
+        assert result["downloaded"] == 1
+        assert result["failed_cameras"] == ["missing"]
         assert result["unavailable_cameras"] == []
     else:
         assert calls == (["healthy"] if failure == "known_offline" else ["missing", "healthy"])
