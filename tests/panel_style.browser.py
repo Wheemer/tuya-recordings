@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -241,6 +242,48 @@ def main() -> None:
                     assert abs(geometry["beforeStatus"] - geometry["afterStatus"]) < 0.1
                     if width < 900:
                         assert geometry["metaTop"] >= geometry["thumbBottom"] - 1
+                    availability = page.evaluate("""() => {
+                      const panel = document.querySelector('tuya-recordings-panel');
+                      panel.stopPlayback();
+                      panel.selectedClip = null;
+                      const camera = panel.data.cameras[0];
+                      const rows = [];
+                      for (const status of ['offline', 'not_responding', 'ready']) {
+                        camera.catalog_status = status;
+                        camera.online = status !== 'offline';
+                        panel.data.catalog_refresh_failed = status !== 'ready';
+                        panel.data.stats.sync = {state: 'deferred', failed: 0,
+                          unavailable_cameras: status === 'ready' ? [] : ['fixture']};
+                        panel.render();
+                        const root = panel.shadowRoot;
+                        const text = root.querySelector('.status');
+                        rows.push({status, text: text.textContent,
+                          camera: root.querySelector('#camera option:checked').textContent,
+                          clips: root.querySelectorAll('.clip').length,
+                          right: text.getBoundingClientRect().right,
+                          overflow: text.scrollWidth > text.clientWidth + 1});
+                      }
+                      camera.catalog_status = 'not_responding';
+                      panel.data.stats.sync.unavailable_cameras = ['fixture'];
+                      panel.render();
+                      if (!panel.shadowRoot.textContent.includes('Waiting for 1 unavailable camera'))
+                        throw new Error('Missing unavailable-camera Sync status');
+                      return rows;
+                    }""")
+                    for row in availability:
+                        label = {"offline": "offline", "not_responding": "not responding",
+                                 "ready": "online"}[row["status"]]
+                        assert label in row["text"].lower(), row
+                        assert row["clips"] == 1 and row["right"] <= width + 1
+                        assert not row["overflow"], row
+                        assert "Could not refresh" not in row["text"]
+                        if row["status"] != "ready":
+                            assert label in row["camera"].lower()
+                            assert "Showing last known recordings" in row["text"]
+                    if artifacts := os.environ.get("TUYA_TEST_ARTIFACT_DIR"):
+                        destination = Path(artifacts)
+                        destination.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(destination / f"camera-availability-{width}.png"))
                     reports.append({"width": width, **geometry})
                     page.close()
                 browser.close()

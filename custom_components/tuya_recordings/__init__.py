@@ -51,6 +51,7 @@ from .frontend import FRONTEND_URL_PATH, async_register_frontend
 from .http import (
     TuyaRecordingsDebugView,
     TuyaRecordingsPanelDataView,
+    TuyaRecordingsPlaybackView,
     TuyaRecordingsThumbnailView,
     TuyaRecordingsTimelineView,
 )
@@ -524,6 +525,7 @@ def _async_register_views(hass: HomeAssistant) -> None:
         return
     hass.http.register_view(TuyaRecordingsPanelDataView(hass))
     hass.http.register_view(TuyaRecordingsDebugView(hass))
+    hass.http.register_view(TuyaRecordingsPlaybackView(hass))
     hass.http.register_view(TuyaRecordingsTimelineView(hass))
     hass.http.register_view(TuyaRecordingsThumbnailView(hass))
     hass.data[DOMAIN]["_playback_view_registered"] = True

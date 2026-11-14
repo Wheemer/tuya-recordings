@@ -21,6 +21,16 @@ from custom_components.tuya_recordings.lib.commands import (
 )
 
 
+def test_startup_registers_cached_playback_view_once():
+    registered = []
+    hass = SimpleNamespace(data={}, http=SimpleNamespace(register_view=registered.append))
+    integration._async_register_views(hass)
+    integration._async_register_views(hass)
+    urls = [view.url for view in registered]
+    assert "/api/tuya_recordings/play/{dev_id}/{start}/{end}" in urls
+    assert len(urls) == len(set(urls)) == 5
+
+
 @pytest.mark.parametrize("media_sync", [False, True])
 def test_refresh_button_updates_inventory_for_its_entry_only(monkeypatch, media_sync):
     entry = SimpleNamespace(entry_id="target", title="Target", data={"native_app_session": {}}, options={})

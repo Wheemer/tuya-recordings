@@ -74,6 +74,7 @@ from .lib.commands import (
 )
 from .lib.native_backend import RecordingBackend, RecordingBackendAuthError
 from .lib.native_playback import native_playback_request
+from .lib.native_relay_playback import NativeSdStatusTimeout
 from .lib.native_session import NativePlaybackRequest
 from .lib.native_setup import build_recordings_backend
 from .lib.storage import write_catalog
@@ -481,6 +482,25 @@ class TuyaRecordingsClient:
         """Expose a sanitized status, never the raw backend exception."""
         return dev_id in self._browse_camera_failures if dev_id else bool(self._browse_discovery_error)
 
+    def camera_catalog_status(self, dev_id: str) -> str:
+        for camera in (self._camera_index_cache or {}).get("cameras", []):
+            if camera.get("devId") == dev_id:
+                return camera.get("bridgeStatus", {}).get("status", "")
+        return ""
+
+    def _set_camera_catalog_status(self, dev_id: str, status: str) -> None:
+        """Update status under the caller's refresh lock without replacing recordings."""
+        index = self._camera_index_cache
+        if index is None:
+            return
+        for camera in index.get("cameras", []):
+            if camera.get("devId") == dev_id:
+                camera["bridgeStatus"] = {
+                    **camera.get("bridgeStatus", {}), "status": status, "error": "",
+                }
+                self._store_cache(index, CACHE_TTL)
+                break
+
     @contextmanager
     def _browse_camera_query(self, dev_id: str):
         """Give a failed camera a quiet period across day and month requests."""
@@ -488,14 +508,17 @@ class TuyaRecordingsClient:
             yield
         except (CameraWorkBusy, CameraWorkCancelled):
             raise
-        except Exception:
+        except Exception as error:
             self._browse_camera_failures.pop(dev_id, None)
             self._browse_camera_failures[dev_id] = time.monotonic() + 30
             if len(self._browse_camera_failures) > 64:
                 self._browse_camera_failures.pop(next(iter(self._browse_camera_failures)))
+            self._set_camera_catalog_status(dev_id, _camera_unavailable_status(error) or "error")
             raise
         else:
             self._browse_camera_failures.pop(dev_id, None)
+            if self.camera_catalog_status(dev_id):
+                self._set_camera_catalog_status(dev_id, "ready")
 
     def browse_recording_month(self, dev_id: str, month: date) -> dict[str, Any]:
         """Read one APK month bitmap, never scan every day to paint a calendar."""
@@ -909,20 +932,16 @@ class TuyaRecordingsClient:
                     except Exception as error:
                         if active.is_set():
                             raise CameraWorkCancelled("Recording catalog pass interrupted") from error
-                        cause = error
-                        seen = set()
-                        while cause is not None and id(cause) not in seen:
-                            if isinstance(cause, NativeGatewayDeviceOfflineError):
-                                break
-                            seen.add(id(cause))
-                            cause = cause.__cause__
-                        offline = isinstance(cause, NativeGatewayDeviceOfflineError)
+                        unavailable = _camera_unavailable_status(error)
+                        offline = unavailable == "offline"
                         if offline:
                             camera["online"] = False
                             self._camera_availability[dev_id] = (time.monotonic() + CACHE_TTL.total_seconds(), False)
+                        if unavailable:
                             LOGGER.info(
-                                "Tuya Recordings catalog unavailable request_id=%s dev=%s day=%s reason=DEVICE_OFFLINE retained_clips=%s",
-                                request_id, dev_id, day.isoformat(), len(camera["clips"]),
+                                "Tuya Recordings catalog unavailable request_id=%s dev=%s day=%s reason=%s retained_clips=%s",
+                                request_id, dev_id, day.isoformat(),
+                                "DEVICE_OFFLINE" if offline else "SD_STATUS_TIMEOUT", len(camera["clips"]),
                             )
                         else:
                             LOGGER.exception(
@@ -936,8 +955,8 @@ class TuyaRecordingsClient:
                         camera["catalogErrorCount"] = failure_count
                         camera["catalogRetryAfter"] = retry_after.isoformat()
                         camera["bridgeStatus"] = {
-                            "error": "" if offline else str(error),
-                            "status": "offline" if offline else "error",
+                            "error": "" if unavailable else str(error),
+                            "status": unavailable or "error",
                             "listedCount": len(camera["clips"]),
                             "retryAfter": camera["catalogRetryAfter"],
                         }
@@ -1332,7 +1351,8 @@ class TuyaRecordingsClient:
 
     def _sync_recordings(self, cancellation: Cancellation, deadline: Deadline) -> dict[str, Any]:
         result = {"enabled": self.media_sync_enabled, "downloaded": 0, "skipped": 0, "failed": 0, "deferred": 0,
-                  "deleted_videos": 0, "deleted_thumbnails": 0, "recovered_partials": 0, "stalled_cameras": []}
+                  "deleted_videos": 0, "deleted_thumbnails": 0, "recovered_partials": 0, "stalled_cameras": [],
+                  "unavailable_cameras": []}
         if self.cloud_activity_paused:
             result.update(enabled=False, paused=True)
             self._set_media_sync_status("paused", last_result=result)
@@ -1354,6 +1374,22 @@ class TuyaRecordingsClient:
             result["recovered_partials"] = self._recover_interrupted_media_sync()
             with camera_work_scope(deadline):
                 index = self.refresh_recent_recordings()
+            unavailable_cameras = {
+                str(camera["devId"]) for camera in index.get("cameras", [])
+                if camera.get("devId") and (
+                    camera.get("bridgeStatus", {}).get("status") in {"offline", "not_responding"}
+                    or (camera.get("online") is False and camera.get("bridgeStatus", {}).get("status") != "ready")
+                )
+            }
+            result["unavailable_cameras"] = sorted(unavailable_cameras)
+
+            def defer_camera(dev_id: str, status: str) -> None:
+                unavailable_cameras.add(dev_id)
+                result["unavailable_cameras"] = sorted(unavailable_cameras)
+                with self._refresh_lock:
+                    self._set_camera_catalog_status(dev_id, status)
+                self._set_media_sync_status("running", unavailable_cameras=sorted(unavailable_cameras),
+                                            deferred=result["deferred"])
             check_cancelled()
             # Catalog failures must not consume the transfer's time allowance.
             deadline = Deadline(MEDIA_SYNC_CAMERA_PASS_TIMEOUT)
@@ -1370,7 +1406,8 @@ class TuyaRecordingsClient:
                 for dev_id, clip in clips if cutoff is None or int(clip["end"]) >= cutoff
             }
             self._set_media_sync_status("running", downloaded=0, skipped=0, failed=0, deferred=0,
-                                        total=len(desired_clips), current=None, last_error=None)
+                                        total=len(desired_clips), current=None, last_error=None,
+                                        unavailable_cameras=sorted(unavailable_cameras))
             newest_sync_end = int(time.time()) - MEDIA_SYNC_MIN_CLIP_AGE
             attempts: dict[str, int] = {}
             for position, (dev_id, clip) in enumerate(clips, start=1):
@@ -1390,8 +1427,10 @@ class TuyaRecordingsClient:
                     failures_changed |= self._media_failures.pop(key, None) is not None
                     result["skipped"] += 1
                     continue
-                if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
+                if dev_id in unavailable_cameras or CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
                     result["deferred"] += 1
+                    if dev_id not in unavailable_cameras:
+                        defer_camera(dev_id, "not_responding")
                     LOGGER.debug("Media Sync deferred recording for %s during SD-status cooldown", dev_id)
                     continue
                 failed_at = self._media_failures.get(key)
@@ -1416,12 +1455,19 @@ class TuyaRecordingsClient:
                 except CameraWorkBusy:
                     if CAMERA_COMMANDS.wake_report_on_cooldown(dev_id):
                         result["deferred"] += 1
+                        defer_camera(dev_id, "not_responding")
                         continue
                     raise
                 except (CameraWorkCancelled, TuyaRecordingsAuthError):
                     raise
                 except Exception as exc:
                     check_cancelled()
+                    unavailable = _camera_unavailable_status(exc)
+                    if unavailable:
+                        result["deferred"] += 1
+                        defer_camera(dev_id, unavailable)
+                        LOGGER.info("Media Sync deferred unavailable camera %s reason=%s", dev_id, unavailable)
+                        continue
                     attempts[dev_id] = attempts.get(dev_id, 0) + 1
                     self._media_failures[key] = time.time()
                     failures_changed = True
@@ -1434,7 +1480,7 @@ class TuyaRecordingsClient:
                 failures_changed = True
                 result["downloaded"] += 1
             check_cancelled()
-            if desired_clips and not result["failed"] and not result["deferred"]:
+            if desired_clips and not result["failed"] and not result["deferred"] and not unavailable_cameras:
                 result.update(self.cleanup_cached_media(desired_clips, cutoff))
         except CameraWorkCancelled:
             result["cancelled"] = True
@@ -1451,12 +1497,13 @@ class TuyaRecordingsClient:
             if failures_changed:
                 self._store_media_failures()
 
-        if result["deferred"] and not result["failed"] and state == "idle":
+        if (result["deferred"] or result["unavailable_cameras"]) and not result["failed"] and state == "idle":
             state = "deferred"
         self._set_media_sync_status(state, downloaded=result["downloaded"], skipped=result["skipped"], deferred=result["deferred"],
                                     failed=result["failed"], current=None,
                                     deleted_videos=result["deleted_videos"], deleted_thumbnails=result["deleted_thumbnails"],
                                     recovered_partials=result["recovered_partials"],
+                                    unavailable_cameras=result["unavailable_cameras"],
                                     stalled_cameras=result["stalled_cameras"], last_result=result)
         return result
 
@@ -1995,3 +2042,17 @@ def _parse_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _camera_unavailable_status(error: BaseException) -> str:
+    """Classify explicit camera evidence, never infer power loss from silence."""
+    seen = set()
+    cause: BaseException | None = error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, NativeGatewayDeviceOfflineError):
+            return "offline"
+        if isinstance(cause, NativeSdStatusTimeout):
+            return "not_responding"
+        cause = cause.__cause__
+    return ""

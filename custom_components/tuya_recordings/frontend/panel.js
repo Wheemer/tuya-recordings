@@ -1,4 +1,4 @@
-const PANEL_BUILD = "20261114-private-cache-35";
+const PANEL_BUILD = "20261114-camera-availability-37";
 
 class TuyaRecordingsPanel extends HTMLElement {
   constructor() {
@@ -645,7 +645,7 @@ class TuyaRecordingsPanel extends HTMLElement {
           <label>
             Camera
             <select id="camera" ${cameras.length === 0 || this.loading ? "disabled" : ""}>
-              ${cameras.map((item) => `<option value="${this.escape(item.dev_id)}" ${item.dev_id === this.selectedCamera ? "selected" : ""}>${this.escape(item.name)}${item.online === false ? " (Offline)" : ""}</option>`).join("")}
+              ${cameras.map((item) => `<option value="${this.escape(item.dev_id)}" ${item.dev_id === this.selectedCamera ? "selected" : ""}>${this.escape(item.name)}${this.cameraAvailability(item) === "offline" ? " (Offline)" : this.cameraAvailability(item) === "not_responding" ? " (Not responding)" : ""}</option>`).join("")}
             </select>
           </label>
           ${this.data?.on_demand ? `<div class="field date-field">
@@ -1080,10 +1080,20 @@ class TuyaRecordingsPanel extends HTMLElement {
     if (this.loading && !this.data) return "";
     const failed = this.data?.catalog_refresh_failed;
     if (!camera) return failed ? "Could not refresh camera inventory" : "No camera selected";
+    const availability = this.cameraAvailability(camera);
+    if (availability === "offline" || availability === "not_responding") {
+      return `${clipCount} recording${clipCount === 1 ? "" : "s"} • Camera ${availability === "offline" ? "offline" : "not responding"} • Showing last known recordings`;
+    }
     const online = camera.online === true ? "online" : "status unknown";
     const refresh = this.data?.catalog_refresh_pending ? " • Updating recordings"
       : failed ? " • Could not refresh recordings" : "";
     return `${clipCount} recording${clipCount === 1 ? "" : "s"} • Camera ${online}${refresh}`;
+  }
+
+  cameraAvailability(camera) {
+    if (camera?.catalog_status === "ready") return "available";
+    if (["offline", "not_responding"].includes(camera?.catalog_status)) return camera.catalog_status;
+    return camera?.online === false ? "offline" : "unknown";
   }
 
   async signVisibleClips() {
@@ -1576,6 +1586,11 @@ class TuyaRecordingsPanel extends HTMLElement {
     const state = String(sync?.state || sync?.status || "idle").toLowerCase();
     const failed = Number(sync?.failed) || 0;
     if (failed > 0) return `${this.formatNumber(failed)} clip${failed === 1 ? "" : "s"} need another try`;
+    const unavailable = sync?.unavailable_cameras?.length || 0;
+    if (unavailable) {
+      return state === "running" ? "Syncing available cameras"
+        : `Waiting for ${this.formatNumber(unavailable)} unavailable camera${unavailable === 1 ? "" : "s"}`;
+    }
     if (state === "running") return "Syncing new videos";
     if (state === "deferred") return "Waiting for camera cooldown";
     if (state === "stalled") return "Sync needs attention";
