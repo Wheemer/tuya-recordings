@@ -174,7 +174,7 @@ def media(data, codec, timestamp, *, audio=False):
 @pytest.mark.parametrize("fragment_reset", [False, True])
 @pytest.mark.parametrize("separate_headers", [False, True])
 @pytest.mark.parametrize("via_sync", [False, True])
-def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, monkeypatch, audio_codec, width, fragment_reset, separate_headers, via_sync):
+def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(tmp_path, monkeypatch, audio_codec, width, fragment_reset, separate_headers, via_sync, leading_pictures=False):
     import hashlib
     path = tmp_path / "bframes.h264"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
@@ -207,6 +207,17 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
             write_events(muxer)
 
     def write_events(muxer):
+        if leading_pictures:
+            from custom_components.tuya_recordings.lib.native_mux import _h264_nals
+            unconfigured = leading_pictures == "unconfigured"
+            if not unconfigured:
+                muxer.handle_event(media(headers, "h264", 99800))
+            data = (b"".join(b"\x00\x00\x00\x01" + nal for nal in _h264_nals(packets[0][0])
+                             if nal[0] & 0x1f not in {7, 8}) if unconfigured else packets[1][0])
+            leading = media(data, "h264", 99900)
+            leading["payload"]["info"]["isKeyFrame"] = unconfigured
+            muxer.handle_event(leading)
+            muxer.handle_event(media(audio[:800 * width], audio_codec, 99900, audio=True))
         for index, (packet, keyframe) in enumerate(packets):
             stamp = 100000 + index * 100 + (60000 if fragment_reset and index >= 10 else 0)
             if separate_headers and keyframe:
@@ -264,6 +275,38 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
         assert seeked[-10:] == expected[-10:]
 
 
+@pytest.mark.parametrize("via_sync", [False, True])
+@pytest.mark.parametrize("leading", [True, "unconfigured"])
+def test_cached_picture_order_uses_index_not_raw_demux(tmp_path, monkeypatch, via_sync, leading):
+    original = av.open
+
+    class RawVideo:
+        def __init__(self, source):
+            self.source = source
+
+        def __enter__(self):
+            self.source.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.source.__exit__(*args)
+
+        @property
+        def streams(self):
+            return self.source.streams
+
+        def demux(self, *args, **kwargs):
+            raise AssertionError("Raw H264 must not redefine indexed camera picture boundaries")
+
+    def open_source(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        return RawVideo(result) if str(path).endswith(".video.h264") else result
+
+    monkeypatch.setattr(av, "open", open_source)
+    test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
+        tmp_path, monkeypatch, "g711u", 1, True, True, via_sync, leading_pictures=leading)
+
+
 @pytest.mark.parametrize("codec,expected,width", [
     ("pcm_s16le", "pcm_s16le", 2), ("g711u", "pcm_mulaw", 1), ("g711a", "pcm_alaw", 1),
 ])
@@ -286,15 +329,19 @@ def test_cache_preserves_raw_audio_and_uneven_video_clock(tmp_path, encoded_vide
         assert result.streams.video[0].codec_context.name == "h264"
         packets = [packet for packet in result.demux() if packet.size]
         times = [float(packet.pts * packet.time_base) for packet in packets if packet.stream.type == "video"]
-        assert times == pytest.approx([0.1, 0.28, 0.51, 0.7, 0.94], abs=0.001)
-        assert b"".join(bytes(packet) for packet in packets if packet.stream.type == "audio") == audio
+        # Like Mp4RecorderProxy, the recorder starts at the first I-frame,
+        # discarding audio delivered before video configuration is ready.
+        assert times == pytest.approx([0, 0.18, 0.41, 0.6, 0.84], abs=0.001)
+        retained_audio = b"".join(payload for stamp, payload, is_audio in sorted(events, key=lambda row: row[0])
+                                  if is_audio and stamp >= 100)
+        assert b"".join(bytes(packet) for packet in packets if packet.stream.type == "audio") == retained_audio
     # The final client fast-start step must preserve these codecs too.
     final = tmp_path / "final.mp4"
     finalize_mp4_for_browser(output, final)
     with av.open(str(final)) as result:
         assert result.streams.audio[0].codec_context.name == expected
         final_times = [float(packet.pts * packet.time_base) for packet in result.demux(video=0) if packet.size]
-        assert final_times == pytest.approx([0.1, 0.28, 0.51, 0.7, 0.94], abs=0.001)
+        assert final_times == pytest.approx([0, 0.18, 0.41, 0.6, 0.84], abs=0.001)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--autoplay-policy=no-user-gesture-required"])
         try:

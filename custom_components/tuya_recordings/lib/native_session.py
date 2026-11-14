@@ -290,6 +290,11 @@ class NativeCameraSessionConfig:
         return 2 if self.local_storage & 134217728 else 0
 
     @property
+    def playback_catalog_paginated(self) -> bool:
+        """PlayBackDataQueryHelper selects the page overload for legacy events."""
+        return self.event_catalog_supported and not self.event_catalog_v2
+
+    @property
     def signaling_local_id(self) -> str:
         """Return the identity supplied to the APK P2P initializer."""
         value = self.local_id or self.app_uid

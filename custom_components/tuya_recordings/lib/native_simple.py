@@ -128,6 +128,41 @@ def encode_catalog_request(
     return _command(request_id, 0, 3, low_command, payload)
 
 
+def encode_paged_catalog_request(*, request_id: int, channel: int, day: date, page: int) -> bytes:
+    """ThingCameraSimple::GetRecordFragmentsByDayAndPageId (3/2)."""
+    _uint32("request_id", request_id)
+    _non_negative("channel", channel)
+    _non_negative("page", page)
+    if not isinstance(day, date):
+        raise NativeSimpleError("Catalog day must be a date")
+    return _command(request_id, 0, 3, 2,
+                    struct.pack("<64x5I", channel, day.year, day.month, day.day, page))
+
+
+def decode_paged_catalog_reply(command: NativeSimpleCommand, *, request_id: int) -> NativeV4CatalogPage:
+    """Read the SDK's page metadata at 0x50 and packed ranges at 0x60."""
+    if command.request_id != request_id or command.control != 1:
+        raise NativeSimpleError("Paged catalog response does not match the request")
+    payload = command.payload
+    if len(payload) < 0x60:
+        raise NativeSimpleError("Paged catalog header is truncated")
+    page, total, size, count = struct.unpack_from("<4I", payload, 0x50)
+    if (total > _MAX_CATALOG_ITEMS or count > total or not 0 <= size <= _MAX_CATALOG_ITEMS
+            or (total > 0 and size == 0)
+            or count > size or len(payload) < 0x60 + count * _CATALOG_ENTRY.size):
+        raise NativeSimpleError("Paged catalog size or count is invalid")
+    pages = max(1, (total + size - 1) // size) if size else 1
+    if page >= pages:
+        raise NativeSimpleError("Paged catalog page is invalid")
+    items = []
+    for offset in range(0x60, 0x60 + count * _CATALOG_ENTRY.size, _CATALOG_ENTRY.size):
+        packed, start, end = _CATALOG_ENTRY.unpack_from(payload, offset)
+        if end > start:
+            items.append(NativeV4Recording(start_time=start, end_time=end,
+                video_type=packed & 0xffff, event_type=packed >> 16).validate())
+    return NativeV4CatalogPage(request_id, 0, "", pages, total, page + 1, tuple(items))
+
+
 def encode_recording_month_request(*, request_id: int, channel: int, month: date) -> bytes:
     """GetRecordDaysByMonth: channel, year, month, reserved zero (3/0)."""
     _uint32("request_id", request_id)

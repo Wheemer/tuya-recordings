@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 import struct
 import subprocess
@@ -25,6 +26,8 @@ from .native_packet_cache import (
     MAX_PACKET_BYTES, PACKET_HEADER, NativePresentationClock, TimestampedVideoMuxer,
     TimestampedAacMuxer, mux_camera_packets,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class NativeMuxError(RuntimeError):
@@ -129,6 +132,7 @@ class NativePlaybackMuxer:
     _started: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
     _pending_video_headers: bytes = field(default=b"", init=False, repr=False)
+    _waiting_for_keyframe_logged: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.output_path = Path(self.output_path)
@@ -173,6 +177,7 @@ class NativePlaybackMuxer:
         self._audio_bytes = 0
         self._audio_format = ("", 0, 0)
         self._origin = None
+        self._waiting_for_keyframe_logged = False
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event = validate_playback_frame_event(event, protocol=self.protocol)
@@ -205,6 +210,8 @@ class NativePlaybackMuxer:
             raise NativeMuxError("Native playback emitted no audio packets")
         assert self._origin is not None
         codec, rate, channels = self._audio_format
+        _LOGGER.debug("Native cached packets collected: recording=%s video_bytes=%s audio_bytes=%s audio_codec=%s",
+                      self.output_path.name, self._video_bytes, self._audio_bytes, codec)
         try:
             mux_camera_packets(self._video_path, self._audio_path, self._packet_path,
                 self._temp_path, audio_codec=codec, sample_rate=rate, channels=channels,
@@ -226,16 +233,33 @@ class NativePlaybackMuxer:
         if codec in {"h264", "avc"}:
             if len(self._pending_video_headers) + len(data) > MAX_PACKET_BYTES:
                 raise NativeMuxError("Native cached video headers exceed packet limit")
-            _append_bytes(self._video_path, data)
             if _h264_metadata_only(data):
+                _append_bytes(self._video_path, data)
                 self._pending_video_headers += data
                 return
+            nals = _h264_nals(self._pending_video_headers + data)
+            nal_types = {nal[0] & 0x1f for nal in nals if not nal[0] & 0x80}
+            keyframe = bool(info.get("isKeyFrame")) or 5 in nal_types
+            if self._video_bytes == 0 and not (keyframe and {7, 8} <= nal_types and nal_types & {1, 2, 3, 4, 5}):
+                # Mp4RecorderProxy::WriteVideoPacket waits for its first I-frame.
+                # FindExtraDataForH264 must also find SPS and PPS before the
+                # recorder accepts audio. A keyframe flag alone is not ready.
+                self._pending_video_headers += _h264_parameter_sets(data)
+                if not self._waiting_for_keyframe_logged:
+                    _LOGGER.debug("Native cached video waiting for decoder configuration: recording=%s bytes=%s keyframe=%s sps=%s pps=%s",
+                                  self.output_path.name, len(data), keyframe, 7 in nal_types, 8 in nal_types)
+                    self._waiting_for_keyframe_logged = True
+                return
+            _append_bytes(self._video_path, data)
             data = self._pending_video_headers + data
             self._pending_video_headers = b""
             self._video_bytes += len(data)
-            self._record_packet(1, data, info)
+            self._record_packet(1, data, {**info, "isKeyFrame": keyframe})
             return
         if codec in {"aac", "mpeg4-generic", "pcm_s16le", "g711u", "g711a"}:
+            if self._video_bytes == 0:
+                # WriteAudioFrame also waits for the recorder's video-ready flag.
+                return
             if codec in {"aac", "mpeg4-generic"}:
                 codec = "aac"
                 data = _aac_with_adts(data, info)

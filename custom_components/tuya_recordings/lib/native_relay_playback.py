@@ -71,10 +71,12 @@ from .native_simple import (
     NativeSimpleCommandDecoder,
     NativeSimpleError,
     decode_catalog_reply,
+    decode_paged_catalog_reply,
     decode_event_catalog_reply,
     decode_thumbnail_reply,
     encode_audio_open,
     encode_catalog_request,
+    encode_paged_catalog_request,
     encode_recording_month_request,
     decode_recording_month_reply,
     encode_event_catalog_request,
@@ -1238,6 +1240,11 @@ class NativeRelayPlaybackSession:
         self._require_connected()
         if self._playback_started:
             raise NativeRelayPlaybackError("Catalog cannot run after playback starts")
+        _LOGGER.debug("Native day catalog request: dev=%s day=%s local_storage=%s paginated=%s version=%s",
+                      self._native_config.dev_id, day, self._native_config.local_storage,
+                      self._native_config.playback_catalog_paginated, self._native_config.playback_catalog_version)
+        if self._native_config.playback_catalog_paginated:
+            return await self._query_paged_recordings(day)
         request_id = self._allocate_request_id()
         version = self._native_config.playback_catalog_version
         self._send_control(
@@ -1254,13 +1261,49 @@ class NativeRelayPlaybackSession:
             if command.request_id != request_id:
                 continue
             try:
-                return decode_catalog_reply(
+                page = decode_catalog_reply(
                     command, request_id=request_id, version=version
                 )
+                _LOGGER.debug("Native day catalog result: dev=%s day=%s version=%s bytes=%s fragments=%s",
+                              self._native_config.dev_id, day, version, len(command.payload), len(page.items))
+                return page
             except NativeSimpleError as err:
                 raise NativeRelayPlaybackError(
                     f"Camera returned an invalid catalog reply: {err}"
                 ) from err
+
+    async def _query_paged_recordings(self, day: date) -> NativeV4CatalogPage:
+        items = []
+        totals = None
+        async with asyncio.timeout(15):
+            for index in range(1024):
+                request = self._allocate_request_id()
+                self._send_control(encode_paged_catalog_request(request_id=request, channel=0, day=day, page=index))
+                while True:
+                    command = await self._receive_or_transport_failure(self._control_messages)
+                    if command.request_id == request:
+                        break
+                try:
+                    page = decode_paged_catalog_reply(command, request_id=request)
+                except NativeSimpleError as err:
+                    raise NativeRelayPlaybackError(f"Camera returned an invalid paged catalog reply: {err}") from err
+                wire_count = struct.unpack_from("<I", command.payload, 0x5c)[0]
+                _LOGGER.debug("Native day catalog result: dev=%s day=%s route=paged page=%s total=%s bytes=%s wire_count=%s fragments=%s",
+                              self._native_config.dev_id, day, index, page.total_files,
+                              len(command.payload), wire_count, len(page.items))
+                current = (page.total_pages, page.total_files)
+                if (page.total_pages > 1024 or page.page != index + 1
+                        or (totals is not None and totals != current)):
+                    raise NativeRelayPlaybackError("Paged catalog metadata changed during collection")
+                totals = current
+                items.extend(page.items)
+                if len(items) > page.total_files:
+                    raise NativeRelayPlaybackError("Paged catalog exceeds reported total")
+                if page.page == page.total_pages:
+                    return NativeV4CatalogPage(request, 0, "", 1, len(items), 1, tuple(items))
+                if wire_count == 0:
+                    raise NativeRelayPlaybackError("Paged catalog made no progress")
+        raise NativeRelayPlaybackError("Paged catalog exceeded page limit")
 
     async def query_recording_days(self, month: date) -> list[date]:
         """Query one month bitmap on the same serialized metadata session."""

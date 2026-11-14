@@ -110,3 +110,34 @@ def test_missing_ffprobe_does_not_mark_invalid_media_ready(monkeypatch, tmp_path
     with pytest.raises(RuntimeError, match="Could not inspect"):
         finalize_mp4_for_browser(source, output)
     assert not output.exists()
+
+
+@pytest.mark.parametrize("stage", ["before_finalization", "after_finalization"])
+def test_audio_only_failure_identifies_stage_and_never_publishes(monkeypatch, tmp_path, stage, caplog):
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "clip.mp4"
+    temp = output.with_suffix(".faststart.tmp.mp4")
+    source.write_bytes(b"intermediate recording")
+    probes = 0
+    copies = []
+
+    def run(command, **kwargs):
+        nonlocal probes
+        if command[0] == "ffmpeg":
+            assert command[command.index("-c") + 1] == "copy"
+            copies.append(command)
+            temp.write_bytes(b"audio-only output")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        probes += 1
+        types = ('{"codec_type":"audio","codec_name":"pcm_mulaw"}'
+                 if stage == "before_finalization" or probes == 2 else
+                 '{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"pcm_mulaw"}')
+        return SimpleNamespace(returncode=0, stdout='{"streams":[' + types + ']}', stderr="")
+
+    monkeypatch.setattr("custom_components.tuya_recordings.lib.ffmpeg.subprocess.run", run)
+    with caplog.at_level("DEBUG", logger="custom_components.tuya_recordings.lib.ffmpeg"):
+        with pytest.raises(RuntimeError, match=f"video_stream=False audio_stream=True stage={stage}"):
+            finalize_mp4_for_browser(source, output)
+    assert len(copies) == (stage == "after_finalization")
+    assert f"stage={stage}" in caplog.text
+    assert not temp.exists() and not output.exists()

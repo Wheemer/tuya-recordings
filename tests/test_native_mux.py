@@ -17,6 +17,8 @@ from custom_components.tuya_recordings.lib.native_mux import (
     NativePlaybackMuxer,
 )
 
+H264_CONFIGURED_PICTURE = b"\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x01\x65picture"
+
 
 def event(frame_type, payload=b"", info=None):
     return playback_frame_event(
@@ -54,7 +56,7 @@ def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path, monkeypatch)
     output = tmp_path / "clip.mp4"
     with NativePlaybackMuxer(output) as muxer:
         muxer.handle_event(event(NativePlaybackFrameType.STARTED))
-        muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"h264", media_info("h264", 27, key_frame=True)))
+        muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, H264_CONFIGURED_PICTURE, media_info("h264", 27, key_frame=True)))
         muxer.handle_event(
             event(
                 NativePlaybackFrameType.MEDIA_CODEC,
@@ -65,7 +67,7 @@ def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path, monkeypatch)
         muxer.handle_event(event(NativePlaybackFrameType.FINISHED))
 
     assert output.read_bytes() == b"mp4"
-    assert received[0][0] == b"h264"
+    assert received[0][0] == H264_CONFIGURED_PICTURE
     assert received[0][1].endswith(b"aac")
     assert received[0][3]["audio_codec"] == "aac"
     assert not output.with_suffix(".packets.tmp").exists()
@@ -76,7 +78,7 @@ def test_native_muxer_remuxes_raw_video_and_audio_packets(tmp_path, monkeypatch)
 def test_native_muxer_rejects_decoded_frames_for_no_transcoding_path(tmp_path):
     muxer = NativePlaybackMuxer(tmp_path / "clip.mp4")
     muxer.open()
-    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"h264", media_info("h264", 27, key_frame=True)))
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, H264_CONFIGURED_PICTURE, media_info("h264", 27, key_frame=True)))
     with pytest.raises(NativeMuxError, match="decoded frames"):
         muxer.handle_event(
             event(
@@ -91,7 +93,7 @@ def test_native_muxer_rejects_decoded_frames_for_no_transcoding_path(tmp_path):
 def test_native_muxer_requires_audio_by_default(tmp_path):
     muxer = NativePlaybackMuxer(tmp_path / "clip.mp4")
     muxer.open()
-    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"h264", media_info("h264", 27, key_frame=True)))
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, H264_CONFIGURED_PICTURE, media_info("h264", 27, key_frame=True)))
     with pytest.raises(NativeMuxError, match="no audio"):
         muxer.finish()
     muxer.cleanup()
@@ -108,6 +110,7 @@ def test_native_muxer_rejects_unknown_raw_packet_codec(tmp_path):
 def test_native_muxer_rejects_raw_aac_without_audio_metadata(tmp_path):
     muxer = NativePlaybackMuxer(tmp_path / "clip.mp4")
     muxer.open()
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, H264_CONFIGURED_PICTURE, media_info("h264", 1, key_frame=True)))
     with pytest.raises(NativeMuxError, match="sampleRate"):
         muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, b"aac", media_info("aac", 86018)))
     muxer.cleanup()
@@ -116,6 +119,32 @@ def test_native_muxer_rejects_raw_aac_without_audio_metadata(tmp_path):
 def test_native_stream_muxer_requires_posix_pipes():
     with pytest.raises(NativeMuxError, match="POSIX pipes"):
         NativePlaybackFmp4StreamMuxer(lambda chunk: None, pipe_factory=None).open()
+
+
+def test_cache_never_accepts_audio_before_sps_pps_even_with_keyframe_flag(tmp_path):
+    output = tmp_path / "clip.mp4"
+    with pytest.raises(NativeMuxError, match="no video packets"):
+        with NativePlaybackMuxer(output) as muxer:
+            muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC,
+                b"\x00\x00\x01\x65picture", media_info("h264", 27, key_frame=True)))
+            muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC,
+                b"aac", media_info("aac", 86018, sample_rate=8000, channels=1)))
+            assert muxer._video_bytes == 0 and muxer._audio_bytes == 0
+    assert not output.exists()
+    assert not list(tmp_path.glob("*.tmp*"))
+
+
+def test_cached_idr_without_keyframe_flag_is_indexed_as_seekable(tmp_path):
+    from custom_components.tuya_recordings.lib.native_packet_cache import PACKET_HEADER
+    muxer = NativePlaybackMuxer(tmp_path / "clip.mp4")
+    muxer.open()
+    try:
+        muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC,
+            H264_CONFIGURED_PICTURE, media_info("h264", 27, key_frame=False)))
+        kind, flags, *_ = PACKET_HEADER.unpack_from(muxer._packet_path.read_bytes())
+        assert kind == 1 and flags == 1
+    finally:
+        muxer.cleanup()
 
 
 def test_browser_stream_reader_emits_a_small_fragment_without_waiting_for_64k():
