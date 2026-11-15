@@ -21,6 +21,36 @@ from custom_components.tuya_recordings.lib.commands import (
 )
 
 
+def test_cache_timer_joins_bounded_backfill_before_downloads(monkeypatch):
+    client = TuyaRecordingsClient({"media_sync_enabled": True})
+    entry = SimpleNamespace(entry_id="entry")
+    hass = SimpleNamespace(data={DOMAIN: {"entry": {"client": client}}})
+    callbacks = []
+    calls = []
+    monkeypatch.setattr(integration, "_client_recording_backend_available", lambda client: True)
+    monkeypatch.setattr(integration, "async_track_time_interval",
+                        lambda hass, callback, interval: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(integration, "async_call_later", lambda *args: lambda: None)
+
+    async def catalog(hass, entry_id, reason, *, wait):
+        assert wait is True
+        assert not ON_DEMAND_DAY_CATALOG.get() and not ON_DEMAND_OFFER_RETRIES.get()
+        calls.append("catalog")
+        await asyncio.sleep(0)
+        calls.append("catalog_done")
+
+    async def transfer(*args, **kwargs):
+        assert kwargs["refresh_catalog"] is False
+        calls.append("transfer")
+
+    monkeypatch.setattr(integration, "_async_request_catalog_refresh", catalog)
+    monkeypatch.setattr(integration, "_async_request_camera_work", transfer)
+    integration._async_schedule_media_sync(hass, entry)
+    assert len(callbacks) == 1
+    asyncio.run(callbacks[0](None))
+    assert calls == ["catalog", "catalog_done", "transfer"]
+
+
 def test_startup_registers_cached_playback_view_once():
     registered = []
     hass = SimpleNamespace(data={}, http=SimpleNamespace(register_view=registered.append))
