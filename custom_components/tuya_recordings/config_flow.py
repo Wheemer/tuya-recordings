@@ -17,6 +17,7 @@ from .const import (
     CONF_ALERT_RESET_SECONDS,
     CONF_APP_PROFILE,
     CONF_CATALOG_SYNC_MINUTES,
+    CONF_CAMERA_ORDER,
     CONF_DEVICE_INVENTORY,
     CONF_DEVICE_WAKE_CAPABILITIES,
     CONF_DEVICE_LOCAL_KEYS,
@@ -381,6 +382,13 @@ def _options_schema(
     )
     retention_hours = user_input.get(CONF_MEDIA_RETENTION_HOURS,
         options.get(CONF_MEDIA_RETENTION_HOURS, data.get(CONF_MEDIA_RETENTION_HOURS, media_sync_hours)))
+    camera_order = user_input.get(CONF_CAMERA_ORDER,
+        options.get(CONF_CAMERA_ORDER, data.get(CONF_CAMERA_ORDER, [])))
+    camera_inventory = data.get(CONF_DEVICE_INVENTORY) or {}
+    camera_choices = [{"value": dev_id, "label": str(name or dev_id)}
+                      for dev_id, name in camera_inventory.items() if isinstance(dev_id, str) and dev_id]
+    camera_choices.extend({"value": dev_id, "label": f"{dev_id} (not currently listed)"}
+                          for dev_id in camera_order if dev_id not in camera_inventory)
     recordings_order = user_input.get(
         CONF_MEDIA_VIEW_RECORDINGS_ORDER,
         options.get(
@@ -430,6 +438,9 @@ def _options_schema(
                 selector.SelectSelectorConfig(
                     options=MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS
                 )
+            ),
+            vol.Required(CONF_CAMERA_ORDER, default=camera_order): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=camera_choices, multiple=True, sort=False)
             ),
             vol.Required(
                 CONF_MEDIA_SYNC_ENABLED, default=media_sync_enabled

@@ -21,6 +21,7 @@ from .const import (
     CONF_DEVICE_WAKE_CAPABILITIES,
     WAKE_CAPABILITIES,
     CONF_CATALOG_SYNC_MINUTES,
+    CONF_CAMERA_ORDER,
     CONF_CLOUD_ACTIVITY_PAUSED,
     CONF_LOOKBACK_DAYS,
     CONF_MEDIA_STORAGE_PATH,
@@ -322,6 +323,8 @@ class TuyaRecordingsClient:
         self.media_sync_enabled = bool(entry_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
         self.thumbnail_sync_enabled = bool(entry_data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED))
         self.media_sync_hours = int(entry_data.get(CONF_MEDIA_SYNC_HOURS, 0) or 0)
+        order = entry_data.get(CONF_CAMERA_ORDER, [])
+        self.camera_order = list(dict.fromkeys(dev_id for dev_id in order if isinstance(dev_id, str) and dev_id)) if isinstance(order, list) else []
         # Preserve bounded legacy caching, while allowing retention to be
         # configured independently once the explicit option is saved.
         self.media_retention_hours = int(entry_data.get(CONF_MEDIA_RETENTION_HOURS, self.media_sync_hours) or 0)

@@ -130,6 +130,12 @@ After setup, **Configure** on the Tuya Recordings integration provides:
   the recording's end time, measured from the current time. `0` keeps them
   indefinitely. This is separate from the download window.
 - **Private video storage path** and **Recording order**.
+- **Camera order**: arrange the full list using **Reorder cameras** in the panel
+  toolbar. The saved order applies to that account across
+  browsers; its first camera is selected when opening the panel. New cameras
+  follow the saved list, while removed cameras are ignored. Changing cameras
+  during use is respected; refreshes do not switch you back. Clearing the Camera
+  order in Configure restores automatic selection of an available camera.
 - **Detection reset time** for the motion and person binary sensors.
 
 Changing the storage path takes effect immediately and does not move existing
@@ -225,6 +231,7 @@ and ordinary motion/person automations.
 | Service | Purpose |
 | --- | --- |
 | `tuya_recordings.refresh_recordings` | Refresh the SD-card recording catalog. |
+| `tuya_recordings.set_camera_order` | Save an account's panel camera order without changing playback or download priority. An empty list restores automatic order. |
 | `tuya_recordings.sync_media` | Download recordings when pre-cache is enabled. |
 | `tuya_recordings.populate_thumbnails` | Populate missing thumbnails for cached recordings. |
 | `tuya_recordings.clear_cache` | Clear the recording index. |

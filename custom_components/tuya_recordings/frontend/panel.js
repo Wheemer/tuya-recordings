@@ -1,4 +1,4 @@
-const PANEL_BUILD = "20261115-local-retention-41";
+const PANEL_BUILD = "20261115-camera-order";
 
 class TuyaRecordingsPanel extends HTMLElement {
   constructor() {
@@ -24,6 +24,9 @@ class TuyaRecordingsPanel extends HTMLElement {
     this.catalogRefreshTimer = null;
     this.calendarOpen = false;
     this.calendarMonth = "";
+    this.cameraOrderDraft = null;
+    this.cameraOrderSaving = false;
+    this.cameraOrderError = "";
     this.timeline = null;
     this.pendingTimelineRender = false;
     this.handleRouteChange = async () => {
@@ -153,7 +156,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       const cameras = data.cameras || [];
       if (!this.selectedCamera || !cameras.some((camera) => camera.dev_id === this.selectedCamera)) {
         const available = cameras.filter((camera) => camera.online !== false);
-        const initial = available.find((camera) =>
+        const initial = cameras.find(camera => camera.dev_id === data.camera_order?.[0]) || available.find((camera) =>
           camera.recording_ranges?.length || camera.clips?.length || camera.dates?.length
         ) || available[0] || cameras[0];
         this.selectedCamera = initial?.dev_id || "";
@@ -536,6 +539,15 @@ class TuyaRecordingsPanel extends HTMLElement {
           padding: 12px 64px 12px 14px;
         }
         .local-delete { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-actions .icon-button { flex: 0 0 44px; }
+        .camera-order-dialog { box-sizing: border-box; width: min(420px, calc(100vw - 32px)); max-height: 80dvh; border: 1px solid var(--divider-color); border-radius: 8px; padding: 20px; background: var(--card-background-color, white); color: var(--primary-text-color); }
+        .camera-order-dialog::backdrop { background: rgb(0 0 0 / 45%); }
+        .camera-order-dialog h2 { margin: 0 0 16px; font-size: 20px; }
+        .camera-order-dialog ol { box-sizing: border-box; margin: -6px; padding: 6px; list-style: none; max-height: 50dvh; overflow-y: auto; }
+        .camera-order-dialog li { display: grid; grid-template-columns: minmax(0, 1fr) 44px 44px; align-items: center; gap: 6px; padding: 6px 0; border-bottom: 1px solid var(--divider-color); }
+        .camera-order-dialog .camera-name { overflow-wrap: anywhere; }
+        .camera-order-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
         .title {
           font-size: 15px;
           font-weight: 500;
@@ -595,11 +607,11 @@ class TuyaRecordingsPanel extends HTMLElement {
             display: none;
           }
           .toolbar {
-            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 44px;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
             gap: 12px 8px;
           }
           .toolbar .status { grid-column: 1 / -1; grid-row: 2; min-height: 20px; }
-          .toolbar #refresh { grid-column: 3; grid-row: 1; }
+          .toolbar .toolbar-actions { grid-column: 3; grid-row: 1; }
           .page-heading { margin-bottom: 20px; }
           h1 { font-size: 21px; }
           .timeline-view { grid-template-columns: 1fr; gap: 0; }
@@ -664,10 +676,12 @@ class TuyaRecordingsPanel extends HTMLElement {
             </select>
           </label>`}
           <div class="status">${this.escape(this.statusText(camera, clipCount))}</div>
-          <button id="refresh" class="icon-button" type="button" title="Refresh recordings" aria-label="Refresh recordings" ${this.loading ? "disabled" : ""}><ha-icon icon="mdi:refresh"></ha-icon></button>
+          <div class="toolbar-actions"><button id="camera-order" class="icon-button" type="button" title="Reorder cameras" aria-label="Reorder cameras" ${cameras.length < 2 || this.loading ? "disabled" : ""}><ha-icon icon="mdi:sort"></ha-icon></button>
+          <button id="refresh" class="icon-button" type="button" title="Refresh recordings" aria-label="Refresh recordings" ${this.loading ? "disabled" : ""}><ha-icon icon="mdi:refresh"></ha-icon></button></div>
         </div>
         ${this.error ? `<div class="error">${this.escape(this.error)}</div>` : ""}
         ${!this.error ? this.renderBody(clips) : ""}
+        ${this.renderCameraOrderDialog()}
       </div>
     `;
     if (retainedPlayer) {
@@ -940,7 +954,68 @@ class TuyaRecordingsPanel extends HTMLElement {
     `;
   }
 
+  renderCameraOrderDialog() {
+    if (!this.cameraOrderDraft) return "";
+    return `<dialog id="camera-order-dialog" class="camera-order-dialog" aria-labelledby="camera-order-title">
+      <h2 id="camera-order-title">Camera order</h2><ol>${this.cameraOrderDraft.map((id, index) => `
+        <li><span class="camera-name">${this.escape(this.cameraName(id))}</span>
+          <button class="icon-button" type="button" data-order-index="${index}" data-order-direction="-1" title="Move up" aria-label="Move ${this.escape(this.cameraName(id))} up" ${index === 0 || this.cameraOrderSaving ? "disabled" : ""}><ha-icon icon="mdi:arrow-up"></ha-icon></button>
+          <button class="icon-button" type="button" data-order-index="${index}" data-order-direction="1" title="Move down" aria-label="Move ${this.escape(this.cameraName(id))} down" ${index === this.cameraOrderDraft.length - 1 || this.cameraOrderSaving ? "disabled" : ""}><ha-icon icon="mdi:arrow-down"></ha-icon></button></li>`).join("")}</ol>
+      ${this.cameraOrderError ? `<p role="alert">${this.escape(this.cameraOrderError)}</p>` : ""}
+      <footer><button id="camera-order-cancel" type="button" ${this.cameraOrderSaving ? "disabled" : ""}>Cancel</button>
+      <button id="camera-order-save" type="button" ${this.cameraOrderSaving ? "disabled" : ""}>Save</button></footer></dialog>`;
+  }
+
+  closeCameraOrder() {
+    if (this.cameraOrderSaving) return;
+    this.cameraOrderDraft = null;
+    this.cameraOrderError = "";
+    this.render();
+    this.shadowRoot.getElementById("camera-order")?.focus();
+  }
+
+  async saveCameraOrder() {
+    if (this.cameraOrderSaving || !this.cameraOrderDraft) return;
+    const order = [...this.cameraOrderDraft];
+    this.cameraOrderSaving = true;
+    this.cameraOrderError = "";
+    this.render();
+    try {
+      await this._hass.callService("tuya_recordings", "set_camera_order", {entry_id: this.selectedAccount, camera_order: order});
+      this.data.camera_order = order;
+      const ranks = new Map(order.map((id, index) => [id, index]));
+      this.data.cameras.sort((a, b) => (ranks.get(a.dev_id) ?? order.length) - (ranks.get(b.dev_id) ?? order.length));
+      this.cameraOrderDraft = null;
+    } catch (error) {
+      this.cameraOrderError = error?.message || "Could not save camera order";
+    } finally {
+      this.cameraOrderSaving = false;
+      this.render();
+      this.shadowRoot.getElementById(this.cameraOrderDraft ? "camera-order-save" : "camera-order")?.focus();
+    }
+  }
+
   bindEvents() {
+    this.shadowRoot.getElementById("camera-order")?.addEventListener("click", () => {
+      this.cameraOrderDraft = (this.data?.cameras || []).map(camera => camera.dev_id);
+      this.cameraOrderError = "";
+      this.render();
+    });
+    this.shadowRoot.getElementById("camera-order-cancel")?.addEventListener("click", () => this.closeCameraOrder());
+    this.shadowRoot.getElementById("camera-order-save")?.addEventListener("click", () => this.saveCameraOrder());
+    this.shadowRoot.getElementById("camera-order-dialog")?.addEventListener("cancel", event => {
+      event.preventDefault();
+      this.closeCameraOrder();
+    });
+    this.shadowRoot.querySelectorAll("[data-order-index]").forEach(button => button.addEventListener("click", () => {
+      const index = Number(button.dataset.orderIndex);
+      const next = index + Number(button.dataset.orderDirection);
+      if (this.cameraOrderSaving || !this.cameraOrderDraft || next < 0 || next >= this.cameraOrderDraft.length) return;
+      [this.cameraOrderDraft[index], this.cameraOrderDraft[next]] = [this.cameraOrderDraft[next], this.cameraOrderDraft[index]];
+      this.render();
+      const controls = this.shadowRoot.querySelectorAll(`[data-order-index="${next}"]`);
+      [...controls].find(control => !control.disabled)?.focus();
+    }));
     this.shadowRoot.getElementById("account")?.addEventListener("change", event => {
       this.stopPlayback();
       this.selectedClip = null;
@@ -1061,6 +1136,8 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   async afterRender() {
+    const orderDialog = this.shadowRoot.getElementById("camera-order-dialog");
+    if (orderDialog && this.isConnected && !orderDialog.open) orderDialog.showModal();
     void this.setupTimeline();
     const video = this.shadowRoot.querySelector(".camera-player video");
     if (!video) return;

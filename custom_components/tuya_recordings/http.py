@@ -227,12 +227,16 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         )
     _add_storage_stats(stats, client, video_files, thumbnail_files)
     _add_sync_stats(stats, client)
+    order = getattr(client, "camera_order", [])
+    ranks = {dev_id: rank for rank, dev_id in enumerate(order)}
+    cameras.sort(key=lambda camera: ranks.get(camera["dev_id"], len(ranks)))
     return {
         "title": NAME,
         "generated_at": index.get("generatedAt"),
         "warning": index.get("warning"),
         "stats": stats,
         "cameras": cameras,
+        "camera_order": [camera["dev_id"] for camera in cameras] if any(camera["dev_id"] in ranks for camera in cameras) else [],
     }
 
 

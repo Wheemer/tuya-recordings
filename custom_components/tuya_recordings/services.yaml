@@ -1,3 +1,18 @@
+set_camera_order:
+  name: Set camera order
+  description: Save this account's panel camera order. The first camera is selected when opening the panel. Does not start playback or change download priority. Use an empty list for automatic ordering.
+  fields:
+    entry_id:
+      name: Config entry ID
+      required: true
+      selector:
+        text:
+    camera_order:
+      name: Ordered camera device IDs
+      required: true
+      selector:
+        object:
+
 refresh_recordings:
   name: Refresh recordings
   description: Refresh the cached Tuya SD-card recording index.
