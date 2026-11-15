@@ -25,6 +25,7 @@ from custom_components.tuya_recordings.const import (
     CONF_LOOKBACK_DAYS,
     CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_SYNC_HOURS,
+    CONF_MEDIA_RETENTION_HOURS,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_MEDIA_SYNC_ENABLED,
     CONF_REGION,
@@ -94,6 +95,19 @@ def test_options_preserve_setup_choices(key, value):
 def test_saved_options_override_setup_choices():
     entry = SimpleNamespace(data={"media_sync_enabled": True}, options={"media_sync_enabled": False})
     assert _options_schema(entry)({})["media_sync_enabled"] is False
+
+
+def test_retention_option_is_independent_and_preserves_legacy_window():
+    entry = SimpleNamespace(data={CONF_MEDIA_SYNC_HOURS: 48}, options={})
+    assert _options_schema(entry)({})[CONF_MEDIA_RETENTION_HOURS] == 48
+    entry.options = {CONF_MEDIA_RETENTION_HOURS: 0}
+    assert _options_schema(entry)({})[CONF_MEDIA_RETENTION_HOURS] == 0
+    assert _user_schema({})({})[CONF_MEDIA_RETENTION_HOURS] == 0
+
+
+@pytest.mark.parametrize("value", [-1, 8761])
+def test_retention_validation_rejects_out_of_range(value):
+    assert _validate_form_input({CONF_MEDIA_RETENTION_HOURS: value})
 
 
 def test_thumbnail_sync_is_not_a_user_option():

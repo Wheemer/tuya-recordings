@@ -22,7 +22,7 @@ clear_cache:
 
 clear_video_cache:
   name: Clear video cache
-  description: Delete cached Tuya MP4/video files while keeping the recording index and thumbnails.
+  description: Delete local video copies and remember their deletion so Sync does not download them again. Keeps the recording index, thumbnails and camera SD recordings.
   fields:
     entry_id:
       name: Config entry ID
@@ -61,4 +61,63 @@ populate_thumbnails:
         number:
           min: 1
           max: 50
+          mode: box
+
+delete_local_recording:
+  name: Delete local recording
+  description: Delete a local MP4 and thumbnail, and prevent Sync from downloading it again. The camera SD recording is not deleted.
+  fields:
+    entry_id:
+      name: Config entry ID
+      required: true
+      selector:
+        text:
+    dev_id:
+      name: Camera device ID
+      required: true
+      selector:
+        text:
+    start:
+      name: Recording start timestamp
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    end:
+      name: Recording end timestamp
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+
+allow_local_recording_downloads:
+  name: Allow download again
+  description: Forget local deletion markers for one recording, one camera, or all cameras in the selected account. The next normal Sync pass may download eligible recordings again.
+  fields:
+    entry_id:
+      name: Config entry ID
+      required: false
+      selector:
+        text:
+    dev_id:
+      name: Camera device ID
+      required: false
+      selector:
+        text:
+    start:
+      name: Recording start timestamp
+      description: For one recording, supply camera ID and both timestamps.
+      required: false
+      selector:
+        number:
+          min: 1
+          mode: box
+    end:
+      name: Recording end timestamp
+      required: false
+      selector:
+        number:
+          min: 1
           mode: box

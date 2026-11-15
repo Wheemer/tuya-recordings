@@ -104,7 +104,8 @@ The setup flow asks for:
 - **Private video storage path**, normally `/media/tuya_recordings`
 - **Recording order**
 - **Pre-cache recordings**
-- **Sync window in hours** when pre-caching is enabled
+- **Download window in hours** when pre-caching is enabled
+- **Keep local recordings for (hours)**
 - **Detection reset time** (default: 60 seconds)
 
 The flow then displays one QR code. Scan it with the selected account app,
@@ -122,8 +123,12 @@ After setup, **Configure** on the Tuya Recordings integration provides:
   empty days. It does not enumerate the entire SD card. A higher value limits
   the scan to that number of days, up to 31.
 - **Background catalog interval**: 15 minutes to 24 hours for timeline mode.
-- **Pre-cache recordings** and **Sync window in hours** for local MP4 caching.
-  A window of `0` means every discovered recording.
+- **Pre-cache recordings** and **Download window in hours** for local MP4 caching.
+  The download window is measured backwards from the current time; `0` includes
+  every discovered recording.
+- **Keep local recordings for (hours)**: expire local videos and thumbnails by
+  the recording's end time, measured from the current time. `0` keeps them
+  indefinitely. This is separate from the download window.
 - **Private video storage path** and **Recording order**.
 - **Detection reset time** for the motion and person binary sensors.
 
@@ -163,8 +168,33 @@ appear in the panel and Home Assistant Media Browser. Thumbnails are rendered
 locally from the cached MP4 files; no separate camera thumbnail request is
 made.
 
-Set the sync window to `0` only when the storage location has enough free
-space for every discovered recording.
+Set the download window and retention to `0` only when the storage location has
+enough free space for every discovered recording. If both limits are set, Sync
+downloads only recordings inside both limits. Older recordings already saved
+are kept until the retention limit expires, regardless of the download window.
+
+Local retention runs every 15 minutes, including when Sync is off, camera
+activity is paused, or camera downloads fail. It does not contact cameras or
+delete anything from their SD cards. Cleanup yields to active work and defers
+recently served videos so normal playback is not interrupted. Existing installs
+without a separate retention setting inherit their previous Sync window;
+new installs default to unlimited retention. Review these options before
+enabling Sync on a storage location with limited free space.
+
+Use the trash icon on a cached recording to delete its local video and thumbnail.
+The catalog entry remains marked **Deleted locally**, and Sync will not download
+it again. **Allow download again** clears its deletion marker, making it eligible for a
+later Sync pass. Bulk **Clear video cache** also remembers deletions, but retains
+thumbnails. Deletion requires the current Sync pass to finish; retry if the
+action reports that Sync is busy.
+
+Files removed outside the integration are remembered as deletions after the
+integration has first tracked them. Deletion history survives restarts and
+catalog refreshes; it is stored separately from the recording index, per account
+and storage path. Changing the storage path starts separate deletion history;
+moving video files alone does not migrate it. Automatic retention expiry is not a manual deletion:
+increasing retention can make those recordings eligible to download again if
+they remain on the SD card and are within the download window.
 
 ## Camera Detection Entities
 
@@ -198,7 +228,9 @@ and ordinary motion/person automations.
 | `tuya_recordings.sync_media` | Download recordings when pre-cache is enabled. |
 | `tuya_recordings.populate_thumbnails` | Populate missing thumbnails for cached recordings. |
 | `tuya_recordings.clear_cache` | Clear the recording index. |
-| `tuya_recordings.clear_video_cache` | Delete cached video files while keeping the index and thumbnails. |
+| `tuya_recordings.clear_video_cache` | Delete cached videos and remember deletions; keep the index and thumbnails. |
+| `tuya_recordings.delete_local_recording` | Delete one local video and thumbnail without deleting its SD-card recording. Requires account entry ID, camera ID, start and end timestamps. |
+| `tuya_recordings.allow_local_recording_downloads` | Allow deleted recordings to download again on a later Sync pass. Optionally select an account, camera or exact recording. Does not start camera work. |
 
 ## Safety And Camera Activity
 

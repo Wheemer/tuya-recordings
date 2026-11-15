@@ -76,6 +76,7 @@ DATA_MANUAL_REFRESH_LOCK = "manual_refresh_lock"
 DATA_MEDIA_SYNC_RUNNING = "media_sync_running"
 DATA_MEDIA_SYNC_PENDING = "media_sync_pending"
 DATA_MEDIA_SYNC_SCHEDULE = "media_sync_schedule"
+DATA_LOCAL_RETENTION_SCHEDULE = "local_retention_schedule"
 DATA_THUMBNAIL_SYNC_RUNNING = "thumbnail_sync_running"
 DATA_THUMBNAIL_SYNC_PENDING = "thumbnail_sync_pending"
 DATA_THUMBNAIL_SYNC_LIMIT = "thumbnail_sync_limit"
@@ -376,6 +377,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_remove(DOMAIN, SERVICE_CLEAR_VIDEO_CACHE)
         hass.services.async_remove(DOMAIN, SERVICE_SYNC_MEDIA)
         hass.services.async_remove(DOMAIN, SERVICE_POPULATE_THUMBNAILS)
+        hass.services.async_remove(DOMAIN, "delete_local_recording")
+        hass.services.async_remove(DOMAIN, "allow_local_recording_downloads")
         ha_frontend.async_remove_panel(hass, FRONTEND_URL_PATH, warn_if_unknown=False)
         hass.data.get(DOMAIN, {}).pop("_panel_registered", None)
     return True
@@ -483,6 +486,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
             )
             async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
 
+    async def delete_local_recording(call) -> None:
+        for entry_data in _entries_for_call(hass, call.data.get(CONF_ENTRY_ID)):
+            await hass.async_add_executor_job(entry_data["client"].delete_local_recording,
+                call.data["dev_id"], call.data["start"], call.data["end"])
+            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
+
+    async def allow_local_recording_downloads(call) -> None:
+        for entry_data in _entries_for_call(hass, call.data.get(CONF_ENTRY_ID)):
+            await hass.async_add_executor_job(entry_data["client"].allow_local_recording_downloads,
+                call.data.get("dev_id"), call.data.get("start"), call.data.get("end"))
+            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry_data["entry"].entry_id)
+
     async def sync_media(call) -> None:
         entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
         for entry_data in entries:
@@ -521,6 +536,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(DOMAIN, SERVICE_CLEAR_VIDEO_CACHE, clear_video_cache, schema=schema)
     hass.services.async_register(DOMAIN, SERVICE_SYNC_MEDIA, sync_media, schema=schema)
     hass.services.async_register(DOMAIN, SERVICE_POPULATE_THUMBNAILS, populate_thumbnails, schema=thumbnail_schema)
+    hass.services.async_register(DOMAIN, "delete_local_recording", delete_local_recording, schema=vol.Schema({
+        vol.Required(CONF_ENTRY_ID): vol.All(str, vol.Length(min=1)), vol.Required("dev_id"): str,
+        vol.Required("start"): cv.positive_int, vol.Required("end"): cv.positive_int,
+    }))
+    hass.services.async_register(DOMAIN, "allow_local_recording_downloads", allow_local_recording_downloads, schema=vol.Schema({
+        vol.Optional(CONF_ENTRY_ID): str, vol.Optional("dev_id"): str,
+        vol.Optional("start"): cv.positive_int, vol.Optional("end"): cv.positive_int,
+    }))
 
 
 def _async_register_views(hass: HomeAssistant) -> None:
@@ -540,6 +563,21 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
         return
     _async_cancel_media_sync_schedule(entry_data)
     client = entry_data.get("client")
+    if isinstance(client, TuyaRecordingsClient) and client.media_retention_hours > 0:
+        async def _run_local_retention(now):
+            del now
+            if entry_data.get(DATA_INTERACTIVE_PLAYBACK_ACTIVE) or client._closed:
+                return
+            try:
+                result = await hass.async_add_executor_job(client.maintain_local_media)
+                if result.get("deleted_videos") or result.get("deleted_thumbnails"):
+                    async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry.entry_id)
+            except Exception:
+                _LOGGER.exception("Local recording retention failed for %s", entry.entry_id)
+        entry_data[DATA_LOCAL_RETENTION_SCHEDULE] = [
+            async_track_time_interval(hass, _run_local_retention, MEDIA_SYNC_INTERVAL),
+            async_call_later(hass, CATALOG_SYNC_STARTUP_DELAY, _run_local_retention),
+        ]
     if (
         not isinstance(client, TuyaRecordingsClient)
         or client.cloud_activity_paused
@@ -590,6 +628,8 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
 def _async_cancel_media_sync_schedule(entry_data: dict) -> None:
     """Cancel every timer owned by optional local media caching."""
     for cancel in entry_data.pop(DATA_MEDIA_SYNC_SCHEDULE, []):
+        cancel()
+    for cancel in entry_data.pop(DATA_LOCAL_RETENTION_SCHEDULE, []):
         cancel()
 
 

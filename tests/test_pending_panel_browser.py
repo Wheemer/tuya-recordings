@@ -20,11 +20,31 @@ def test_pending_date_survives_and_becomes_cached_playable_without_thumbnail(tmp
     client = FakeClient(tmp_path)
     index = {"cameras": [{"devId": "doorbell", "name": "Wifi videodeurbel", "online": True,
                            "clips": [{"start": 100, "end": 130, "date": "2026-11-14"}]}]}
-    state = {"data": build_panel_data(client, index, media_root=tmp_path)}
+    state = {"data": build_panel_data(client, index, media_root=tmp_path), "deleted": False}
+    client.local_recording_status = lambda *args, cached=False: (
+        "cached" if cached else "deleted" if state["deleted"] else "pending")
     frontend = Path(__file__).resolve().parents[1] / "custom_components/tuya_recordings/frontend"
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path != "/local-action":
+                self.send_error(404)
+                return
+            command = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if command["action"] == "delete_local_recording":
+                client.clip_path("doorbell", 100, 130).unlink()
+                state["deleted"] = True
+            elif command["action"] == "allow_local_recording_downloads":
+                state["deleted"] = False
+            else:
+                self.send_error(400)
+                return
+            state["data"] = build_panel_data(client, index, media_root=tmp_path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             requests.append(self.path)
@@ -82,7 +102,11 @@ def test_pending_date_survives_and_becomes_cached_playable_without_thumbnail(tmp
                       locale: {language: 'en', time_format: '12'}, states: {},
                       callApi: async (method) => method === 'GET'
                         ? await (await fetch('/api/panel')).json() : {},
-                      callService: () => { throw new Error('Unexpected device command'); },
+                      callService: async (domain, action, data) => {
+                        window.localActions ||= [];
+                        localActions.push({domain, action, data});
+                        await fetch('/local-action', {method:'POST', body:JSON.stringify({action})});
+                      },
                       connection: {sendMessagePromise: async message => {
                         signs.push(message.path); return {path: message.path};
                       }},
@@ -130,6 +154,28 @@ def test_pending_date_survives_and_becomes_cached_playable_without_thumbnail(tmp
                 assert not any("transport=native" in path or "/timeline/" in path for path in requests)
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
                 page.screenshot(path=str(artifacts / f"pending-recording-ready-{width}.png"), full_page=True)
+
+                # Local commands must not bubble into playback, including keyboard activation.
+                page.evaluate("() => { panel.stopPlayback(); panel.selectedClip = null; }")
+                signed_before = page.evaluate("signs.length")
+                page.once("dialog", lambda dialog: dialog.dismiss())
+                card.locator(".local-delete").click()
+                assert page.evaluate("window.localActions?.length || 0") == 0
+                page.once("dialog", lambda dialog: dialog.accept())
+                card.locator(".local-delete").press("Enter")
+                page.wait_for_function("() => window.localActions?.length === 1")
+                page.wait_for_function("() => panel.shadowRoot.textContent.includes('Deleted locally')")
+                assert page.evaluate("localActions[0].action") == "delete_local_recording"
+                assert page.evaluate("signs.length") == signed_before
+                assert card.locator(".local-delete").get_attribute("title") == "Allow download again"
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                page.screenshot(path=str(artifacts / f"local-recording-deleted-{width}.png"), full_page=True)
+                page.once("dialog", lambda dialog: dialog.accept())
+                card.locator(".local-delete").click()
+                page.wait_for_function("() => window.localActions?.length === 2")
+                page.wait_for_function("() => panel.shadowRoot.textContent.includes('Awaiting download')")
+                assert page.evaluate("localActions[1].action") == "allow_local_recording_downloads"
+                assert page.evaluate("signs.length") == signed_before
             finally:
                 browser.close()
     finally:

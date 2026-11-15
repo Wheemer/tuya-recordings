@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-41 (2026-11-15)
+
+### Local Recordings
+
+- Separate the download window from local retention, with both measured from the current time. Set retention to 0 to keep local recordings indefinitely; existing installs inherit their previous Sync window until configured separately.
+- Run local cleanup independently of download failures and camera availability, including when Sync is off. Protect recently played files and leave camera SD recordings untouched.
+- Remember local deletions across restarts and catalog refreshes so Sync does not download removed clips again. Allow download again explicitly clears that restriction for a later Sync pass.
+- Stop Sync safely when known local storage is unavailable rather than treating missing storage as deliberate deletion.
+
+### Recordings Panel
+
+- Add confirmed local deletion and Allow download again controls, with clear statuses for deleted recordings and recordings outside configured limits.
+- Keep playable cached videos available in the Media Browser even when their thumbnail is missing.
+
 ## Tuya Recordings v0.4.13-40 (2026-11-15)
 
 ### Native Playback

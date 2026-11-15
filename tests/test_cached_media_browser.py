@@ -306,7 +306,7 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     assert {"initialize", "controls-create", "controls-ready", "cached-play-request",
                             "playing", "progress", "player-ready"}.issubset(result["stages"]), result
                     assert result["safeDebug"], result
-                    assert {"20261114-pending-recordings-38", "20261114-private-cache-36"}.issubset(
+                    assert {"20261115-local-retention-41", "20261114-private-cache-36"}.issubset(
                         result["builds"]), result
                     if directory := os.environ.get("TUYA_TEST_ARTIFACT_DIR"):
                         artifacts = Path(directory)

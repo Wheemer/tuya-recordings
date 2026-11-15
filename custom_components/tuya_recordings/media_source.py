@@ -134,7 +134,7 @@ class TuyaRecordingsMediaSource(MediaSource):
             clip = next((clip for clip in visible if int(clip["start"]) == start_int
                          and int(clip["end"]) == end_int), None)
             if clip is None:
-                raise Unresolvable("Tuya recording is not cached and thumbnailed")
+                raise Unresolvable("Tuya recording is not cached")
             use_12h = await self._async_use_12h_time()
             return self._clip_node(
                 client=client, clip=clip, dev_id=dev_id, clip_date=str(clip.get("date") or ""),
@@ -270,8 +270,7 @@ class TuyaRecordingsMediaSource(MediaSource):
             if not start or not end:
                 continue
             clip_cached = self._clip_ready(client, dev_id, start, end, client.clip_path(dev_id, start, end))
-            thumbnail_cached = self._path_ready(client.thumbnail_path(dev_id, start, end))
-            if not clip_cached or not thumbnail_cached:
+            if not clip_cached:
                 continue
             visible.append(clip)
         return visible

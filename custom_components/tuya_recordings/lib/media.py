@@ -91,9 +91,7 @@ def cleanup_cached_media(
     logger: LoggerLike,
 ) -> dict[str, int]:
     deleted_videos = _cleanup_cached_folder(media_storage_path / "videos", ".mp4", desired_clips, cutoff, logger)
-    deleted_videos += _cleanup_temp_files(media_storage_path / "videos", "*.tmp.mp4", logger)
     deleted_thumbnails = _cleanup_cached_folder(media_storage_path / "thumbs", ".jpg", desired_clips, cutoff, logger)
-    deleted_thumbnails += _cleanup_temp_files(media_storage_path / "thumbs", "*.tmp.jpg", logger)
     return {"deleted_videos": deleted_videos, "deleted_thumbnails": deleted_thumbnails}
 
 
@@ -104,16 +102,14 @@ def _cleanup_cached_folder(
     cutoff: int | None,
     logger: LoggerLike,
 ) -> int:
-    if not folder.exists():
+    if cutoff is None or not folder.exists() or folder.is_symlink():
         return 0
     deleted = 0
     for path in folder.glob(f"*{extension}"):
         parsed = parse_cached_media_name(path.name, extension)
-        if parsed is None:
+        if parsed is None or path.is_symlink() or not path.is_file():
             continue
-        if parsed in desired_clips:
-            continue
-        if cutoff is None or parsed.end < cutoff:
+        if parsed.end < cutoff:
             try:
                 path.unlink()
             except OSError as exc:
