@@ -567,6 +567,9 @@ def _async_schedule_media_sync(hass: HomeAssistant, entry: ConfigEntry) -> None:
     async def _run_cache_cycle(now) -> None:
         if _entry_cloud_paused(_entry_data(hass, entry.entry_id)):
             return
+        # Discover older days before selecting downloads, on the same bounded
+        # catalog queue used without caching. Never overlap catalog and transfer.
+        await _async_request_catalog_refresh(hass, entry.entry_id, "cache_cycle", wait=True)
         await _async_request_camera_work(
             hass,
             entry.entry_id,

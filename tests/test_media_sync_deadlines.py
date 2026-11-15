@@ -9,6 +9,45 @@ from custom_components.tuya_recordings import client as module
 from custom_components.tuya_recordings.lib.commands import _WORK_CANCEL, CameraCommandQueue
 
 
+def test_backfill_discovers_and_downloads_older_days_newest_first(monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
+    monkeypatch.setattr(module, "MEDIA_SYNC_INTER_ATTEMPT_DELAY", 0)
+    client = module.TuyaRecordingsClient({"media_sync_enabled": True, "lookback_days": 5},
+                                        media_storage_path=tmp_path)
+    today = module.dt_util.now().date()
+    now = datetime.now(timezone.utc).isoformat()
+    client._camera_index_cache = {"cameras": [{"devId": "camera", "clips": [],
+        "catalogDays": {today.isoformat(): now, (today - timedelta(days=1)).isoformat(): now}}]}
+    monkeypatch.setattr(client, "_camera_devices", lambda: [{"devId": "camera", "online": True}])
+    monkeypatch.setattr(client, "_camera_candidates", lambda devices: devices)
+    queried = []
+
+    def query(dev_id, day):
+        assert not _WORK_CANCEL.get().is_set()
+        queried.append(day)
+        start = int(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+        return [{"start": start, "end": start + 10}]
+
+    monkeypatch.setattr(client, "_recordings_for_day", query)
+    monkeypatch.setattr(client, "refresh_recent_recordings", lambda: client._camera_index_cache)
+    monkeypatch.setattr(client, "_recover_interrupted_media_sync", lambda: 0)
+    monkeypatch.setattr(client, "cleanup_cached_media", lambda *args, **kwargs: {})
+    downloaded = []
+    monkeypatch.setattr(client, "download_clip", lambda dev, start, end, path, **kwargs: downloaded.append(start))
+    client.refresh_background_catalog(limit=2)
+    assert queried == [today - timedelta(days=2), today - timedelta(days=3)]
+    result = client.sync_recordings()
+    assert result["downloaded"] == 2
+    assert downloaded == sorted(downloaded, reverse=True)
+    assert all(start < int(datetime.combine(today - timedelta(days=1), datetime.min.time(),
+                                           tzinfo=timezone.utc).timestamp()) for start in downloaded)
+    client.refresh_background_catalog(limit=2)
+    assert queried[-1] == today - timedelta(days=4)
+    assert len(queried) == 3
+
+
 def test_remux_failure_skips_only_that_camera_and_keeps_other_downloads(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "CAMERA_COMMANDS", CameraCommandQueue())
     monkeypatch.setattr(module, "MEDIA_SYNC_INTER_ATTEMPT_DELAY", 0)

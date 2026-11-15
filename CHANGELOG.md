@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-37 (2026-11-15)
+
+### Media Sync
+
+- Discover older recording days during Media Sync instead of refreshing only today and yesterday.
+- Backfill within the configured lookback, using bounded catalog passes and newest-first downloads.
+- Preserve camera serialization, cooldowns, playback priority, seeking and per-camera failure isolation.
+
 ## Tuya Recordings v0.4.13-36 (2026-11-14)
 
 ### Recordings Panel
