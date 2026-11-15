@@ -1,5 +1,14 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-42 (2026-11-15)
+
+### Camera Ordering
+
+- Add Reorder cameras in the panel toolbar to arrange the complete camera list with move-up/down controls, Save and Cancel.
+- Save the order per account across browsers and restarts. The first listed camera is selected when opening the panel, while manual camera changes remain respected during use.
+- Append newly discovered cameras after the saved list and ignore removed cameras. Clear Camera order in Configure to restore automatic selection.
+- Keep playback running while saving the order, without changing Media Sync download priority or camera safety limits.
+
 ## Tuya Recordings v0.4.13-41 (2026-11-15)
 
 ### Local Recordings

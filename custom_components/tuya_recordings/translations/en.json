@@ -54,6 +54,7 @@
         "description": "The SD-card catalog updates automatically. When pre-cache recordings is enabled, cached clips receive local thumbnails. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
         "data": {
           "lookback_days": "Days to check (0 = automatic)",
+          "camera_order": "Camera order",
           "catalog_sync_minutes": "Background catalog interval (minutes)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
@@ -64,6 +65,7 @@
         },
         "data_description": {
           "lookback_days": "Use 0 to scan up to 31 days, stopping after 7 consecutive empty days. This does not enumerate the entire SD card.",
+          "camera_order": "Cameras appear in this order; the first is selected when opening the panel. Unlisted cameras follow afterward. Leave empty for automatic ordering. Manual camera selection is preserved during use.",
           "catalog_sync_minutes": "How often to refresh SD-card recording lists while local video caching is off. Playback pauses this work automatically. Use a longer interval for cameras that permit only one P2P session.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
           "media_sync_enabled": "Optional, off by default. Download recordings in the background for local playback. Cataloged recordings remain visible while awaiting download. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",

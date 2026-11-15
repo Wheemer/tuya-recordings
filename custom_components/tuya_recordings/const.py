@@ -35,6 +35,7 @@ RECORDING_TRIGGER_COOLDOWN = 90
 
 CONF_LOOKBACK_DAYS = "lookback_days"
 CONF_CATALOG_SYNC_MINUTES = "catalog_sync_minutes"
+CONF_CAMERA_ORDER = "camera_order"
 CONF_MEDIA_SYNC_ENABLED = "media_sync_enabled"
 CONF_MEDIA_SYNC_HOURS = "media_sync_hours"
 CONF_MEDIA_RETENTION_HOURS = "media_retention_hours"

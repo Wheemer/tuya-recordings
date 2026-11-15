@@ -26,7 +26,7 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
         webcomponent_name=PANEL_ELEMENT_NAME,
         sidebar_title=NAME,
         sidebar_icon="mdi:memory",
-        module_url=f"{STATIC_URL_PATH}/panel.js?v=20261115-local-retention-41",
+        module_url=f"{STATIC_URL_PATH}/panel.js?v=20261115-camera-order",
         embed_iframe=False,
     )
     hass.data[DOMAIN]["_panel_registered"] = True

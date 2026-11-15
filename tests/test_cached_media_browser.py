@@ -306,7 +306,36 @@ def test_signed_cache_thumbnails_video_audio_and_range_requests(tmp_path, codec,
                     assert {"initialize", "controls-create", "controls-ready", "cached-play-request",
                             "playing", "progress", "player-ready"}.issubset(result["stages"]), result
                     assert result["safeDebug"], result
-                    assert {"20261115-local-retention-41", "20261114-private-cache-36"}.issubset(
+                    ordering = page.evaluate("""async () => {
+                      const panel = document.querySelector('tuya-recordings-panel');
+                      const video = panel.shadowRoot.querySelector('video');
+                      const before = video.currentTime;
+                      const source = video.currentSrc;
+                      const revision = panel.playbackRevision;
+                      const selected = panel.selectedCamera;
+                      panel.data.cameras.push({dev_id:'other',name:'Other camera',online:true,
+                        dates:[],clips:[],recording_ranges:[],playback_mode:'clips'});
+                      panel._hass.callService = async (domain, action, data) => {
+                        if (domain !== 'tuya_recordings' || action !== 'set_camera_order' ||
+                            data.camera_order.join(',') !== 'other,fixture') throw new Error('Unexpected order');
+                      };
+                      panel.render();
+                      panel.shadowRoot.querySelector('#camera-order').click();
+                      panel.shadowRoot.querySelector('[data-order-index="1"][data-order-direction="-1"]').click();
+                      await panel.saveCameraOrder();
+                      await new Promise(resolve => setTimeout(resolve, 100));
+                      const result = {sameVideo:video === panel.shadowRoot.querySelector('video'),
+                        sameSource:source === video.currentSrc, revision:panel.playbackRevision === revision,
+                        selected:panel.selectedCamera === selected, progressed:video.currentTime > before,
+                        paused:video.paused};
+                      panel.data.cameras = panel.data.cameras.filter(camera => camera.dev_id !== 'other');
+                      panel.data.camera_order = [];
+                      panel.render();
+                      return result;
+                    }""")
+                    assert ordering == {"sameVideo": True, "sameSource": True, "revision": True,
+                                        "selected": True, "progressed": True, "paused": False}, ordering
+                    assert {"20261115-camera-order", "20261114-private-cache-36"}.issubset(
                         result["builds"]), result
                     if directory := os.environ.get("TUYA_TEST_ARTIFACT_DIR"):
                         artifacts = Path(directory)

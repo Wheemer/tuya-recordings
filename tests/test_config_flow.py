@@ -105,6 +105,27 @@ def test_retention_option_is_independent_and_preserves_legacy_window():
     assert _user_schema({})({})[CONF_MEDIA_RETENTION_HOURS] == 0
 
 
+def test_camera_order_choices_use_saved_inventory_without_network():
+    entry = SimpleNamespace(data={"device_inventory": {"doorbell": "Doorbell", "ptz": "PTZ"}},
+                            options={"camera_order": ["doorbell", "ptz"]})
+    fields = convert(_options_schema(entry), custom_serializer=cv.custom_serializer)
+    camera = next(field for field in fields if field["name"] == "camera_order")
+    assert camera["selector"]["select"]["options"] == [
+        {"value": "doorbell", "label": "Doorbell"},
+        {"value": "ptz", "label": "PTZ"}]
+    assert camera["selector"]["select"]["multiple"] is True
+    assert _options_schema(entry)({})["camera_order"] == ["doorbell", "ptz"]
+    assert _options_schema(entry, {"camera_order": []})({})["camera_order"] == []
+
+
+def test_removed_ordered_camera_can_be_kept_or_cleared():
+    entry = SimpleNamespace(data={}, options={"camera_order": ["removed"]})
+    fields = convert(_options_schema(entry), custom_serializer=cv.custom_serializer)
+    camera = next(field for field in fields if field["name"] == "camera_order")
+    assert camera["selector"]["select"]["options"][-1]["value"] == "removed"
+    assert _options_schema(entry)({})["camera_order"] == ["removed"]
+
+
 @pytest.mark.parametrize("value", [-1, 8761])
 def test_retention_validation_rejects_out_of_range(value):
     assert _validate_form_input({CONF_MEDIA_RETENTION_HOURS: value})

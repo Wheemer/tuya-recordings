@@ -379,6 +379,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_remove(DOMAIN, SERVICE_POPULATE_THUMBNAILS)
         hass.services.async_remove(DOMAIN, "delete_local_recording")
         hass.services.async_remove(DOMAIN, "allow_local_recording_downloads")
+        hass.services.async_remove(DOMAIN, "set_camera_order")
         ha_frontend.async_remove_panel(hass, FRONTEND_URL_PATH, warn_if_unknown=False)
         hass.data.get(DOMAIN, {}).pop("_panel_registered", None)
     return True
@@ -506,6 +507,19 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 continue
             await _async_request_camera_work(hass, entry_data["entry"].entry_id, "service", media=True, thumbnails=True, wait=True)
 
+    async def set_camera_order(call) -> None:
+        for entry_data in _entries_for_call(hass, call.data["entry_id"]):
+            client = entry_data["client"]
+            order = call.data["camera_order"]
+            known = set(client._camera_inventory or {}) | {
+                camera["devId"] for camera in (client._camera_index_cache or {}).get("cameras", []) if camera.get("devId")}
+            if any(dev_id not in known for dev_id in order):
+                raise ValueError("Camera order contains a camera not discovered in this account")
+            entry = entry_data["entry"]
+            hass.config_entries.async_update_entry(entry, options={**entry.options, "camera_order": list(order)})
+            client.camera_order = list(order)
+            async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry.entry_id)
+
     async def populate_thumbnails(call) -> None:
         entries = _entries_for_call(hass, call.data.get(CONF_ENTRY_ID))
         limit = int(call.data.get(CONF_LIMIT) or THUMBNAIL_SYNC_LIMIT)
@@ -543,6 +557,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(DOMAIN, "allow_local_recording_downloads", allow_local_recording_downloads, schema=vol.Schema({
         vol.Optional(CONF_ENTRY_ID): str, vol.Optional("dev_id"): str,
         vol.Optional("start"): cv.positive_int, vol.Optional("end"): cv.positive_int,
+    }))
+    hass.services.async_register(DOMAIN, "set_camera_order", set_camera_order, schema=vol.Schema({
+        vol.Required(CONF_ENTRY_ID): vol.All(str, vol.Length(min=1)),
+        vol.Required("camera_order"): vol.All([vol.All(str, vol.Length(min=1))], vol.Unique()),
     }))
 
 
