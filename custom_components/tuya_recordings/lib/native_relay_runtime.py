@@ -1148,6 +1148,7 @@ class NativeRelayRuntimeSession:
         started = False
         generation = 1
         audio_codec_info = None
+        traced_video = 0
         loop = asyncio.get_running_loop()
         video_deadline = loop.time() + self.first_frame_timeout
         saw_audio = False
@@ -1300,7 +1301,11 @@ class NativeRelayRuntimeSession:
                     frame,
                     playback_secrets,
                     recording_uuid,
+                    trace=not frame.is_audio and traced_video < 8,
+                    trace_device=self.config.dev_id,
                 )
+                if not frame.is_audio:
+                    traced_video += 1
                 if converted is None:
                     empty_media_frames += 1
                     # Do not let an active camera stream only empty frames forever.
@@ -1390,6 +1395,9 @@ class NativeRelayRuntimeSession:
         frame: Any,
         playback_secrets: dict[str, str],
         recording_uuid: str,
+        *,
+        trace: bool = False,
+        trace_device: str = "",
     ) -> Any:
         try:
             decrypted = decrypt_playback_frame(
@@ -1401,6 +1409,14 @@ class NativeRelayRuntimeSession:
             raise NativeRelayRuntimeError(
                 f"Native playback media decryption failed: {err}"
             ) from err
+        if trace and not frame.is_audio and _LOGGER.isEnabledFor(logging.DEBUG):
+            from .native_mux import h264_packet_diagnostics
+            _LOGGER.debug("Native H264 trace schema=2 stage=frame_conversion dev=%s frame=%s frame_type=%s timestamp=%s/%s codec_info=%s codec_flag=%s encrypted=%s wire=%s clear=%s",
+                          trace_device or "unknown", frame.field_28, frame.frame_type,
+                          (frame.field_8 << 32) | frame.field_12, frame.timestamp_scale or 1000,
+                          frame.codec_info is not None, frame.codec_info.field_4 if frame.codec_info else 0,
+                          bool(frame.codec_info and frame.codec_info.field_4),
+                          h264_packet_diagnostics(frame.payload), h264_packet_diagnostics(decrypted.payload))
         # A zero-length wire payload or a valid all-padding encrypted payload
         # contains no media. Leave other frame types to the converter to reject.
         if not decrypted.payload and frame.frame_type in (1, 3):
@@ -1491,6 +1507,7 @@ class NativeRelayRuntimeSession:
         audio_codec_info = None
         ended_tracks: set[int] = set()
         rejected: dict[str, int] = {}
+        traced_video = 0
         while True:
             if self._cancelled():
                 raise NativeRelayRuntimeError("Native playback was cancelled")
@@ -1556,7 +1573,11 @@ class NativeRelayRuntimeSession:
                     audio_codec_info = frame.codec_info
                 elif audio_codec_info is not None:
                     frame = replace(frame, codec_info=audio_codec_info)
-            converted = self._convert_frame(frame, playback_secrets, recording_uuid)
+            converted = self._convert_frame(frame, playback_secrets, recording_uuid,
+                                            trace=not frame.is_audio and traced_video < 8,
+                                            trace_device=self.config.dev_id)
+            if not frame.is_audio:
+                traced_video += 1
             if converted is None:
                 continue
             info = converted.info or {}

@@ -2605,6 +2605,23 @@ def test_rtp_media_stream_id_does_not_filter_playback_video():
     assert playback._media_stream_packets == {0x00010004: 2}
 
 
+def test_rtp_header_trace_keeps_full_header_bits_and_is_bounded(caplog):
+    import logging
+    caplog.set_level(logging.DEBUG, logger=relay_module.__name__)
+    playback = session()
+    for sequence in range(20):
+        header = struct.pack("<I5I", 0x00020008, 0, 0, 0, 0, 0)
+        rtp = struct.pack(">BBHII", 0x80, 0xe0, sequence, sequence * 100, 1) + b"\x95PRIVATE_FOOTAGE"
+        playback._on_rtp_record(1, encrypt_record(ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp), ANSWER_KEY)
+    messages = [record.getMessage() for record in caplog.records if "stage=rtp_payload" in record.getMessage()]
+    assert len(messages) == 8
+    assert all("nal_header=0x95" in message and "forbidden=True" in message for message in messages)
+    assert "PRIVATE_FOOTAGE" not in caplog.text
+    playback._reset_media_state()
+    playback._on_rtp_record(1, encrypt_record(ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp), ANSWER_KEY)
+    assert sum("stage=rtp_payload" in record.getMessage() for record in caplog.records) == 9
+
+
 def test_rtp_audio_is_exposed_as_pcm_s16le():
     playback = session()
     header = struct.pack("<I5I", 0x00010005, 0, 0, 0, 0, 0)
