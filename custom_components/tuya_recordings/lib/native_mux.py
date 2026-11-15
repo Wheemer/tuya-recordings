@@ -1103,11 +1103,13 @@ def _h264_nals(payload: bytes) -> tuple[bytes, ...]:
 
 
 def _h264_metadata_only(payload: bytes) -> bool:
-    """Recognize configuration/delimiter packets, not corrupt or unknown NALs."""
-    # SPS extensions, prefixes and subset SPS (13..15) are not pictures either.
+    """Retain non-picture callbacks until an SDK-supported picture arrives."""
+    # HandleSingleNalu sets picture-ready only for type 1/5, retaining other
+    # single NALs. Reserved/vendor units must not become indexed pictures, but
+    # their encoded bytes must remain with the next picture, not be discarded.
     nals = _h264_nals(payload)
     return bool(nals) and all(
-        not nal[0] & 0x80 and nal[0] & 0x1F in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+        not nal[0] & 0x80 and 6 <= nal[0] & 0x1F <= 23
         for nal in nals
     )
 

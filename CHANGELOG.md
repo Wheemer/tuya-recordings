@@ -1,5 +1,13 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-38 (2026-11-15)
+
+### Media Sync
+
+- Follow the APK's H.264 buffering behavior: retain non-picture callback bytes with the next picture instead of indexing them as standalone pictures. This addresses the reproduced remux failures matching the doorbell and PTZ logs, without transcoding video or audio.
+- Include historical recording discovery from the withdrawn v0.4.13-37 prerelease, using bounded catalog passes and newest-first downloads within the configured lookback.
+- Preserve playback, seeking, camera serialization, cooldowns and per-camera failure isolation.
+
 ## Tuya Recordings v0.4.13-37 (2026-11-15)
 
 ### Media Sync
