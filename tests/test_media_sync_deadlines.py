@@ -152,7 +152,8 @@ def test_sync_defers_cooldown_without_failure_and_resumes_next_pass(monkeypatch,
     assert result["deferred"] == result["failed"] == 0
     assert result["downloaded"] == 3
     assert client._media_failures == {}
-    cleanup.assert_called_once()
+    # Retention is now independent of camera success, not catalog-based pruning.
+    cleanup.assert_not_called()
 
 
 def test_cooldown_download_does_not_allocate_output_or_contact_camera(monkeypatch, tmp_path):

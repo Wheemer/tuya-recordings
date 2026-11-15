@@ -1,4 +1,4 @@
-const PANEL_BUILD = "20261114-pending-recordings-38";
+const PANEL_BUILD = "20261115-local-retention-41";
 
 class TuyaRecordingsPanel extends HTMLElement {
   constructor() {
@@ -530,10 +530,12 @@ class TuyaRecordingsPanel extends HTMLElement {
           font-size: 12px;
         }
         .meta {
+          position: relative;
           display: grid;
           gap: 4px;
-          padding: 12px 14px;
+          padding: 12px 64px 12px 14px;
         }
+        .local-delete { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; }
         .title {
           font-size: 15px;
           font-weight: 500;
@@ -916,11 +918,12 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   renderClip(clip) {
-    const pending = Boolean(this.data?.stats?.cache_only && !clip.cached);
-    const playable = !pending && Boolean(clip.playback_url);
+    const blocked = {deleted: "Deleted locally", expired: "Outside retention period", outside_download_window: "Outside download window"}[clip.local_status];
+    const pending = Boolean(this.data?.stats?.cache_only && !clip.cached && !blocked);
+    const playable = !pending && !blocked && Boolean(clip.playback_url);
     const isPlaying = this.selectedClip && this.selectedClip.dev_id === clip.dev_id && this.selectedClip.start === clip.start && this.selectedClip.end === clip.end;
     return `
-      <div class="clip${pending ? " pending" : ""}" role="${playable ? "button" : "article"}" aria-label="${pending ? "Awaiting download: recording" : "Play recording"} at ${this.escape(this.formatClipTime(clip))}" ${playable ? 'tabindex="0"' : 'aria-disabled="true"'} data-start="${clip.start}" data-end="${clip.end}" ${isPlaying ? "playing" : ""}>
+      <div class="clip${pending || blocked ? " pending" : ""}" role="${playable ? "button" : "article"}" aria-label="${blocked || (pending ? "Awaiting download: recording" : "Play recording")} at ${this.escape(this.formatClipTime(clip))}" ${playable ? 'tabindex="0"' : clip.local_status === "deleted" ? '' : 'aria-disabled="true"'} data-start="${clip.start}" data-end="${clip.end}" ${isPlaying ? "playing" : ""}>
         <div class="thumb">
           ${
             isPlaying
@@ -930,7 +933,8 @@ class TuyaRecordingsPanel extends HTMLElement {
         </div>
         <div class="meta">
           <div class="title">${this.escape(this.formatClipTime(clip))}</div>
-          <div class="sub">${isPlaying ? "Now playing" : pending ? "Awaiting download" : this.data?.stats?.cache_only && clip.cached ? "Saved locally" : this.escape(this.cameraName(clip.dev_id))}</div>
+          <div class="sub">${isPlaying ? "Now playing" : blocked || (pending ? "Awaiting download" : this.data?.stats?.cache_only && clip.cached ? "Saved locally" : this.escape(this.cameraName(clip.dev_id)))}</div>
+          ${this.data?.stats?.cache_only && (clip.cached || clip.local_status === "deleted") ? `<button class="icon-button local-delete" type="button" title="${clip.cached ? "Delete local recording" : "Allow download again"}" aria-label="${clip.cached ? "Delete local recording" : "Allow download again"}" data-local-action="${clip.cached ? "delete_local_recording" : "allow_local_recording_downloads"}" data-start="${clip.start}" data-end="${clip.end}"><ha-icon icon="${clip.cached ? "mdi:trash-can-outline" : "mdi:download"}"></ha-icon></button>` : ""}
         </div>
       </div>
     `;
@@ -1005,7 +1009,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       if (this.boundClipButtons.has(button)) return;
       this.boundClipButtons.add(button);
       const open = async (event) => {
-        if (event?.target?.closest?.("video, .camera-player")) return;
+        if (event?.target?.closest?.("video, .camera-player, .local-delete")) return;
         const start = Number(button.dataset.start);
         const end = Number(button.dataset.end);
         const clip = this.clips.find((item) => item.start === start && item.end === end);
@@ -1015,6 +1019,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       };
       button.addEventListener("click", open);
       button.addEventListener("keydown", (event) => {
+        if (event.target?.closest?.(".local-delete")) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         open(event);
@@ -1028,6 +1033,30 @@ class TuyaRecordingsPanel extends HTMLElement {
           if (clip) this.debugPlayback("thumbnail-error", clip);
         }, {once: true});
       }
+    });
+    this.shadowRoot.querySelectorAll("[data-local-action]").forEach(button => {
+      this.boundLocalButtons ||= new WeakSet();
+      if (this.boundLocalButtons.has(button)) return;
+      this.boundLocalButtons.add(button);
+      button.addEventListener("click", async event => {
+        event.stopPropagation();
+        const action = button.dataset.localAction;
+        const clip = this.clips.find(item => item.start === Number(button.dataset.start) && item.end === Number(button.dataset.end));
+        if (!clip || !window.confirm(action === "delete_local_recording"
+          ? "Delete this local recording? The camera's SD recording will not be deleted."
+          : "Allow Media Sync to download this recording again?")) return;
+        button.disabled = true;
+        try {
+          if (this.selectedClip?.start === clip.start && this.selectedClip?.dev_id === clip.dev_id) {
+            this.stopPlayback(); this.selectedClip = null;
+          }
+          await this._hass.callService("tuya_recordings", action, {entry_id: this.selectedAccount, dev_id: clip.dev_id, start: clip.start, end: clip.end});
+          await this.loadData();
+        } catch (error) {
+          button.disabled = false;
+          window.alert(error?.message || "Local recording action failed");
+        }
+      });
     });
   }
 
@@ -1597,7 +1626,9 @@ class TuyaRecordingsPanel extends HTMLElement {
     if (state === "running") return "Syncing new videos";
     if (state === "deferred") return "Waiting for camera cooldown";
     if (state === "stalled") return "Sync needs attention";
+    if (state === "storage_unavailable") return "Local storage unavailable";
     if (pending > 0) return "Catching up in background";
+    if (this.data?.stats?.cache_only && !Number(this.data.stats.ready_clips)) return "No local recordings";
     return "Recordings are ready";
   }
 

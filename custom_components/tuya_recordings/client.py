@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import queue
 import threading
 import time
@@ -25,6 +26,7 @@ from .const import (
     CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_SYNC_ENABLED,
     CONF_MEDIA_SYNC_HOURS,
+    CONF_MEDIA_RETENTION_HOURS,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_REGION,
     CONF_THUMBNAIL_SYNC_ENABLED,
@@ -40,7 +42,6 @@ from .const import (
 from .lib import (
     CachedClipKey,
     MediaSyncStatus,
-    cleanup_cached_media,
     extract_thumbnail_from_mp4,
     safe_segment,
 )
@@ -78,6 +79,7 @@ from .lib.native_relay_playback import NativeSdStatusTimeout
 from .lib.native_session import NativePlaybackRequest
 from .lib.native_setup import build_recordings_backend
 from .lib.storage import write_catalog
+from .lib.local_media import LocalMediaState, local_clip_key
 from .lib.native_gateway import (
     CAMERA_NAME_HINTS,
     KNOWN_CAMERA_CATEGORIES,
@@ -108,6 +110,7 @@ CATALOG_DAYS_PER_SESSION = 2
 
 TuyaRecordingsAuthError = RecordingBackendAuthError
 TuyaRecordingsApiError = RuntimeError
+
 
 
 def camera_inventory_from_native_devices(devices: list[dict[str, Any]]) -> dict[str, str]:
@@ -196,6 +199,9 @@ class TuyaRecordingsClient:
         self._thumbnail_camera_failures: dict[str, float] = {}
         self._media_failures: dict[tuple[str, int, int], float] = {}
         self._media_sync_status = MediaSyncStatus()
+        self._local_state = None
+        self._local_state_guard = threading.RLock()
+        self._local_playback_leases = {}
         self._backend = recordings_backend or self._build_backend(entry_data)
 
     def _build_backend(self, entry_data: dict[str, Any]) -> RecordingBackend:
@@ -316,6 +322,9 @@ class TuyaRecordingsClient:
         self.media_sync_enabled = bool(entry_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
         self.thumbnail_sync_enabled = bool(entry_data.get(CONF_THUMBNAIL_SYNC_ENABLED, DEFAULT_THUMBNAIL_SYNC_ENABLED))
         self.media_sync_hours = int(entry_data.get(CONF_MEDIA_SYNC_HOURS, 0) or 0)
+        # Preserve bounded legacy caching, while allowing retention to be
+        # configured independently once the explicit option is saved.
+        self.media_retention_hours = int(entry_data.get(CONF_MEDIA_RETENTION_HOURS, self.media_sync_hours) or 0)
         self.media_view_recordings_order = entry_data.get(CONF_MEDIA_VIEW_RECORDINGS_ORDER, "Descending")
         configured_media_path = entry_data.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH)
         self.media_storage_path = self._media_storage_path_override or Path(str(configured_media_path))
@@ -628,9 +637,98 @@ class TuyaRecordingsClient:
         finally:
             self._refresh_lock.release()
 
+    def _local_policy(self) -> LocalMediaState:
+        root = Path(self.media_storage_path).resolve()
+        with self._local_state_guard:
+            if self._local_state is None or self._local_state.root != root:
+                digest = hashlib.sha256(str(root).encode()).hexdigest()[:12]
+                state_path = (self._cache_path.with_name(f"{self._cache_path.stem}.local-{digest}.json")
+                              if self._cache_path else root / ".local_media.json")
+                self._local_state = LocalMediaState(root, state_path)
+            return self._local_state
+
+    def _owned_local_devices(self):
+        if self._camera_inventory is None and self._cache_path is None:
+            return None  # Standalone clients explicitly own their supplied folder.
+        return set(self._camera_inventory or {}) | {
+            str(camera["devId"]) for camera in (self._camera_index_cache or {}).get("cameras", []) if camera.get("devId")}
+
+    def protect_local_clip(self, dev_id: str, start: int, end: int) -> None:
+        key = local_clip_key(dev_id, start, end)
+        with self._local_state_guard:
+            if not self._local_policy().path(key).is_file():
+                raise FileNotFoundError("Local recording is no longer available")
+            self._local_playback_leases[key] = time.monotonic() + max(1800, end - start + 300)
+
+    def local_recording_status(self, dev_id: str, start: int, end: int, *, cached=False) -> str:
+        if cached:
+            return "cached"
+        key = local_clip_key(dev_id, start, end)
+        if self._local_policy().is_deleted(key):
+            return "deleted"
+        now = time.time()
+        if self.media_retention_hours > 0 and end < now - self.media_retention_hours * 3600:
+            return "expired"
+        if self.media_sync_hours > 0 and end < now - self.media_sync_hours * 3600:
+            return "outside_download_window"
+        return "pending"
+
+    def _maintain_local_media_locked(self) -> dict[str, Any]:
+        if self.background_work_paused:
+            return {"deleted_videos": 0, "deleted_thumbnails": 0, "retention_deferred": 1}
+        with self._local_state_guard, self._thumbnail_create_lock:
+            now = time.monotonic()
+            self._local_playback_leases = {key: until for key, until in self._local_playback_leases.items() if until > now}
+            cutoff = time.time() - self.media_retention_hours * 3600 if self.media_retention_hours > 0 else None
+            result = self._local_policy().maintain(cutoff, self._owned_local_devices(), self._local_playback_leases, LOGGER)
+            if result.get("deleted_videos") or result.get("deleted_thumbnails"):
+                LOGGER.info("Local recording retention removed videos=%s thumbnails=%s; protected=%s",
+                            result["deleted_videos"], result["deleted_thumbnails"], result.get("retention_deferred", 0))
+            return result
+
+    def maintain_local_media(self) -> dict[str, Any]:
+        """Local-only maintenance, independent of camera availability and Sync."""
+        if self._closed:
+            return {"closed": True}
+        if not self._media_sync_lock.acquire(blocking=False):
+            return {"busy": True}
+        try:
+            return self._maintain_local_media_locked()
+        finally:
+            self._media_sync_lock.release()
+
+    def delete_local_recording(self, dev_id: str, start: int, end: int) -> dict[str, Any]:
+        key = local_clip_key(dev_id, start, end)
+        owned = self._owned_local_devices()
+        if owned is not None and dev_id not in owned:
+            raise ValueError("Unknown recording camera for this account")
+        if not self._media_sync_lock.acquire(blocking=False):
+            raise CameraWorkBusy("Media Sync is running; retry deletion when this pass finishes")
+        try:
+            with self._local_state_guard, self._thumbnail_create_lock:
+                return {"deleted_files": self._local_policy().delete(key), "remembered": True}
+        finally:
+            self._media_sync_lock.release()
+
+    def allow_local_recording_downloads(self, dev_id: str | None = None, start: int | None = None, end: int | None = None) -> int:
+        """Allow normal Sync to fetch deliberately deleted local copies again."""
+        with self._local_state_guard:
+            return self._local_policy().restore(dev_id, start, end)
+
     def clear_video_cache(self) -> dict[str, Any]:
         """Delete cached video files while preserving the index and thumbnails."""
+        if not self._media_sync_lock.acquire(blocking=False):
+            raise CameraWorkBusy("Media Sync is running; retry clearing the cache when this pass finishes")
+        try:
+            with self._local_state_guard, self._thumbnail_create_lock:
+                return self._clear_video_cache_locked()
+        finally:
+            self._media_sync_lock.release()
+
+    def _clear_video_cache_locked(self) -> dict[str, Any]:
         video_folder = Path(self.media_storage_path) / "videos"
+        if video_folder.resolve().parent != Path(self.media_storage_path).resolve():
+            raise ValueError("Local media folder leaves the configured storage folder")
         result = {
             "path": str(video_folder),
             "deleted_videos": 0,
@@ -647,8 +745,23 @@ class TuyaRecordingsClient:
                 if path.is_file():
                     candidates.add(path)
 
+        from .lib.media import parse_cached_media_name
+        owned = self._owned_local_devices()
+        eligible = []
         for path in candidates:
             is_video = path.suffix == ".mp4" and not path.name.endswith(".tmp.mp4")
+            key = parse_cached_media_name(path.name, ".mp4") if is_video else None
+            if path.is_symlink() or (owned is not None and (key is None or key.dev_id not in owned)):
+                continue
+            if key is not None:
+                try:
+                    local_clip_key(key.dev_id, key.start, key.end)
+                except ValueError:
+                    continue
+            eligible.append((path, is_video, key))
+        self._local_policy().mark_deleted(key for _, _, key in eligible if key is not None)
+
+        for path, is_video, _ in eligible:
             try:
                 size = path.stat().st_size
                 path.unlink()
@@ -675,6 +788,7 @@ class TuyaRecordingsClient:
             "media_sync_enabled": self.media_sync_enabled,
             "thumbnail_sync_enabled": self.thumbnail_sync_enabled,
             "media_sync_hours": self.media_sync_hours,
+            "media_retention_hours": self.media_retention_hours,
             "media_storage_path": str(self.media_storage_path),
             "has_cache": self._camera_index_cache is not None,
             "cache_expires_at": self._camera_index_cache_until.isoformat(),
@@ -1346,8 +1460,17 @@ class TuyaRecordingsClient:
             return {"enabled": self.media_sync_enabled, "running": True}
         deadline = Deadline(MEDIA_SYNC_CAMERA_PASS_TIMEOUT)
         try:
+            maintenance = self._maintain_local_media_locked()
+            if maintenance.get("storage_unavailable"):
+                result = {"enabled": self.media_sync_enabled, "downloaded": 0, "failed": 0, **maintenance}
+                self._set_media_sync_status("storage_unavailable", current=None, last_result=result)
+                return result
             with camera_work_scope(Cancellation(cancellation, self.media_work_cancellation())) as cancellation:
-                return self._sync_recordings(cancellation, deadline)
+                result = self._sync_recordings(cancellation, deadline)
+                result.update(maintenance)
+                self._media_sync_status.update(self._media_sync_status.state, last_result=result,
+                    deleted_videos=result.get("deleted_videos", 0), deleted_thumbnails=result.get("deleted_thumbnails", 0))
+                return result
         finally:
             self._media_sync_lock.release()
 
@@ -1402,7 +1525,8 @@ class TuyaRecordingsClient:
                  if int(clip.get("start") or 0) > 0 and int(clip.get("end") or 0) > int(clip.get("start") or 0)],
                 key=lambda item: int(item[1]["start"]), reverse=True,
             )
-            cutoff = max((int(clip["end"]) for _, clip in clips), default=0) - self.media_sync_hours * 3600 if self.media_sync_hours > 0 else None
+            windows = [value for value in (self.media_sync_hours, self.media_retention_hours) if value > 0]
+            cutoff = time.time() - min(windows) * 3600 if windows else None
             desired_clips = {
                 CachedClipKey.from_raw(dev_id, int(clip["start"]), int(clip["end"]))
                 for dev_id, clip in clips if cutoff is None or int(clip["end"]) >= cutoff
@@ -1421,6 +1545,9 @@ class TuyaRecordingsClient:
                 current_device = dev_id
                 start, end = int(clip["start"]), int(clip["end"])
                 key = (dev_id, start, end)
+                if self._local_policy().is_deleted(local_clip_key(dev_id, start, end)):
+                    result["skipped"] += 1
+                    continue
                 if dev_id in failed_cameras:
                     result["skipped"] += 1
                     continue
@@ -1429,6 +1556,7 @@ class TuyaRecordingsClient:
                     continue
                 output_path = self.clip_path(dev_id, start, end)
                 if _mp4_ready(output_path):
+                    self._local_policy().remember(local_clip_key(dev_id, start, end))
                     self.ensure_thumbnail(dev_id, start, end)
                     failures_changed |= self._media_failures.pop(key, None) is not None
                     result["skipped"] += 1
@@ -1486,9 +1614,8 @@ class TuyaRecordingsClient:
                 self._media_failures.pop(key, None)
                 failures_changed = True
                 result["downloaded"] += 1
+                self._local_policy().remember(local_clip_key(dev_id, start, end))
             check_cancelled()
-            if desired_clips and not result["failed"] and not result["deferred"] and not unavailable_cameras:
-                result.update(self.cleanup_cached_media(desired_clips, cutoff))
         except CameraWorkCancelled:
             result["cancelled"] = True
             if operation_deadline.is_set():
@@ -1529,7 +1656,7 @@ class TuyaRecordingsClient:
         return work
 
     def cleanup_cached_media(self, desired_clips: set[CachedClipKey], cutoff: int | None) -> dict[str, int]:
-        return cleanup_cached_media(Path(self.media_storage_path), desired_clips, cutoff, LOGGER)
+        return self.maintain_local_media()
 
     def _recover_interrupted_media_sync(self) -> int:
         video_folder = Path(self.media_storage_path) / "videos"

@@ -33,9 +33,18 @@ def test_cleanup_cached_media_deletes_stale_files(tmp_path):
     thumb.write_bytes(b"old")
     keep.write_bytes(b"keep")
 
-    result = cleanup_cached_media(tmp_path, {CachedClipKey("camera", 30, 40)}, None, FakeLogger())
+    result = cleanup_cached_media(tmp_path, {CachedClipKey("camera", 30, 40)}, 25, FakeLogger())
 
     assert result == {"deleted_videos": 1, "deleted_thumbnails": 1}
     assert not video.exists()
     assert not thumb.exists()
     assert keep.exists()
+
+
+def test_unlimited_retention_never_deletes_catalog_omissions(tmp_path):
+    video = tmp_path / "videos" / "camera_10_20.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"keep")
+    result = cleanup_cached_media(tmp_path, set(), None, FakeLogger())
+    assert result == {"deleted_videos": 0, "deleted_thumbnails": 0}
+    assert video.exists()

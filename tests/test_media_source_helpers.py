@@ -163,7 +163,7 @@ def test_visible_clips_hides_uncached_recording():
     assert source._visible_clips(client, camera) == []
 
 
-def test_visible_clips_precache_mode_requires_cached_video_and_thumbnail():
+def test_visible_clips_precache_mode_requires_cached_video():
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
     client.media_sync_enabled = True
@@ -172,13 +172,24 @@ def test_visible_clips_precache_mode_requires_cached_video_and_thumbnail():
     assert source._visible_clips(client, camera) == []
 
 
-def test_visible_clips_cloud_pause_requires_cached_video_and_thumbnail():
+def test_visible_clips_cloud_pause_requires_cached_video():
     source = TuyaRecordingsMediaSource(hass=None)
     client = DownloadingClipClient()
     client.cloud_activity_paused = True
     camera = {"devId": "cam", "clips": [{"start": 10, "end": 20, "date": "2026-06-29"}]}
 
     assert source._visible_clips(client, camera) == []
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_visible_cached_clip_does_not_depend_on_thumbnail(paused):
+    source = TuyaRecordingsMediaSource(hass=None)
+    client = CachedClipClient()
+    client.media_sync_enabled = True
+    client.cloud_activity_paused = paused
+    camera = {"devId": "cam", "clips": [{"start": 10, "end": 20}]}
+    assert source._visible_clips(client, camera) == camera["clips"]
+    assert source._thumbnail_url(client, camera["clips"][0], "cam", 10, 20) is None
 
 
 def test_thumbnail_url_uses_private_integration_endpoint():

@@ -182,7 +182,10 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 ai_detections.append(detection)
             if media_cache_only:
                 dates.add(clip_date)
-                item["pending"] = not clip_cached
+                status_method = getattr(client, "local_recording_status", None)
+                item["local_status"] = status_method(dev_id, start, end, cached=clip_cached) if callable(status_method) else ("cached" if clip_cached else "pending")
+                item["pending"] = item["local_status"] == "pending"
+                camera_stats["pending_clips"] += int(item["pending"])
                 item["playback_url"] = f"/api/{DOMAIN}/play/{quote(dev_id, safe='')}/{start}/{end}?transport=file" if clip_cached else ""
                 item["stream_transport"] = "file"
                 clips.append(item)
@@ -199,7 +202,8 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 dates.add(clip_date)
             _update_latest_clip(stats, dev_id, str(camera.get("name") or dev_id), start, end)
             stats["visible_clips"] += 1
-        camera_stats["pending_clips"] = max(0, camera_stats["indexed_clips"] - camera_stats["ready_clips"])
+        if not media_cache_only:
+            camera_stats["pending_clips"] = max(0, camera_stats["indexed_clips"] - camera_stats["ready_clips"])
         stats["pending_clips"] += camera_stats["pending_clips"]
         stats["camera_stats"].append(camera_stats)
         clips.sort(key=lambda item: int(item["start"]), reverse=True)
@@ -761,6 +765,12 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
             size = await self.hass.async_add_executor_job(_file_size, clip_path)
             if not clip_cached or size <= 0:
                 raise web.HTTPNotFound(reason="Tuya recording is not cached")
+            protect = getattr(client, "protect_local_clip", None)
+            if callable(protect):
+                try:
+                    await self.hass.async_add_executor_job(protect, dev_id, start_int, end_int)
+                except FileNotFoundError as error:
+                    raise web.HTTPNotFound(reason="Tuya recording is no longer cached") from error
             _LOGGER.debug(
                 "Tuya Recordings cached video response dev=%s start=%s end=%s bytes=%s range_requested=%s",
                 dev_id, start_int, end_int, size, bool(request.headers.get("Range")),

@@ -25,6 +25,7 @@ from .const import (
     CONF_MEDIA_STORAGE_PATH,
     CONF_MEDIA_SYNC_ENABLED,
     CONF_MEDIA_SYNC_HOURS,
+    CONF_MEDIA_RETENTION_HOURS,
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_NATIVE_APP_SESSION,
     CONF_REGION,
@@ -76,6 +77,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_MEDIA_STORAGE_PATH: user_input[CONF_MEDIA_STORAGE_PATH],
                 CONF_MEDIA_SYNC_ENABLED: user_input[CONF_MEDIA_SYNC_ENABLED],
                 CONF_MEDIA_SYNC_HOURS: user_input[CONF_MEDIA_SYNC_HOURS],
+                CONF_MEDIA_RETENTION_HOURS: user_input.get(CONF_MEDIA_RETENTION_HOURS, 0),
                 CONF_MEDIA_VIEW_RECORDINGS_ORDER: user_input[
                     CONF_MEDIA_VIEW_RECORDINGS_ORDER
                 ],
@@ -313,6 +315,7 @@ def _validate_form_input(user_input: dict[str, Any]) -> dict[str, str]:
         (CONF_LOOKBACK_DAYS, 0, 31),
         (CONF_CATALOG_SYNC_MINUTES, 15, 1440),
         (CONF_MEDIA_SYNC_HOURS, 0, 744),
+        (CONF_MEDIA_RETENTION_HOURS, 0, 8760),
         (CONF_ALERT_RESET_SECONDS, 5, 3600),
     ):
         if key not in user_input:
@@ -376,6 +379,8 @@ def _options_schema(
             data.get(CONF_MEDIA_STORAGE_PATH, DEFAULT_MEDIA_STORAGE_PATH),
         ),
     )
+    retention_hours = user_input.get(CONF_MEDIA_RETENTION_HOURS,
+        options.get(CONF_MEDIA_RETENTION_HOURS, data.get(CONF_MEDIA_RETENTION_HOURS, media_sync_hours)))
     recordings_order = user_input.get(
         CONF_MEDIA_VIEW_RECORDINGS_ORDER,
         options.get(
@@ -442,6 +447,9 @@ def _options_schema(
             vol.Required(
                 CONF_MEDIA_STORAGE_PATH, default=media_storage_path
             ): selector.TextSelector(),
+            vol.Required(CONF_MEDIA_RETENTION_HOURS, default=retention_hours): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=8760, step=1, mode=selector.NumberSelectorMode.BOX)
+            ),
             vol.Required(
                 CONF_ALERT_RESET_SECONDS, default=alert_reset_seconds
             ): selector.NumberSelector(
@@ -507,6 +515,9 @@ def _user_schema(user_input: dict[str, Any]) -> vol.Schema:
                 default=user_input.get(CONF_ALERT_RESET_SECONDS, DEFAULT_ALERT_RESET_SECONDS),
             ): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=5, max=3600, step=1, mode=selector.NumberSelectorMode.BOX)
+            ),
+            vol.Required(CONF_MEDIA_RETENTION_HOURS, default=user_input.get(CONF_MEDIA_RETENTION_HOURS, 0)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=8760, step=1, mode=selector.NumberSelectorMode.BOX)
             ),
         }
     )

@@ -10,7 +10,8 @@
           "media_storage_path": "Private video storage path",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
-          "media_sync_hours": "Sync window in hours",
+          "media_sync_hours": "Download window in hours",
+          "media_retention_hours": "Keep local recordings for (hours)",
           "alert_reset_seconds": "Detection reset time"
         },
         "data_description": {
@@ -18,8 +19,9 @@
           "app_profile": "Choose the app that contains the cameras. Scan the QR code using this same app.",
           "media_storage_path": "Use a private path under /media, such as /media/tuya_recordings. Do not use /config/www.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
-          "media_sync_enabled": "Optional, off by default. Download recordings in the background so only cached, thumbnailed clips are shown. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
-          "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Make sure the storage location has enough free space.",
+          "media_sync_enabled": "Optional, off by default. Download recordings in the background for local playback. Cataloged recordings remain visible while awaiting download. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
+          "media_sync_hours": "Download recordings this many hours back from the current time. Use 0 for all discovered recordings still within local retention.",
+          "media_retention_hours": "Automatically delete local MP4s and thumbnails older than this many hours, measured from recording end to current time. Use 0 for no age-based deletion. Camera SD recordings are never deleted.",
           "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
         }
       },
@@ -55,7 +57,8 @@
           "catalog_sync_minutes": "Background catalog interval (minutes)",
           "media_view_recordings_order": "Recording order",
           "media_sync_enabled": "Pre-cache recordings",
-          "media_sync_hours": "Sync window in hours",
+          "media_sync_hours": "Download window in hours",
+          "media_retention_hours": "Keep local recordings for (hours)",
           "alert_reset_seconds": "Detection reset time",
           "media_storage_path": "Private video storage path"
         },
@@ -63,8 +66,9 @@
           "lookback_days": "Use 0 to scan up to 31 days, stopping after 7 consecutive empty days. This does not enumerate the entire SD card.",
           "catalog_sync_minutes": "How often to refresh SD-card recording lists while local video caching is off. Playback pauses this work automatically. Use a longer interval for cameras that permit only one P2P session.",
           "media_view_recordings_order": "Choose whether the newest or oldest recordings appear first.",
-          "media_sync_enabled": "Optional, off by default. When enabled, recordings are downloaded in the background and the panel shows only cached, thumbnailed clips. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
-          "media_sync_hours": "Use 0 to sync every discovered SD-card recording. Higher values limit background caching to recent clips.",
+          "media_sync_enabled": "Optional, off by default. Download recordings in the background for local playback. Cataloged recordings remain visible while awaiting download. Battery cameras may wake repeatedly and lose battery life; leave off unless you explicitly want background downloads.",
+          "media_sync_hours": "Download recordings this many hours back from the current time. Use 0 for all discovered recordings still within local retention. Changing this setting does not delete existing local copies.",
+          "media_retention_hours": "Delete local MP4s and thumbnails older than this many hours, using the current time, even when Sync is off or cameras fail. Use 0 for no age-based deletion. Recently played copies are protected temporarily; camera SD recordings are never deleted.",
           "media_storage_path": "Changing this path does not move existing cached videos. Keep it under /media.",
           "alert_reset_seconds": "Motion and person sensors reset this many seconds after the newest matching camera event."
         }
