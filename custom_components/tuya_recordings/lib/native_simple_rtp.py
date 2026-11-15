@@ -245,8 +245,8 @@ class NativeH264RtpDepacketizer:
         return result
 
 
-def parse_rtp_packet(data: bytes) -> NativeRtpPacket:
-    """Parse one RFC 3550 packet without altering its encoded payload."""
+def parse_rtp_packet(data: bytes, *, native_fixed_header: bool = False) -> NativeRtpPacket:
+    """Parse RTP, using the SDK's fixed payload offset on native streams."""
     if not isinstance(data, bytes) or len(data) < 12:
         raise NativeSimpleRtpError("RTP packet is shorter than its fixed header")
     first, second = data[0], data[1]
@@ -254,11 +254,15 @@ def parse_rtp_packet(data: bytes) -> NativeRtpPacket:
         raise NativeSimpleRtpError("RTP packet has an unsupported version")
     if first == 0xB8:
         first = 0x80
-    csrc_count = first & 0x0F
+    # ThingRTPUnpackerH264::ParseRtpPackage passes data+12 and size-12 to
+    # single-NAL/STAP/FU handlers, irrespective of the low first-byte flags.
+    # Those native packets must not lose encoded bytes to RFC extension or
+    # padding interpretation. Keep generic RFC parsing for explicit other users.
+    csrc_count = 0 if native_fixed_header else first & 0x0F
     offset = 12 + csrc_count * 4
     if len(data) < offset:
         raise NativeSimpleRtpError("RTP CSRC list is truncated")
-    if first & 0x10:
+    if not native_fixed_header and first & 0x10:
         if len(data) < offset + 4:
             raise NativeSimpleRtpError("RTP extension header is truncated")
         words = struct.unpack_from(">H", data, offset + 2)[0]
@@ -266,7 +270,7 @@ def parse_rtp_packet(data: bytes) -> NativeRtpPacket:
         if len(data) < offset:
             raise NativeSimpleRtpError("RTP extension payload is truncated")
     end = len(data)
-    if first & 0x20:
+    if not native_fixed_header and first & 0x20:
         padding = data[-1]
         if not padding or padding > end - offset:
             raise NativeSimpleRtpError("RTP padding is invalid")
