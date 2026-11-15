@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-40 (2026-11-15)
+
+### Native Playback
+
+- Follow the APK's fixed 12-byte native RTP payload offset, rather than interpreting native header flags as standard RTP extensions or padding that can shift or truncate encoded media.
+- Preserve original video and audio without transcoding, along with playback, seeking, Media Sync, historical backfill and camera safety limits.
+
+### Diagnostics
+
+- Sample bounded NAL and fragment boundaries so the trace reaches later pictures instead of being consumed by the first large I-frame.
+- Identify the native parsing route and payload offset without logging footage or credentials.
+
 ## Tuya Recordings v0.4.13-39 (2026-11-15)
 
 ### Media Sync

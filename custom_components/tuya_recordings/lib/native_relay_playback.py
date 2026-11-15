@@ -2054,14 +2054,15 @@ class NativeRelayPlaybackSession:
                     self._rtp_codec_info.get(conversation, 0) + 1
                 )
             try:
-                rtp = parse_rtp_packet(packet.payload)
+                rtp = parse_rtp_packet(packet.payload, native_fixed_header=True)
             except NativeSimpleRtpError:
                 self._count_media_drop("rtp_header")
                 continue
             unit_type = rtp.payload[0] & 0x1F if rtp.payload else -1
-            if (conversation == _VIDEO_CONVERSATION and rtp.payload
-                    and self._rtp_header_trace_count < 8 and _LOGGER.isEnabledFor(logging.DEBUG)):
-                _LOGGER.debug("Native H264 trace schema=2 stage=rtp_payload dev=%s payload_type=%s sequence=%s timestamp=%s camera_timestamp=%s rtp_header=0x%02x nal_header=0x%02x type=%s forbidden=%s ref_idc=%s fu_header=%s payload_bytes=%s codec_info_bytes=%s",
+            boundary = (unit_type != 28 or len(rtp.payload) > 1 and bool(rtp.payload[1] & 0xc0))
+            if (conversation == _VIDEO_CONVERSATION and rtp.payload and boundary
+                    and self._rtp_header_trace_count < 16 and _LOGGER.isEnabledFor(logging.DEBUG)):
+                _LOGGER.debug("Native H264 trace schema=3 stage=rtp_payload route=sdk_fixed_12 payload_offset=12 dev=%s payload_type=%s sequence=%s timestamp=%s camera_timestamp=%s rtp_header=0x%02x nal_header=0x%02x type=%s forbidden=%s ref_idc=%s fu_header=%s payload_bytes=%s codec_info_bytes=%s",
                               self._native_config.dev_id, rtp.payload_type, rtp.sequence, rtp.timestamp, packet.camera_timestamp,
                               packet.payload[0], rtp.payload[0], unit_type, bool(rtp.payload[0] & 128),
                               (rtp.payload[0] >> 5) & 3,

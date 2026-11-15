@@ -97,6 +97,15 @@ def test_reads_payload_after_fixed_header_when_first_byte_is_0xb8():
     assert rtp.payload == bytes.fromhex("3c81e201")
 
 
+@pytest.mark.parametrize("first", [0x80, 0x81, 0x90, 0xa0, 0xb0, 0xb8, 0xbf])
+def test_native_sdk_payload_always_starts_at_twelve_bytes(first):
+    payload = b"\x3c\x81" + bytes(100) + b"\x03"
+    data = struct.pack(">BBHII", first, 0xe0, 17, 90000, 5) + payload
+    packet = parse_rtp_packet(data, native_fixed_header=True)
+    assert packet.payload == payload
+    assert packet.sequence == 17 and packet.marker
+
+
 def test_rejects_invalid_rtp_version():
     with pytest.raises(NativeSimpleRtpError, match="version"):
         parse_rtp_packet(bytes(12))

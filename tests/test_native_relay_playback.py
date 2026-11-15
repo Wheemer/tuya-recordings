@@ -2605,6 +2605,22 @@ def test_rtp_media_stream_id_does_not_filter_playback_video():
     assert playback._media_stream_packets == {0x00010004: 2}
 
 
+@pytest.mark.parametrize("first", [0x80, 0x81, 0x90, 0xa0, 0xb0, 0xb8, 0xbf])
+def test_native_receive_keeps_fu_headers_after_first_picture(first):
+    playback = session()
+
+    def deliver(sequence, timestamp, payload, first_byte, marker):
+        header = struct.pack("<I5I", 0x00020008, 0, timestamp, 0, 0, 0)
+        rtp = struct.pack(">BBHII", first_byte, 96 | (128 if marker else 0), sequence, timestamp, 1) + payload
+        playback._on_rtp_record(1, encrypt_record(ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp), ANSWER_KEY)
+
+    deliver(1, 1000, b"\x25initial", 0x80, True)
+    assert playback._media_frames.get_nowait().payload == b"\x00\x00\x00\x01\x25initial"
+    deliver(2, 1100, b"\x3c\x81abc" + bytes(16), first, False)
+    deliver(3, 1100, b"\x3c\x41def" + bytes(16), first, True)
+    assert playback._media_frames.get_nowait().payload == b"\x00\x00\x00\x01\x21abc" + bytes(16) + b"def" + bytes(16)
+
+
 def test_rtp_header_trace_keeps_full_header_bits_and_is_bounded(caplog):
     import logging
     caplog.set_level(logging.DEBUG, logger=relay_module.__name__)
@@ -2614,12 +2630,12 @@ def test_rtp_header_trace_keeps_full_header_bits_and_is_bounded(caplog):
         rtp = struct.pack(">BBHII", 0x80, 0xe0, sequence, sequence * 100, 1) + b"\x95PRIVATE_FOOTAGE"
         playback._on_rtp_record(1, encrypt_record(ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp), ANSWER_KEY)
     messages = [record.getMessage() for record in caplog.records if "stage=rtp_payload" in record.getMessage()]
-    assert len(messages) == 8
+    assert len(messages) == 16
     assert all("nal_header=0x95" in message and "forbidden=True" in message for message in messages)
     assert "PRIVATE_FOOTAGE" not in caplog.text
     playback._reset_media_state()
     playback._on_rtp_record(1, encrypt_record(ANSWER_KEY, header + struct.pack("<I", len(rtp)) + rtp), ANSWER_KEY)
-    assert sum("stage=rtp_payload" in record.getMessage() for record in caplog.records) == 9
+    assert sum("stage=rtp_payload" in record.getMessage() for record in caplog.records) == 17
 
 
 def test_rtp_audio_is_exposed_as_pcm_s16le():

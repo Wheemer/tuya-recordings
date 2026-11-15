@@ -207,9 +207,52 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
             write_events(muxer)
 
     def write_events(muxer):
+        if wire == "rtp":
+            from test_native_relay_playback import session, ANSWER_KEY
+            from custom_components.tuya_recordings.lib.native_mux import _h264_nals
+            from custom_components.tuya_recordings.lib.native_relay_runtime import NativeRelayRuntimeSession
+            from custom_components.tuya_recordings.vendor.tuya_ipc_p2p_sdk.crypto import encrypt_record
+            playback = session()
+            sequences = {1: 0, 2: 0}
+            flags = (0x80, 0x81, 0x90, 0xa0, 0xb0, 0xb8, 0xbf)
+
+            def deliver_rtp(channel, payload_type, payload, stamp, marker):
+                seq = sequences[channel]
+                sequences[channel] += 1
+                first = 0x80 if stamp == 100000 else flags[seq % len(flags)]
+                packet = struct.pack(">BBHII", first, payload_type | (128 if marker else 0),
+                                     seq & 65535, stamp * 90, 1) + payload
+                header = struct.pack("<IIQII", 0x20008, 0, stamp, 0, 0)
+                data = header + struct.pack("<I", len(packet)) + packet
+                # Exercise decrypted transport-record boundaries inside the
+                # native header and length word, not only complete packets.
+                for chunk in (data[:17], data[17:27], data[27:]):
+                    playback._on_rtp_record(channel, encrypt_record(ANSWER_KEY, chunk), ANSWER_KEY)
+                while not playback._media_frames.empty():
+                    frame = playback._media_frames.get_nowait()
+                    converted = NativeRelayRuntimeSession._convert_frame(frame, {}, "")
+                    muxer.handle_event(playback_frame_event(converted, protocol=1))
+
         def emit(event):
             if not wire:
                 return muxer.handle_event(event)
+            if wire == "rtp":
+                info = event["payload"]["info"]
+                clear = base64.b64decode(event["payload"]["payloadBase64"])
+                stamp = info["timestamp"]
+                if info["avChannel"]:
+                    return deliver_rtp(2, 0 if audio_codec == "g711u" else 99, clear, stamp, True)
+                nals = _h264_nals(clear)
+                for position, nal in enumerate(nals):
+                    if len(nal) <= 512:
+                        deliver_rtp(1, 96, nal, stamp, position == len(nals) - 1)
+                    else:
+                        chunks = [nal[offset:offset + 400] for offset in range(1, len(nal), 400)]
+                        for index, chunk in enumerate(chunks):
+                            fu = (nal[0] & 31) | (128 if index == 0 else 0) | (64 if index == len(chunks) - 1 else 0)
+                            deliver_rtp(1, 96, bytes([(nal[0] & 224) | 28, fu]) + chunk,
+                                        stamp, position == len(nals) - 1 and index == len(chunks) - 1)
+                return
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
             from custom_components.tuya_recordings.lib.native_playback_stream import NativePlaybackStreamParser
             from custom_components.tuya_recordings.lib.native_relay_runtime import NativeRelayRuntimeSession
@@ -326,6 +369,13 @@ def test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
 def test_cached_nonpicture_second_callback_retains_video_audio_and_sync(tmp_path, monkeypatch, via_sync):
     test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
         tmp_path, monkeypatch, "g711u", 1, True, True, via_sync, extension_packet=True)
+
+
+@pytest.mark.parametrize("via_sync", [False, True])
+@pytest.mark.parametrize("audio_codec,width", [("g711u", 1), ("pcm_s16le", 2)])
+def test_native_rtp_flags_preserve_video_audio_sync_and_seeking(tmp_path, monkeypatch, via_sync, audio_codec, width):
+    test_cached_reordered_h264_retains_pictures_audio_and_distinct_decode_clock(
+        tmp_path, monkeypatch, audio_codec, width, True, False, via_sync, wire="rtp")
 
 
 @pytest.mark.parametrize("via_sync", [False, True])
