@@ -110,7 +110,7 @@ def test_interactive_video_stall_must_expire_after_initial_video(monkeypatch):
             return SimpleNamespace(is_audio=self.count > 1, codec_info=None)
 
     monkeypatch.setattr(runtime, "NativePlaybackEventSink", Sink)
-    monkeypatch.setattr(runtime.NativeRelayRuntimeSession, "_convert_frame", staticmethod(lambda f, *a: f))
+    monkeypatch.setattr(runtime.NativeRelayRuntimeSession, "_convert_frame", staticmethod(lambda f, *a, **kw: f))
     session = runtime.NativeRelayRuntimeSession(camera_config(), APP_SESSION, cancel_event=cancel, first_frame_timeout=0.01)
     with pytest.raises(runtime.NativeRelayRuntimeError, match="video"):
         asyncio.run(session._interactive_connected(
@@ -140,7 +140,7 @@ def test_received_idr_without_decoder_config_must_not_disable_startup_deadline(m
                 cancel.set()
             return SimpleNamespace(is_audio=False, codec_info=None)
 
-    monkeypatch.setattr(runtime.NativeRelayRuntimeSession, "_convert_frame", staticmethod(lambda f, *a: packet))
+    monkeypatch.setattr(runtime.NativeRelayRuntimeSession, "_convert_frame", staticmethod(lambda f, *a, **kw: packet))
     session = runtime.NativeRelayRuntimeSession(camera_config(), APP_SESSION, cancel_event=cancel, first_frame_timeout=0.01)
     try:
         with pytest.raises(runtime.NativeRelayRuntimeError, match="video"):

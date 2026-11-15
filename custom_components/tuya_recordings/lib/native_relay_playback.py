@@ -274,6 +274,7 @@ class NativeRelayPlaybackSession:
         self._h264 = NativeH264RtpDepacketizer()
         self._video_frame_number = 0
         self._audio_frame_number = 0
+        self._rtp_header_trace_count = 0
         self._control_payloads: dict[str, str] = {}
         self._next_request_id = 8
         self._task_id = 2
@@ -1641,6 +1642,7 @@ class NativeRelayPlaybackSession:
 
     def _reset_media_state(self) -> None:
         """Discard every decoder-bound state before a new playback stream."""
+        self._rtp_header_trace_count = 0
         self._media_frames = asyncio.Queue(maxsize=_MEDIA_QUEUE_LIMIT)
         self._playback_complete = asyncio.Event()
         self._parser = NativePlaybackStreamParser()
@@ -2057,6 +2059,15 @@ class NativeRelayPlaybackSession:
                 self._count_media_drop("rtp_header")
                 continue
             unit_type = rtp.payload[0] & 0x1F if rtp.payload else -1
+            if (conversation == _VIDEO_CONVERSATION and rtp.payload
+                    and self._rtp_header_trace_count < 8 and _LOGGER.isEnabledFor(logging.DEBUG)):
+                _LOGGER.debug("Native H264 trace schema=2 stage=rtp_payload dev=%s payload_type=%s sequence=%s timestamp=%s camera_timestamp=%s rtp_header=0x%02x nal_header=0x%02x type=%s forbidden=%s ref_idc=%s fu_header=%s payload_bytes=%s codec_info_bytes=%s",
+                              self._native_config.dev_id, rtp.payload_type, rtp.sequence, rtp.timestamp, packet.camera_timestamp,
+                              packet.payload[0], rtp.payload[0], unit_type, bool(rtp.payload[0] & 128),
+                              (rtp.payload[0] >> 5) & 3,
+                              f"0x{rtp.payload[1]:02x}" if unit_type == 28 and len(rtp.payload) > 1 else "none",
+                              len(rtp.payload), len(packet.codec_info))
+                self._rtp_header_trace_count += 1
             key = (conversation, rtp.payload_type, unit_type)
             self._rtp_packets[key] = self._rtp_packets.get(key, 0) + 1
             if (

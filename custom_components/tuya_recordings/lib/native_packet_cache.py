@@ -19,6 +19,15 @@ _LOGGER = logging.getLogger(__name__)
 _SD_CLOCK_GAP = Fraction(1050, 1000)
 
 
+def _owned_packet(payload: bytes):
+    """Give libav independent storage with its required zero tail padding."""
+    # Packet(bytes) wraps Python storage directly; av_new_packet owns a padded
+    # buffer and prevents decoder/bitstream-filter writes changing our evidence.
+    packet = av.Packet(len(payload))
+    packet.update(payload)
+    return packet
+
+
 @dataclass
 class _ClockTrack:
     source: Fraction
@@ -148,7 +157,7 @@ class TimestampedVideoMuxer:
         stamp = Fraction(timestamp, scale)
         if self.origin is None:
             self.origin = stamp
-        packet = av.Packet(payload)
+        packet = _owned_packet(payload)
         packet.stream = self.stream
         packet.is_keyframe = bool(keyframe)
         packet.time_base = Fraction(1, 1_000_000)
@@ -259,20 +268,25 @@ def _reordered_video_timing(video, packet_path: Path, origin: Fraction):
                 # The index preserves the camera callback's picture boundary
                 # and its buffered SPS/PPS. Re-demuxing the concatenated raw
                 # file can split those boundaries or create a header-only tail.
-                packet = av.Packet(source.read(size))
+                data = source.read(size)
+                packet = _owned_packet(data)
                 packet.pts = len(times) - 1
                 packet.dts = None
                 packet.time_base = Fraction(1, 1000)
+                from .native_mux import h264_packet_diagnostics
+                summary = h264_packet_diagnostics(data) if len(times) <= 8 and _LOGGER.isEnabledFor(logging.DEBUG) else None
+                if len(times) <= 8:
+                    _LOGGER.debug("Native H264 trace schema=2 stage=before_decode picture=%s timestamp=%s/%s packet=%s",
+                                  len(times) - 1, stamp, scale, summary)
                 try:
                     order.extend(frame.pts for frame in decoder.decode(packet))
                 except av.error.FFmpegError as err:
                     # Report framing, never compressed footage or credentials.
-                    from .native_mux import _h264_nals
-                    layout = [(nal[0] & 0x1f, len(nal)) for nal in _h264_nals(bytes(packet))][:8]
                     raise ValueError(
                         f"Native indexed H264 picture decode failed: picture={len(times) - 1} "
                         f"bytes={size} timestamp={stamp}/{scale} "
-                        f"keyframe={bool(flags & 1)} nals={layout}: {err}"
+                        f"keyframe={bool(flags & 1)} pre_decode={summary or h264_packet_diagnostics(data)} "
+                        f"packet_unchanged={bytes(packet) == data}: {err}"
                     ) from err
             else:
                 source.seek(size, 1)
@@ -323,7 +337,7 @@ def mux_camera_packets(video_path: Path, audio_path: Path, packet_path: Path,
                 if kind in previous and time <= previous[kind]:
                     raise ValueError("Native camera packet timestamps are not increasing")
                 previous[kind] = time
-                packet = av.Packet(payload)
+                packet = _owned_packet(payload)
                 packet.is_keyframe = kind == 1 and bool(flags & 1)
                 packet.stream = streams[kind]
                 packet.time_base = Fraction(1, 1_000_000)

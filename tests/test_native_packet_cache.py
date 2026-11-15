@@ -330,7 +330,8 @@ def test_cached_nonpicture_second_callback_retains_video_audio_and_sync(tmp_path
 
 @pytest.mark.parametrize("via_sync", [False, True])
 @pytest.mark.parametrize("layout", [((9, 1034), (16, 142)), ((23, 233),), ((22, 600),),
-                                    ((7, 1054), (20, 996), (12, 1178))])
+                                    ((7, 1054), (20, 996), (12, 1178)),
+                                    ((0x88, 996), (0x95, 769))])
 @pytest.mark.parametrize("wire", [False, True])
 def test_cached_sdk_buffered_nonpicture_layouts(tmp_path, monkeypatch, via_sync, layout, wire):
     # Match the logged NAL layouts, not unprovided camera payload contents.
@@ -458,13 +459,13 @@ def test_cache_bounds_header_only_packets_and_cleans_up(tmp_path, monkeypatch):
     assert muxer._pending_video_headers == b""
 
 
-@pytest.mark.parametrize("nal_type", [0, 1, 2, 3, 4, 5, 24, 28, 31, 0x87, 0x8d, 0x8e, 0x8f])
+@pytest.mark.parametrize("nal_type", [0, 1, 2, 3, 4, 5, 24, 28, 31, 0x80, 0x81, 0x85])
 def test_cache_does_not_classify_pictures_or_invalid_nals_as_headers(nal_type):
     from custom_components.tuya_recordings.lib.native_mux import _h264_metadata_only
     assert not _h264_metadata_only(b"\x00\x00\x01" + bytes([nal_type]) + b"data")
 
 
-@pytest.mark.parametrize("nal_type", range(6, 24))
+@pytest.mark.parametrize("nal_type", [*range(6, 24), 0x87, 0x88, 0x8d, 0x8e, 0x8f, 0x95])
 @pytest.mark.parametrize("start", [b"\x00\x00\x01", b"\x00\x00\x00\x01"])
 def test_cache_recognizes_nonpicture_nals_without_hiding_mixed_pictures(nal_type, start):
     from custom_components.tuya_recordings.lib.native_mux import _h264_metadata_only

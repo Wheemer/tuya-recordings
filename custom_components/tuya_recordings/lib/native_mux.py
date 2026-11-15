@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import logging
 import os
 import struct
@@ -133,6 +134,7 @@ class NativePlaybackMuxer:
     _finished: bool = field(default=False, init=False, repr=False)
     _pending_video_headers: bytes = field(default=b"", init=False, repr=False)
     _waiting_for_keyframe_logged: bool = field(default=False, init=False, repr=False)
+    _header_trace_count: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.output_path = Path(self.output_path)
@@ -178,6 +180,7 @@ class NativePlaybackMuxer:
         self._audio_format = ("", 0, 0)
         self._origin = None
         self._waiting_for_keyframe_logged = False
+        self._header_trace_count = 0
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event = validate_playback_frame_event(event, protocol=self.protocol)
@@ -233,7 +236,13 @@ class NativePlaybackMuxer:
         if codec in {"h264", "avc"}:
             if len(self._pending_video_headers) + len(data) > MAX_PACKET_BYTES:
                 raise NativeMuxError("Native cached video headers exceed packet limit")
-            if _h264_metadata_only(data):
+            buffered = _h264_metadata_only(data)
+            if self._header_trace_count < 8 and _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug("Native H264 trace schema=2 stage=cache_callback recording=%s timestamp=%s/%s decision=%s pending_bytes=%s packet=%s",
+                              self.output_path.name, info.get("timestamp"), info.get("timestampScale", 1000),
+                              "buffer" if buffered else "picture_candidate", len(self._pending_video_headers), h264_packet_diagnostics(data))
+                self._header_trace_count += 1
+            if buffered:
                 _append_bytes(self._video_path, data)
                 self._pending_video_headers += data
                 return
@@ -285,6 +294,12 @@ class NativePlaybackMuxer:
             raise NativeMuxError("Native cached packet is empty")
         stamp = Fraction(timestamp, scale)
         self._origin = stamp if self._origin is None else min(self._origin, stamp)
+        if kind == 1 and self._header_trace_count <= 8 and _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug("Native H264 trace schema=2 stage=cache_index recording=%s timestamp=%s/%s packet=%s",
+                          self.output_path.name, timestamp, scale, h264_packet_diagnostics(data))
+            # Close the trace window even when the eighth callback was buffered.
+            if self._header_trace_count == 8:
+                self._header_trace_count = 9
         _append_bytes(self._packet_path, PACKET_HEADER.pack(kind, int(bool(info.get("isKeyFrame"))), timestamp, scale, len(data)) + data)
 
     def _cleanup_intermediates(self) -> None:
@@ -1107,11 +1122,27 @@ def _h264_metadata_only(payload: bytes) -> bool:
     # HandleSingleNalu sets picture-ready only for type 1/5, retaining other
     # single NALs. Reserved/vendor units must not become indexed pictures, but
     # their encoded bytes must remain with the next picture, not be discarded.
+    # Match the SDK's &0x1f readiness test, including flagged non-picture NALs.
+    # This does not clear forbidden bits or suppress decoder errors on pictures.
     nals = _h264_nals(payload)
     return bool(nals) and all(
-        not nal[0] & 0x80 and 6 <= nal[0] & 0x1F <= 23
+        6 <= nal[0] & 0x1F <= 23
         for nal in nals
     )
+
+
+def h264_packet_diagnostics(payload: bytes) -> dict[str, Any]:
+    """Bounded header metadata and fingerprint; never encoded frame contents."""
+    nals = _h264_nals(payload)
+    return {
+        "build": "sdk-masked-headers-20261115",
+        "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()[:16],
+        "annex_b": payload.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")),
+        "nal_count": len(nals), "headers_truncated": len(nals) > 8,
+        "headers": [{"byte": f"0x{nal[0]:02x}", "type": nal[0] & 31,
+                     "forbidden": bool(nal[0] & 128), "ref_idc": (nal[0] >> 5) & 3,
+                     "bytes": len(nal)} for nal in nals[:8]],
+    }
 
 
 def _h264_parameter_sets(payload: bytes) -> bytes:

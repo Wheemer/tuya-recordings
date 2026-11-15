@@ -1,5 +1,19 @@
 # Changelog
 
+## Tuya Recordings v0.4.13-39 (2026-11-15)
+
+### Media Sync
+
+- Give libav independently owned, padded packets so decoder and filter writes cannot alter the original encoded data or its diagnostics.
+- Match the APK's masked H.264 header classification when buffering non-picture callbacks, retaining their encoded bytes without transcoding.
+- Preserve historical backfill, newest-first downloads, playback, seeking and camera safety limits.
+
+### Diagnostics
+
+- Trace full H.264 header bits and bounded packet fingerprints through RTP framing, decryption, cache indexing and decoder submission.
+- Report original pre-decoder headers on failure, identify changed decoder packets, and reset bounded trace windows for new playback streams.
+- Keep footage, encryption keys and authentication data out of these diagnostics.
+
 ## Tuya Recordings v0.4.13-38 (2026-11-15)
 
 ### Media Sync
